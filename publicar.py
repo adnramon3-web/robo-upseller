@@ -13,9 +13,12 @@ from pathlib import Path
 
 from supabase import create_client
 
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
 SUPABASE_URL = "https://qaqlaqlxxeilouvbwgiv.supabase.co"
-# service_role key — NÃO compartilhe este arquivo com clientes
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFhcWxhcWx4eGVpbG91dmJ3Z2l2Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NzAyNTQ1MSwiZXhwIjoyMDkyNjAxNDUxfQ.X8wGOgOsxxoUlCAh5XYdpPtzhMyUnKykiyFYxlfu2mo"
+SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 BUCKET       = "robo-upseller"
 
 ARQUIVOS = [

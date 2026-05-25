@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build e Release
 
 on:
   push:
@@ -6,28 +6,64 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Configurar Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Instalar dependências
         run: |
-          pip install flask supabase playwright openpyxl pyinstaller
+          pip install flask supabase playwright openpyxl pyinstaller python-dotenv
           playwright install chromium --with-deps
-
-      - name: Compilar executável
+      - name: Compilar
         run: pyinstaller robo_upseller.spec
-
-      - name: Upload executável
-        uses: actions/upload-artifact@v4
+      - name: Criar ZIP
+        run: Compress-Archive -Path dist\RoboUpSeller\* -DestinationPath RoboUpSeller_Windows.zip
+      - uses: actions/upload-artifact@v4
         with:
-          name: RoboUpSeller-Windows
-          path: dist/RoboUpSeller/
-          retention-days: 30
+          name: windows-zip
+          path: RoboUpSeller_Windows.zip
+
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Instalar dependências
+        run: |
+          pip install flask supabase playwright openpyxl pyinstaller python-dotenv
+          playwright install chromium
+      - name: Compilar
+        run: pyinstaller robo_upseller.spec
+      - name: Criar ZIP
+        run: zip -r RoboUpSeller_Mac.zip dist/RoboUpSeller/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-zip
+          path: RoboUpSeller_Mac.zip
+
+  release:
+    needs: [build-windows, build-mac]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-zip
+      - uses: actions/download-artifact@v4
+        with:
+          name: mac-zip
+      - name: Criar Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Robô UpSeller — versão mais recente"
+          body: "Download automático gerado pelo sistema AdnSys."
+          files: |
+            RoboUpSeller_Windows.zip
+            RoboUpSeller_Mac.zip
