@@ -1,0 +1,26 @@
+# Configuração local (credenciais do cliente)
+config.json
+.env
+
+# Dados e arquivos gerados em execução
+arquivos/
+dados/
+sessao/
+robo.log
+execucoes.json
+
+# Build
+dist/
+build/
+__pycache__/
+*.pyc
+*.spec.bak
+
+# macOS
+.DS_Store
+
+# Dev
+inspecionar_*.py
+lista_separacao.py
+pedidos_hoje.py
+app/
