@@ -1,0 +1,67 @@
+========================================
+  RoboUpSeller — Guia do Usuario
+========================================
+
+
+COMO INSTALAR
+--------------
+Windows:
+  1. Extraia o arquivo ZIP em qualquer pasta (ex: Area de Trabalho)
+  2. Abra a pasta RoboUpSeller
+  3. Clique duas vezes em "Instalar.bat"
+  4. O atalho "RoboUpSeller" sera criado na sua Area de Trabalho
+
+Mac:
+  1. Extraia o arquivo ZIP em qualquer pasta (ex: Area de Trabalho)
+  2. Abra a pasta RoboUpSeller
+  3. Clique duas vezes em "Instalar.command"
+     ATENCAO: se aparecer um aviso de seguranca do macOS,
+     clique com o botao DIREITO do mouse sobre o arquivo
+     e escolha "Abrir" no menu — depois clique "Abrir" novamente.
+  4. O atalho "RoboUpSeller" sera criado na sua Area de Trabalho
+
+
+COMO USAR
+-----------
+1. Clique duas vezes no atalho "RoboUpSeller" na Area de Trabalho
+2. Uma janela preta (terminal) vai abrir — NAO feche essa janela
+3. Seu navegador vai abrir automaticamente com a tela do robo
+4. Clique em "Iniciar importacao" para buscar os pedidos do dia
+5. Quando terminar, voce vera "Concluido!" na tela
+
+IMPORTANTE: O robo precisa ter acesso a internet para funcionar.
+
+
+CONFIGURACAO (PRIMEIRA VEZ)
+-----------------------------
+Na primeira abertura, o robo vai pedir seu e-mail e senha do UpSeller.
+Essas informacoes sao salvas uma unica vez — nas proximas vezes
+o robo ja vai lembrar automaticamente.
+
+
+ATUALIZACOES AUTOMATICAS
+--------------------------
+O robo verifica e instala atualizacoes automaticamente toda vez
+que e aberto. Voce nao precisa fazer nada — sempre estara na
+versao mais recente.
+
+
+COMO DESINSTALAR
+-----------------
+Windows:
+  1. Apague a pasta:  C:\Users\[seu nome]\RoboUpSeller
+  2. Apague o atalho "RoboUpSeller" da Area de Trabalho
+
+Mac:
+  1. Apague a pasta:  /Users/[seu nome]/RoboUpSeller
+     (ou: sua pasta pessoal → RoboUpSeller)
+  2. Apague o atalho "RoboUpSeller" da Area de Trabalho
+
+Nao ha nenhum outro arquivo ou registro deixado no sistema.
+
+
+SUPORTE
+--------
+AdnSys — Adilson Ramon de Souza
+WhatsApp: (16) 99162-4759
+E-mail: adnramon3@gmail.com

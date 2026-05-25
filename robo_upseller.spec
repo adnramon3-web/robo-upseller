@@ -12,7 +12,11 @@ a = Analysis(
     ["launcher.py"],
     pathex=[],
     binaries=binaries_pw + binaries_supa + binaries_flask,
-    datas=datas_pw + datas_supa + datas_flask,
+    datas=datas_pw + datas_supa + datas_flask + [
+        ("Instalar.bat",     "."),
+        ("Instalar.command", "."),
+        ("LEIA-ME.txt",      "."),
+    ],
     hiddenimports=(
         hiddenimports_pw
         + hiddenimports_supa
