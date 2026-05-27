@@ -9,11 +9,10 @@
     :root{
       --navy:#1A237E; --azul:#1565C0; --azul-cl:#1E88E5;
       --verde:#2E7D32; --verde-cl:#43A047; --laranja:#E65100;
-      --fundo:#F4F6F9; --branco:#FFFFFF;
+      --roxo:#6A1B9A; --fundo:#F4F6F9; --branco:#FFFFFF;
     }
     body{font-family:'Segoe UI',Arial,sans-serif;background:var(--fundo);color:#263238;min-height:100vh;}
 
-    /* NAV */
     nav{background:var(--navy);padding:0 28px;height:60px;display:flex;align-items:center;
         justify-content:space-between;box-shadow:0 2px 10px rgba(0,0,0,0.3);}
     .nav-brand{display:flex;align-items:center;gap:10px;}
@@ -23,52 +22,126 @@
     .nav-brand-sub{color:rgba(255,255,255,0.5);font-size:11px;}
     .status-pill{display:flex;align-items:center;gap:6px;padding:5px 14px;
         border-radius:20px;font-size:12px;font-weight:600;}
-    .status-pill.ok{background:rgba(46,125,50,0.25);color:#81C784;}
+    .status-pill.ok {background:rgba(46,125,50,0.25);color:#81C784;}
     .status-pill.nok{background:rgba(230,81,0,0.25);color:#FF8A65;}
     .status-dot{width:8px;height:8px;border-radius:50%;}
     .status-pill.ok  .status-dot{background:#81C784;}
     .status-pill.nok .status-dot{background:#FF8A65;}
 
-    /* BODY */
     .container{max-width:680px;margin:0 auto;padding:28px 16px 60px;}
 
-    /* CARD */
     .card{background:var(--branco);border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,0.07);
           margin-bottom:20px;overflow:hidden;}
     .card-header{padding:16px 24px;border-bottom:1px solid #EEF2F7;
         display:flex;align-items:center;gap:10px;}
-    .card-header h2{font-size:14px;font-weight:700;color:var(--navy);text-transform:uppercase;
-        letter-spacing:.6px;}
+    .card-header h2{font-size:14px;font-weight:700;color:var(--navy);text-transform:uppercase;letter-spacing:.6px;}
     .card-body{padding:20px 24px;}
 
-    /* FORM */
     .form-row{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px;}
     .form-row.single{grid-template-columns:1fr;}
     .form-group{display:flex;flex-direction:column;gap:5px;}
     .form-group label{font-size:12px;font-weight:600;color:#546E7A;}
-    .form-group input,.form-group select{
-        height:42px;border:1.5px solid #E3E8F0;border-radius:8px;
-        padding:0 12px;font-size:14px;color:#263238;outline:none;
-        transition:border-color .2s;background:#fff;}
-    .form-group input:focus,.form-group select:focus{border-color:var(--azul-cl);}
+    .form-group input{height:42px;border:1.5px solid #E3E8F0;border-radius:8px;
+        padding:0 12px;font-size:14px;color:#263238;outline:none;transition:border-color .2s;background:#fff;}
+    .form-group input:focus{border-color:var(--azul-cl);}
 
     .btn-save{width:100%;height:44px;background:var(--azul);color:#fff;border:none;
         border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;
         transition:background .2s;margin-top:6px;}
     .btn-save:hover{background:var(--azul-cl);}
+    .btn-save:disabled{opacity:.5;cursor:not-allowed;}
 
-    .btn-auth{width:100%;height:42px;border:1.5px solid var(--laranja);border-radius:8px;
-        background:none;color:var(--laranja);font-size:13px;font-weight:600;cursor:pointer;
-        transition:background .2s,border-color .2s,color .2s;margin-top:10px;}
+    /* HORÁRIOS */
+    .horarios-lista{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;min-height:36px;}
+    .horario-chip{display:flex;align-items:center;gap:6px;background:#EEF2F7;
+        border-radius:20px;padding:6px 12px;font-size:13px;font-weight:600;color:var(--navy);}
+    .horario-chip button{background:none;border:none;cursor:pointer;color:#90A4AE;
+        font-size:16px;line-height:1;padding:0 0 0 2px;}
+    .horario-chip button:hover{color:#E53935;}
+    .add-horario{display:flex;gap:8px;align-items:center;}
+    .add-horario input{height:38px;border:1.5px solid #E3E8F0;border-radius:8px;
+        padding:0 12px;font-size:14px;outline:none;width:130px;}
+    .add-horario input:focus{border-color:var(--azul-cl);}
+    .btn-add{height:38px;padding:0 16px;background:var(--verde);color:#fff;border:none;
+        border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;}
+    .btn-add:hover{background:var(--verde-cl);}
+
+    /* ETAPAS */
+    .etapas-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+    .etapa-item{display:flex;align-items:center;justify-content:space-between;
+        padding:12px 16px;border:1.5px solid #E3E8F0;border-radius:10px;
+        transition:border-color .2s,background .2s;}
+    .etapa-item.ativa{border-color:#BBDEFB;background:#F0F8FF;}
+    .etapa-label{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:#37474F;}
+    .etapa-label span{font-size:18px;}
+
+    /* TOGGLE SWITCH */
+    .toggle{position:relative;width:44px;height:24px;flex-shrink:0;}
+    .toggle input{opacity:0;width:0;height:0;}
+    .toggle-slider{position:absolute;inset:0;background:#CFD8DC;border-radius:12px;
+        cursor:pointer;transition:.2s;}
+    .toggle-slider::before{content:'';position:absolute;width:18px;height:18px;
+        background:#fff;border-radius:50%;left:3px;top:3px;transition:.2s;
+        box-shadow:0 1px 3px rgba(0,0,0,0.2);}
+    .toggle input:checked + .toggle-slider{background:var(--verde);}
+    .toggle input:checked + .toggle-slider::before{transform:translateX(20px);}
+
+    /* CLIENTE INFO */
+    .cliente-info{display:flex;align-items:center;gap:12px;padding:14px 20px;
+        background:linear-gradient(135deg,#E3F2FD,#EDE7F6);border-radius:12px;
+        margin-bottom:18px;}
+    .ci-icon{font-size:28px;}
+    .ci-nome{font-weight:700;color:var(--navy);font-size:15px;}
+    .ci-sub{color:#546E7A;font-size:12px;margin-top:2px;}
+
+    /* EXECUÇÃO */
+    .exec-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:14px;}
+    .exec-block{border:1.5px solid #E3E8F0;border-radius:14px;padding:18px 12px 14px;
+        display:flex;flex-direction:column;align-items:center;text-align:center;gap:5px;}
+    .exec-icon{font-size:24px;line-height:1;}
+    .exec-titulo{font-size:10px;font-weight:700;color:#78909C;text-transform:uppercase;letter-spacing:.7px;}
+    .exec-data{font-size:16px;font-weight:800;color:var(--navy);margin:2px 0;}
+    .exec-sub{font-size:11px;color:#90A4AE;min-height:16px;}
+    .exec-select{width:100%;height:32px;border:1.5px solid #E3E8F0;border-radius:6px;
+        padding:0 8px;font-size:12px;color:#546E7A;outline:none;background:#F8FAFC;
+        margin-top:4px;cursor:pointer;}
+    .exec-btn{width:100%;height:38px;border:none;border-radius:8px;font-size:13px;
+        font-weight:700;cursor:pointer;margin-top:8px;transition:opacity .2s,transform .15s;}
+    .exec-btn:hover{opacity:.88;transform:translateY(-1px);}
+    .exec-btn:disabled{opacity:.4;cursor:not-allowed;transform:none;}
+    .exec-btn-periodo{background:linear-gradient(135deg,var(--verde),var(--verde-cl));color:#fff;}
+    .exec-btn-hoje   {background:linear-gradient(135deg,var(--azul),var(--azul-cl));color:#fff;}
+
+    .btn-sec{width:100%;height:42px;border-radius:8px;font-size:13px;font-weight:600;
+        cursor:pointer;transition:background .2s;margin-top:10px;}
+    .btn-auth{border:1.5px solid var(--laranja);background:none;color:var(--laranja);}
     .btn-auth:hover{background:rgba(230,81,0,0.07);}
     .btn-auth.sessao-ok{border-color:#B0BEC5;color:#78909C;}
-    .btn-auth.sessao-ok:hover{background:#f1f5f9;}
-
-    .btn-setup{width:100%;height:42px;border:1.5px solid #7B1FA2;border-radius:8px;
-        background:none;color:#7B1FA2;font-size:13px;font-weight:600;cursor:pointer;
-        transition:background .2s;margin-top:10px;}
-    .btn-setup:hover{background:rgba(123,31,162,0.07);}
+    .btn-capturar{border:none;background:linear-gradient(135deg,var(--azul),var(--azul-cl));color:#fff;}
+    .btn-setup{border:1.5px solid var(--roxo);background:none;color:var(--roxo);}
+    .btn-setup:hover{background:rgba(106,27,154,0.07);}
     .btn-setup.ok{border-color:#B0BEC5;color:#78909C;}
+
+    /* PROGRESS */
+    .progress-bar{height:4px;background:#E3E8F0;border-radius:4px;overflow:hidden;
+        margin-bottom:16px;display:none;}
+    .progress-fill{height:100%;background:linear-gradient(90deg,var(--azul),var(--azul-cl));}
+    .progress-bar.active{display:block;}
+    .progress-bar.active .progress-fill{animation:prog 2s ease-in-out infinite alternate;}
+    @keyframes prog{from{width:20%}to{width:90%}}
+
+    /* LOG */
+    .log-area{background:#0F172A;border-radius:10px;padding:16px;
+        height:280px;overflow-y:auto;font-family:'SF Mono',Menlo,monospace;font-size:12px;
+        line-height:1.7;color:#94A3B8;}
+    .log-area .log-ok    {color:#86EFAC;}
+    .log-area .log-erro  {color:#FCA5A5;}
+    .log-area .log-info  {color:#93C5FD;}
+    .log-area .log-normal{color:#CBD5E1;}
+    .log-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;}
+    .log-header h2{font-size:13px;font-weight:700;color:var(--navy);text-transform:uppercase;letter-spacing:.6px;}
+    .btn-limpar{background:none;border:1px solid #E3E8F0;border-radius:6px;
+        padding:4px 10px;font-size:11px;color:#90A4AE;cursor:pointer;}
 
     /* MODAL */
     .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:100;
@@ -85,62 +158,9 @@
     .modal-close{width:100%;height:40px;background:var(--azul);color:#fff;border:none;
         border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;}
 
-    /* BLOCOS DE EXECUÇÃO */
-    .exec-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px;}
-    .exec-block{border:1.5px solid #E3E8F0;border-radius:14px;padding:20px 14px 16px;
-        display:flex;flex-direction:column;align-items:center;text-align:center;gap:6px;}
-    .exec-icon{font-size:26px;line-height:1;}
-    .exec-titulo{font-size:10px;font-weight:700;color:#78909C;text-transform:uppercase;
-        letter-spacing:.7px;}
-    .exec-data{font-size:17px;font-weight:800;color:var(--navy);margin:2px 0;}
-    .exec-sub{font-size:11px;color:#90A4AE;min-height:16px;}
-    .exec-select{width:100%;height:32px;border:1.5px solid #E3E8F0;border-radius:6px;
-        padding:0 8px;font-size:12px;color:#546E7A;outline:none;background:#F8FAFC;
-        margin-top:4px;cursor:pointer;}
-    .exec-btn{width:100%;height:40px;border:none;border-radius:8px;font-size:13px;
-        font-weight:700;cursor:pointer;margin-top:8px;transition:opacity .2s,transform .15s;}
-    .exec-btn:hover{opacity:.88;transform:translateY(-1px);}
-    .exec-btn:disabled{opacity:.4;cursor:not-allowed;transform:none;}
-    .exec-btn-periodo{background:linear-gradient(135deg,var(--verde),var(--verde-cl));color:#fff;}
-    .exec-btn-hoje   {background:linear-gradient(135deg,var(--azul),var(--azul-cl));color:#fff;}
-    @media(max-width:420px){.exec-grid{grid-template-columns:1fr;}}
-
-    /* INFO CLIENTE */
-    .cliente-info{display:flex;align-items:center;gap:12px;padding:14px 20px;
-        background:linear-gradient(135deg,#E3F2FD,#EDE7F6);border-radius:12px;
-        margin-bottom:18px;font-size:13px;}
-    .ci-icon{font-size:28px;}
-    .ci-nome{font-weight:700;color:var(--navy);font-size:15px;}
-    .ci-sub{color:#546E7A;font-size:12px;margin-top:2px;}
-
-    /* LOG */
-    .log-area{background:#0F172A;border-radius:10px;padding:16px;
-        height:280px;overflow-y:auto;font-family:'SF Mono',Menlo,monospace;font-size:12px;
-        line-height:1.7;color:#94A3B8;}
-    .log-area .log-ok     {color:#86EFAC;}
-    .log-area .log-erro   {color:#FCA5A5;}
-    .log-area .log-info   {color:#93C5FD;}
-    .log-area .log-normal {color:#CBD5E1;}
-
-    .log-header{display:flex;align-items:center;justify-content:space-between;
-        margin-bottom:8px;}
-    .log-header h2{font-size:13px;font-weight:700;color:var(--navy);text-transform:uppercase;letter-spacing:.6px;}
-    .btn-limpar{background:none;border:1px solid #E3E8F0;border-radius:6px;
-        padding:4px 10px;font-size:11px;color:#90A4AE;cursor:pointer;}
-    .btn-limpar:hover{background:#f1f5f9;}
-
-    /* PROGRESS BAR */
-    .progress-bar{height:4px;background:#E3E8F0;border-radius:4px;overflow:hidden;
-        margin-bottom:18px;display:none;}
-    .progress-fill{height:100%;background:linear-gradient(90deg,var(--azul),var(--azul-cl));
-        width:0%;transition:width .3s;border-radius:4px;}
-    .progress-bar.active{display:block;}
-    .progress-bar.active .progress-fill{animation:progress-anim 2s ease-in-out infinite alternate;}
-    @keyframes progress-anim{from{width:20%}to{width:90%}}
-
-    @media(max-width:540px){
-      .form-row{grid-template-columns:1fr;}
-      .acoes{grid-template-columns:1fr;}
+    @media(max-width:480px){
+      .exec-grid{grid-template-columns:1fr 1fr;}
+      .etapas-grid{grid-template-columns:1fr;}
     }
   </style>
 </head>
@@ -151,7 +171,7 @@
     <div class="nav-brand-icon">🤖</div>
     <div>
       <div class="nav-brand-text">AdnSys Robo UpSeller</div>
-      <div class="nav-brand-sub">Extração automática de pedidos</div>
+      <div class="nav-brand-sub">Automação de pedidos</div>
     </div>
   </div>
   <div class="status-pill nok" id="status-pill">
@@ -162,7 +182,7 @@
 
 <div class="container">
 
-  <!-- INFO CLIENTE (aparece quando configurado) -->
+  <!-- CLIENTE INFO -->
   <div class="cliente-info" id="cliente-info" style="display:none">
     <div class="ci-icon">🏭</div>
     <div>
@@ -173,10 +193,7 @@
 
   <!-- CONFIGURAÇÃO -->
   <div class="card">
-    <div class="card-header">
-      <span>⚙️</span>
-      <h2>Configuração</h2>
-    </div>
+    <div class="card-header"><span>⚙️</span><h2>Configuração</h2></div>
     <div class="card-body">
       <div class="form-row single">
         <div class="form-group">
@@ -199,91 +216,106 @@
               style="flex:1;padding-right:40px;"/>
             <button type="button" onclick="toggleSenha()"
               style="position:absolute;right:0;top:0;height:42px;width:40px;background:none;border:none;cursor:pointer;color:#90A4AE;font-size:16px;"
-              id="btn-ver-senha" title="Mostrar/ocultar senha">👁</button>
+              id="btn-ver-senha">👁</button>
           </div>
         </div>
       </div>
-      <div class="form-row">
-        <div class="form-group">
-          <label>Início do expediente</label>
-          <input type="time" id="hora_inicio" value="{{ config.get('hora_inicio','07:00') }}"/>
-        </div>
-        <div class="form-group">
-          <label>Fim do expediente</label>
-          <input type="time" id="hora_fim" value="{{ config.get('hora_fim','18:00') }}"/>
-        </div>
-      </div>
-      <div class="form-row single">
-        <div class="form-group">
-          <label>Intervalo de atualização</label>
-          <select id="intervalo_horas">
-            <option value="1" {% if config.get('intervalo_horas',1)|int == 1 %}selected{% endif %}>A cada 1 hora</option>
-            <option value="2" {% if config.get('intervalo_horas',1)|int == 2 %}selected{% endif %}>A cada 2 horas</option>
-            <option value="3" {% if config.get('intervalo_horas',1)|int == 3 %}selected{% endif %}>A cada 3 horas</option>
-          </select>
-        </div>
-      </div>
-      <button class="btn-save" onclick="salvar()">💾 Salvar Configuração</button>
     </div>
   </div>
 
-  <!-- EXECUÇÃO -->
+  <!-- HORÁRIOS AUTOMÁTICOS -->
   <div class="card">
-    <div class="card-header">
-      <span>▶️</span>
-      <h2>Execução Manual</h2>
-    </div>
+    <div class="card-header"><span>🕐</span><h2>Horários Automáticos</h2></div>
     <div class="card-body">
-      <div class="progress-bar" id="progress-bar">
-        <div class="progress-fill"></div>
+      <p style="font-size:12px;color:#78909C;margin-bottom:14px;">
+        Adicione os horários que o robô deve executar automaticamente. Pode ser qualquer horário.
+      </p>
+      <div class="horarios-lista" id="horarios-lista"></div>
+      <div class="add-horario">
+        <input type="time" id="novo-horario" value="08:00"/>
+        <button class="btn-add" onclick="adicionarHorario()">+ Adicionar</button>
       </div>
-      <div class="exec-info" id="exec-info" style="font-size:12px;color:#78909C;margin-bottom:14px;min-height:18px;"></div>
-      <div class="exec-grid" style="grid-template-columns:1fr 1fr 1fr;">
+    </div>
+  </div>
 
-        <!-- Dia Completo (escolha a data) -->
+  <!-- ETAPAS -->
+  <div class="card">
+    <div class="card-header"><span>📋</span><h2>Etapas Automáticas</h2></div>
+    <div class="card-body">
+      <p style="font-size:12px;color:#78909C;margin-bottom:16px;">
+        Escolha quais etapas o robô executa em cada ciclo automático.
+      </p>
+      <div class="etapas-grid">
+        <div class="etapa-item" id="etapa-importar-box">
+          <div class="etapa-label"><span>📥</span> Importar Pedidos</div>
+          <label class="toggle">
+            <input type="checkbox" id="etapa-importar" checked onchange="atualizarEtapa('importar')"/>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div class="etapa-item" id="etapa-picklist-box">
+          <div class="etapa-label"><span>🗒️</span> Imprimir Picklist</div>
+          <label class="toggle">
+            <input type="checkbox" id="etapa-picklist" checked onchange="atualizarEtapa('picklist')"/>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div class="etapa-item" id="etapa-nfe-box">
+          <div class="etapa-label"><span>📄</span> Emitir Nota Fiscal</div>
+          <label class="toggle">
+            <input type="checkbox" id="etapa-nfe" checked onchange="atualizarEtapa('nfe')"/>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div class="etapa-item" id="etapa-envio-box">
+          <div class="etapa-label"><span>🚚</span> Programar Envio</div>
+          <label class="toggle">
+            <input type="checkbox" id="etapa-envio" checked onchange="atualizarEtapa('envio')"/>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SALVAR -->
+  <button class="btn-save" id="btn-save" onclick="salvar()" style="margin-bottom:20px;">💾 Salvar Configuração</button>
+
+  <!-- EXECUÇÃO MANUAL -->
+  <div class="card">
+    <div class="card-header"><span>▶️</span><h2>Execução Manual</h2></div>
+    <div class="card-body">
+      <div class="progress-bar" id="progress-bar"><div class="progress-fill"></div></div>
+      <div class="exec-grid">
         <div class="exec-block">
           <div class="exec-icon">📆</div>
-          <div class="exec-titulo">Dia Completo</div>
-          <input type="date" id="data-ontem" class="exec-select" style="margin-top:6px;cursor:pointer;"/>
+          <div class="exec-titulo">Dia Específico</div>
+          <input type="date" id="data-ontem" class="exec-select" style="cursor:pointer;"/>
           <div class="exec-sub">00:00 até 23:59</div>
           <div style="flex:1"></div>
-          <button class="exec-btn exec-btn-periodo" id="btn-ontem" onclick="executar('ontem')">
-            ▶ Executar
-          </button>
+          <button class="exec-btn exec-btn-periodo" id="btn-ontem" onclick="executar('ontem')">▶ Executar</button>
         </div>
-
-        <!-- Hoje até agora -->
         <div class="exec-block">
           <div class="exec-icon">📅</div>
           <div class="exec-titulo">Hoje até agora</div>
           <div class="exec-data" id="exec-data-hoje">—</div>
           <div class="exec-sub" id="exec-hora-hoje">até —:—</div>
           <div style="flex:1"></div>
-          <button class="exec-btn exec-btn-hoje" id="btn-hoje" onclick="executar('hoje')">
-            ▶ Executar
-          </button>
+          <button class="exec-btn exec-btn-hoje" id="btn-hoje" onclick="executar('hoje')">▶ Executar</button>
         </div>
-
-        <!-- Ambos -->
         <div class="exec-block">
           <div class="exec-icon">🔄</div>
           <div class="exec-titulo">Ontem + Hoje</div>
-          <div class="exec-data" style="font-size:13px;color:#7B1FA2;">Carga completa</div>
-          <div class="exec-sub">igual ao início do dia</div>
+          <div class="exec-data" style="font-size:12px;color:#7B1FA2;">Carga completa</div>
+          <div class="exec-sub">início do dia</div>
           <div style="flex:1"></div>
           <button class="exec-btn" id="btn-ambos" onclick="executar('ambos')"
-            style="background:linear-gradient(135deg,#6A1B9A,#9C27B0);color:#fff;">
-            ▶ Executar
-          </button>
+            style="background:linear-gradient(135deg,#6A1B9A,#9C27B0);color:#fff;">▶ Executar</button>
         </div>
-
       </div>
-      <button class="btn-auth" id="btn-auth" onclick="autenticarUpseller()">
-        🔐 Autenticar UpSeller
-      </button>
-      <button class="btn-setup" id="btn-setup" onclick="configurarInicializacao()">
-        ⚙️ Configurar Inicialização Automática
-      </button>
+      <button class="btn-sec btn-auth" id="btn-auth" onclick="autenticarUpseller()">🔐 Autenticar UpSeller</button>
+      <button class="btn-sec btn-capturar" id="btn-capturar" onclick="capturarEtiquetas()">🏷️ Capturar Etiquetas</button>
+      <button class="btn-sec btn-setup" id="btn-setup" onclick="configurarInicializacao()">⚙️ Inicialização Automática</button>
     </div>
   </div>
 
@@ -315,7 +347,10 @@
 </div>
 
 <script>
-  // ── Status ao carregar ────────────────────────────────────────────────────
+  // Estado local
+  let _horarios = [];
+  let _etapas   = { importar: true, picklist: true, nfe: true, envio: true };
+
   window.addEventListener('DOMContentLoaded', () => {
     verificarStatus();
     iniciarLogStream();
@@ -324,21 +359,67 @@
   });
 
   function atualizarBlocos() {
-    const hoje      = new Date();
-    const ontem     = new Date(hoje); ontem.setDate(hoje.getDate() - 1);
-    const isoOntem  = ontem.toISOString().split('T')[0];
-    const fmt       = d => d.toLocaleDateString('pt-BR', {day:'2-digit',month:'2-digit',year:'numeric'});
-    const hm        = d => d.toLocaleTimeString('pt-BR', {hour:'2-digit',minute:'2-digit'});
-
-    const inputData = document.getElementById('data-ontem');
-    if (inputData && !inputData.value) inputData.value = isoOntem;
-
+    const hoje  = new Date();
+    const ontem = new Date(hoje); ontem.setDate(hoje.getDate() - 1);
+    const fmt   = d => d.toLocaleDateString('pt-BR', {day:'2-digit',month:'2-digit',year:'numeric'});
+    const hm    = d => d.toLocaleTimeString('pt-BR', {hour:'2-digit',minute:'2-digit'});
+    const inp   = document.getElementById('data-ontem');
+    if (inp && !inp.value) inp.value = ontem.toISOString().split('T')[0];
     document.getElementById('exec-data-hoje').textContent = fmt(hoje);
     document.getElementById('exec-hora-hoje').textContent = `até ${hm(hoje)}`;
   }
 
+  // ── Horários ─────────────────────────────────────────────────────────────
+  function renderHorarios() {
+    const lista = document.getElementById('horarios-lista');
+    lista.innerHTML = '';
+    _horarios.sort().forEach(h => {
+      const chip = document.createElement('div');
+      chip.className = 'horario-chip';
+      chip.innerHTML = `🕐 ${h} <button onclick="removerHorario('${h}')" title="Remover">×</button>`;
+      lista.appendChild(chip);
+    });
+    if (_horarios.length === 0) {
+      lista.innerHTML = '<span style="font-size:12px;color:#B0BEC5;padding:6px 0;">Nenhum horário cadastrado</span>';
+    }
+  }
+
+  function adicionarHorario() {
+    const val = document.getElementById('novo-horario').value;
+    if (!val) return;
+    if (!_horarios.includes(val)) {
+      _horarios.push(val);
+      renderHorarios();
+    }
+  }
+
+  function removerHorario(h) {
+    _horarios = _horarios.filter(x => x !== h);
+    renderHorarios();
+  }
+
+  // ── Etapas ───────────────────────────────────────────────────────────────
+  function atualizarEtapa(nome) {
+    _etapas[nome] = document.getElementById(`etapa-${nome}`).checked;
+    const box = document.getElementById(`etapa-${nome}-box`);
+    if (box) box.classList.toggle('ativa', _etapas[nome]);
+  }
+
+  function aplicarEtapas(etapas) {
+    _etapas = { ...{ importar: true, picklist: true, nfe: true, envio: true }, ...etapas };
+    ['importar','picklist','nfe','envio'].forEach(n => {
+      const el = document.getElementById(`etapa-${n}`);
+      if (el) {
+        el.checked = _etapas[n];
+        const box = document.getElementById(`etapa-${n}-box`);
+        if (box) box.classList.toggle('ativa', _etapas[n]);
+      }
+    });
+  }
+
+  // ── Status ───────────────────────────────────────────────────────────────
   async function verificarStatus() {
-    const r   = await fetch('/status');
+    const r    = await fetch('/status');
     const data = await r.json();
     const pill = document.getElementById('status-pill');
     const txt  = document.getElementById('status-texto');
@@ -348,22 +429,30 @@
       txt.textContent = data.rodando ? 'Rodando...' : 'Conectado';
       document.getElementById('cliente-info').style.display = 'flex';
       document.getElementById('ci-nome').textContent = data.cliente;
-      const intv = data.intervalo_horas === 1 ? '1h' : `${data.intervalo_horas}h`;
+
+      const hs = (data.horarios || []);
+      const proxima = data.proxima || '—';
       document.getElementById('ci-sub').textContent =
-        `${data.hora_inicio}–${data.hora_fim} a cada ${intv} · Próxima: ${data.proxima}`;
-      const info = document.getElementById('exec-info');
-      if (info) info.textContent = `Agenda: ${(data.horarios||[]).join(', ')}`;
+        hs.length ? `${hs.length} horário(s) · Próxima execução: ${proxima}` : 'Nenhum horário configurado';
+
+      // Carrega horários e etapas vindos do servidor
+      if (Array.isArray(data.horarios)) {
+        _horarios = data.horarios;
+        renderHorarios();
+      }
+      if (data.etapas) aplicarEtapas(data.etapas);
     } else {
       pill.className = 'status-pill nok';
       txt.textContent = 'Não configurado';
+      renderHorarios();
     }
 
     const btnAuth = document.getElementById('btn-auth');
     if (data.sessao_ok) {
-      btnAuth.className = 'btn-auth sessao-ok';
+      btnAuth.className = 'btn-sec btn-auth sessao-ok';
       btnAuth.textContent = '✅ Sessão UpSeller ativa';
     } else {
-      btnAuth.className = 'btn-auth';
+      btnAuth.className = 'btn-sec btn-auth';
       btnAuth.textContent = '🔐 Autenticar UpSeller';
     }
   }
@@ -371,18 +460,13 @@
   function toggleSenha() {
     const input = document.getElementById('senha');
     const btn   = document.getElementById('btn-ver-senha');
-    if (input.type === 'password') {
-      input.type = 'text';
-      btn.textContent = '🙈';
-    } else {
-      input.type = 'password';
-      btn.textContent = '👁';
-    }
+    input.type  = input.type === 'password' ? 'text' : 'password';
+    btn.textContent = input.type === 'password' ? '👁' : '🙈';
   }
 
-  // ── Salvar configuração ───────────────────────────────────────────────────
+  // ── Salvar ───────────────────────────────────────────────────────────────
   async function salvar() {
-    const btn = document.querySelector('.btn-save');
+    const btn = document.getElementById('btn-save');
     btn.textContent = 'Salvando...';
     btn.disabled = true;
 
@@ -390,20 +474,19 @@
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        token:           document.getElementById('token').value,
-        upseller_email:  document.getElementById('email').value,
-        upseller_senha:  document.getElementById('senha').value,
-        hora_inicio:     document.getElementById('hora_inicio').value,
-        hora_fim:        document.getElementById('hora_fim').value,
-        intervalo_horas: parseInt(document.getElementById('intervalo_horas').value),
+        token:          document.getElementById('token').value,
+        upseller_email: document.getElementById('email').value,
+        upseller_senha: document.getElementById('senha').value,
+        horarios:       _horarios,
+        etapas:         _etapas,
       })
     });
     const data = await resp.json();
 
     if (data.ok) {
       btn.textContent = '✅ Salvo!';
-      adicionarLog(`✅ Configuração salva — Cliente: ${data.cliente}`, 'ok');
-      setTimeout(() => verificarStatus(), 500);
+      adicionarLog(`✅ Configuração salva — ${data.cliente}`, 'ok');
+      setTimeout(() => verificarStatus(), 400);
     } else {
       btn.textContent = '❌ Erro';
       adicionarLog(`❌ ${data.erro}`, 'erro');
@@ -411,7 +494,7 @@
     setTimeout(() => { btn.textContent = '💾 Salvar Configuração'; btn.disabled = false; }, 2000);
   }
 
-  // ── Executar robô ─────────────────────────────────────────────────────────
+  // ── Executar ─────────────────────────────────────────────────────────────
   function _setBotoes(disabled) {
     ['btn-ontem','btn-hoje','btn-ambos'].forEach(id => {
       const el = document.getElementById(id);
@@ -420,10 +503,8 @@
   }
 
   async function executar(modo) {
-    const progBar = document.getElementById('progress-bar');
     _setBotoes(true);
-    progBar.classList.add('active');
-
+    document.getElementById('progress-bar').classList.add('active');
     const dataOntem = document.getElementById('data-ontem')?.value || '';
     const resp = await fetch('/executar', {
       method: 'POST',
@@ -431,134 +512,69 @@
       body: JSON.stringify({ modo, data_alvo: dataOntem })
     });
     const data = await resp.json();
-
     if (!data.ok) {
       adicionarLog(`❌ ${data.erro}`, 'erro');
       _setBotoes(false);
-      progBar.classList.remove('active');
+      document.getElementById('progress-bar').classList.remove('active');
       return;
     }
-
-    // Polling fallback: caso SSE perca conexão e __fim__ não chegue
     const poll = setInterval(async () => {
       try {
-        const r = await fetch('/rodando');
-        const s = await r.json();
-        if (!s.rodando) {
-          clearInterval(poll);
-          _setBotoes(false);
-          progBar.classList.remove('active');
-        }
-      } catch (e) {}
+        const s = await (await fetch('/rodando')).json();
+        if (!s.rodando) { clearInterval(poll); _setBotoes(false); document.getElementById('progress-bar').classList.remove('active'); }
+      } catch(e){}
     }, 3000);
   }
 
-  // ── Stream de logs (SSE) ──────────────────────────────────────────────────
+  // ── Capturar etiquetas ───────────────────────────────────────────────────
+  async function capturarEtiquetas() {
+    const btn = document.getElementById('btn-capturar');
+    btn.disabled = true;
+    btn.textContent = '⏳ Capturando...';
+    adicionarLog('🏷️ Iniciando captura de etiquetas...', 'normal');
+    try {
+      const resp = await fetch('/capturar-etiquetas', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
+      const data = await resp.json();
+      if (!data.ok) adicionarLog(`❌ ${data.erro}`, 'erro');
+    } catch(e) { adicionarLog(`❌ Erro: ${e}`, 'erro'); }
+    setTimeout(() => { btn.disabled = false; btn.textContent = '🏷️ Capturar Etiquetas'; }, 3000);
+  }
+
+  // ── Log stream ───────────────────────────────────────────────────────────
   function iniciarLogStream() {
     const source = new EventSource('/logs');
     source.onmessage = (e) => {
       const msg = e.data;
       if (msg === '__ping__') return;
-
       if (msg === '__fim__') {
         _setBotoes(false);
         document.getElementById('progress-bar').classList.remove('active');
         verificarStatus();
         return;
       }
-
-      const tipo = msg.includes('✅') || msg.includes('OK') ? 'ok'
-                 : msg.includes('❌') || msg.includes('Erro') ? 'erro'
-                 : 'normal';
+      const tipo = msg.includes('✅') ? 'ok' : msg.includes('❌') || msg.includes('Erro') ? 'erro' : 'normal';
       adicionarLog(msg, tipo);
     };
   }
 
   function adicionarLog(msg, tipo = 'normal') {
     const area = document.getElementById('log-area');
-    const span = document.createElement('div');
-    span.className = `log-${tipo}`;
-    span.textContent = msg;
-    area.appendChild(span);
+    const div  = document.createElement('div');
+    div.className = `log-${tipo}`;
+    div.textContent = msg;
+    area.appendChild(div);
     area.scrollTop = area.scrollHeight;
   }
 
-  function limparLog() {
-    document.getElementById('log-area').innerHTML = '';
-  }
+  function limparLog() { document.getElementById('log-area').innerHTML = ''; }
 
-  async function configurarInicializacao() {
-    const btn = document.getElementById('btn-setup');
-    btn.disabled = true;
-    btn.textContent = 'Configurando...';
-
-    const resp = await fetch('/configurar_inicializacao', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({})
-    });
-    const data = await resp.json();
-    btn.disabled = false;
-
-    if (!data.ok) {
-      adicionarLog(`❌ ${data.erro}`, 'erro');
-      btn.textContent = '⚙️ Configurar Inicialização Automática';
-      return;
-    }
-
-    if (data.sistema === 'mac') {
-      if (data.launchagent) {
-        adicionarLog('✅ App configurado para iniciar automaticamente ao ligar o Mac', 'ok');
-      }
-      if (data.pmset_ok) {
-        adicionarLog(`✅ Mac programado para acordar às ${data.wake_time} todos os dias`, 'ok');
-        btn.className = 'btn-setup ok';
-        btn.textContent = '✅ Inicialização automática ativa';
-      } else {
-        document.getElementById('pmset-cmd').textContent = data.pmset_cmd;
-        document.getElementById('modal-pmset').style.display = 'flex';
-        btn.textContent = '⚙️ Configurar Inicialização Automática';
-      }
-    } else if (data.sistema === 'windows') {
-      if (data.login_ok) {
-        adicionarLog('✅ App configurado para iniciar automaticamente no Windows', 'ok');
-      }
-      data.wake_tasks.forEach(t => {
-        if (t.ok) adicionarLog(`✅ Windows acordará às ${t.wake} (antes das ${t.horario})`, 'ok');
-        else adicionarLog(`⚠️ Falha ao configurar wake para ${t.horario}`, 'erro');
-      });
-      btn.className = 'btn-setup ok';
-      btn.textContent = '✅ Inicialização automática ativa';
-    }
-  }
-
-  function fecharModal() {
-    document.getElementById('modal-pmset').style.display = 'none';
-    document.getElementById('btn-setup').className = 'btn-setup ok';
-    document.getElementById('btn-setup').textContent = '✅ Inicialização automática ativa';
-  }
-
-  function copiarCmd() {
-    const txt = document.getElementById('pmset-cmd').textContent;
-    navigator.clipboard.writeText(txt).then(() => {
-      const el = document.getElementById('pmset-cmd');
-      el.style.color = '#FCD34D';
-      setTimeout(() => el.style.color = '', 1000);
-    });
-  }
-
+  // ── Autenticar ───────────────────────────────────────────────────────────
   async function autenticarUpseller() {
     const btn = document.getElementById('btn-auth');
     btn.disabled = true;
     btn.textContent = 'Abrindo browser...';
-
-    const resp = await fetch('/login_upseller', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({})
-    });
+    const resp = await fetch('/login_upseller', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
     const data = await resp.json();
-
     if (!data.ok) {
       adicionarLog(`❌ ${data.erro}`, 'erro');
       btn.disabled = false;
@@ -567,6 +583,45 @@
       adicionarLog('🌐 Browser aberto. Complete o login no UpSeller.', 'info');
       setTimeout(() => { btn.disabled = false; verificarStatus(); }, 3000);
     }
+  }
+
+  // ── Inicialização automática ─────────────────────────────────────────────
+  async function configurarInicializacao() {
+    const btn = document.getElementById('btn-setup');
+    btn.disabled = true;
+    btn.textContent = 'Configurando...';
+    const resp = await fetch('/configurar_inicializacao', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
+    const data = await resp.json();
+    btn.disabled = false;
+    if (!data.ok) { adicionarLog(`❌ ${data.erro}`, 'erro'); btn.textContent = '⚙️ Inicialização Automática'; return; }
+    if (data.sistema === 'mac') {
+      if (data.launchagent) adicionarLog('✅ Inicialização automática configurada no Mac', 'ok');
+      if (data.pmset_ok) {
+        adicionarLog(`✅ Mac acordará às ${data.wake_time}`, 'ok');
+        btn.className = 'btn-sec btn-setup ok';
+        btn.textContent = '✅ Inicialização ativa';
+      } else {
+        document.getElementById('pmset-cmd').textContent = data.pmset_cmd;
+        document.getElementById('modal-pmset').style.display = 'flex';
+        btn.textContent = '⚙️ Inicialização Automática';
+      }
+    } else if (data.sistema === 'windows') {
+      if (data.login_ok) adicionarLog('✅ Inicialização automática configurada no Windows', 'ok');
+      btn.className = 'btn-sec btn-setup ok';
+      btn.textContent = '✅ Inicialização ativa';
+    }
+  }
+
+  function fecharModal() {
+    document.getElementById('modal-pmset').style.display = 'none';
+    const btn = document.getElementById('btn-setup');
+    btn.className = 'btn-sec btn-setup ok';
+    btn.textContent = '✅ Inicialização ativa';
+  }
+
+  function copiarCmd() {
+    navigator.clipboard.writeText(document.getElementById('pmset-cmd').textContent)
+      .then(() => { const el = document.getElementById('pmset-cmd'); el.style.color='#FCD34D'; setTimeout(()=>el.style.color='',1000); });
   }
 </script>
 </body>
