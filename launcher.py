@@ -132,7 +132,7 @@ def main():
 
     # Abre o navegador após 2s (tempo para Flask subir)
     threading.Thread(
-        target=lambda: (time.sleep(2), webbrowser.open("http://127.0.0.1:5000")),
+        target=lambda: (time.sleep(2), webbrowser.open("http://127.0.0.1:5001")),
         daemon=True,
     ).start()
 
