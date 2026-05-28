@@ -47,7 +47,7 @@ def _carregar_execucoes() -> set:
     hoje = str(date.today())
     try:
         if EXECUCOES_FILE.exists():
-            dados = json.loads(EXECUCOES_FILE.read_text())
+            dados = json.loads(EXECUCOES_FILE.read_text(encoding="utf-8"))
             return {k for k in dados.get("chaves", []) if k.startswith(hoje)}
     except Exception:
         pass
@@ -56,7 +56,7 @@ def _carregar_execucoes() -> set:
 
 def _salvar_execucoes(chaves: set):
     try:
-        EXECUCOES_FILE.write_text(json.dumps({"chaves": list(chaves)}, ensure_ascii=False))
+        EXECUCOES_FILE.write_text(json.dumps({"chaves": list(chaves)}, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
 
@@ -69,7 +69,7 @@ _execucoes_hoje = _carregar_execucoes()
 def index():
     config = {}
     if CONFIG_FILE.exists():
-        config = json.loads(CONFIG_FILE.read_text())
+        config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     return render_template("index.html", config=config)
 
 
@@ -98,7 +98,7 @@ def salvar():
         "horarios":       dados.get("horarios", []),
         "etapas":         dados.get("etapas", {"importar": True, "picklist": True, "nfe": True, "envio": True}),
     }
-    CONFIG_FILE.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+    CONFIG_FILE.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     return jsonify({"ok": True, "cliente": nome})
 
 
@@ -112,7 +112,7 @@ def executar():
     if not CONFIG_FILE.exists():
         return jsonify({"ok": False, "erro": "Salve a configuração primeiro"})
 
-    config = json.loads(CONFIG_FILE.read_text())
+    config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     modo   = request.json.get("modo", "hoje")
     agora  = datetime.now()
     ontem  = date.today() - timedelta(days=1)
@@ -161,7 +161,7 @@ def login_upseller():
     if not CONFIG_FILE.exists():
         return jsonify({"ok": False, "erro": "Salve a configuração primeiro"})
 
-    config = json.loads(CONFIG_FILE.read_text())
+    config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     threading.Thread(
         target=lambda: asyncio.run(_login_upseller_playwright(config)),
         daemon=True
@@ -193,7 +193,7 @@ def emitir_etiqueta():
         r.headers["Access-Control-Allow-Origin"] = "*"
         return r
 
-    config = json.loads(CONFIG_FILE.read_text())
+    config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
 
     # Roda de forma síncrona para retornar o resultado ao dashboard
     resultado = [{"ok": False, "erro": "Timeout"}]
@@ -234,7 +234,7 @@ def reimprimir_etiqueta():
         r.headers["Access-Control-Allow-Origin"] = "*"
         return r
 
-    config = json.loads(CONFIG_FILE.read_text())
+    config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
 
     resultado = [{"ok": False, "erro": "Timeout"}]
     concluido = threading.Event()
@@ -266,7 +266,7 @@ def capturar_etiquetas():
         r.headers["Access-Control-Allow-Origin"] = "*"
         return r
 
-    config = json.loads(CONFIG_FILE.read_text())
+    config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     threading.Thread(
         target=lambda: asyncio.run(_capturar_etiquetas_playwright(config)),
         daemon=True
@@ -283,7 +283,7 @@ def configurar_inicializacao():
     if not CONFIG_FILE.exists():
         return jsonify({"ok": False, "erro": "Salve a configuração primeiro"})
 
-    config   = json.loads(CONFIG_FILE.read_text())
+    config   = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     horarios = sorted(config.get("horarios", ["07:00"]))
     sistema  = platform.system()
 
@@ -463,7 +463,7 @@ def rodando_flag():
 def status():
     config = {}
     if CONFIG_FILE.exists():
-        config = json.loads(CONFIG_FILE.read_text())
+        config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
 
     cliente = ""
     if config.get("token"):
@@ -977,7 +977,7 @@ def imprimir_picklist():
         r.headers["Access-Control-Allow-Origin"] = "*"
         return r
 
-    config = json.loads(CONFIG_FILE.read_text())
+    config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     threading.Thread(
         target=_imprimir_picklist_thread,
         args=(config,),
@@ -1964,7 +1964,7 @@ def extrair(config: dict, data_alvo: date):
     log(f"Pedidos encontrados: {len(pedidos)} ({multi} com 2+ itens, {len(itens_list)} itens no total)")
 
     arq = PASTA_DADOS / f"lista_{data_arquivo}_{token[:8]}.json"
-    arq.write_text(json.dumps(pedidos, ensure_ascii=False, indent=2))
+    arq.write_text(json.dumps(pedidos, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"JSON salvo: {arq.name}")
 
     log("Enviando para Supabase...")
@@ -2073,7 +2073,7 @@ def _loop_agendador():
         if not CONFIG_FILE.exists():
             continue
         try:
-            config   = json.loads(CONFIG_FILE.read_text())
+            config   = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             horarios = config.get("horarios", [])
             # backward compat — converte config antigo se necessário
             if not horarios and config.get("hora_inicio"):
