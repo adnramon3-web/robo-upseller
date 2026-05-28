@@ -219,6 +219,13 @@
               id="btn-ver-senha">👁</button>
           </div>
         </div>
+        <div class="form-group">
+          <label>🖨️ Nome da Impressora (opcional)</label>
+          <input type="text" id="nome_impressora"
+            placeholder="Ex: ELGIN-i9 (deixe vazio para abrir PDF no browser)"
+            value="{{ config.get('nome_impressora','') }}"/>
+          <small style="color:#90A4AE;font-size:11px">Preencha para imprimir etiquetas direto na impressora ao bipar</small>
+        </div>
       </div>
     </div>
   </div>
@@ -474,11 +481,12 @@
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        token:          document.getElementById('token').value,
-        upseller_email: document.getElementById('email').value,
-        upseller_senha: document.getElementById('senha').value,
-        horarios:       _horarios,
-        etapas:         _etapas,
+        token:           document.getElementById('token').value,
+        upseller_email:  document.getElementById('email').value,
+        upseller_senha:  document.getElementById('senha').value,
+        horarios:        _horarios,
+        etapas:          _etapas,
+        nome_impressora: document.getElementById('nome_impressora').value,
       })
     });
     const data = await resp.json();

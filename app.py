@@ -92,11 +92,12 @@ def salvar():
         return jsonify({"ok": False, "erro": "Token inválido ou não encontrado"})
 
     config = {
-        "token":          dados["token"].strip(),
-        "upseller_email": dados["upseller_email"].strip(),
-        "upseller_senha": dados["upseller_senha"].strip(),
-        "horarios":       dados.get("horarios", []),
-        "etapas":         dados.get("etapas", {"importar": True, "picklist": True, "nfe": True, "envio": True}),
+        "token":           dados["token"].strip(),
+        "upseller_email":  dados["upseller_email"].strip(),
+        "upseller_senha":  dados["upseller_senha"].strip(),
+        "horarios":        dados.get("horarios", []),
+        "etapas":          dados.get("etapas", {"importar": True, "picklist": True, "nfe": True, "envio": True}),
+        "nome_impressora": dados.get("nome_impressora", "").strip(),
     }
     CONFIG_FILE.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     return jsonify({"ok": True, "cliente": nome})
@@ -487,12 +488,13 @@ def status():
     sessao_ok = PASTA_SESSAO.exists() and any(PASTA_SESSAO.iterdir())
 
     return jsonify({
-        "configurado": bool(config.get("token")),
-        "token":       config.get("token", ""),
-        "cliente":     cliente,
-        "horarios":    horarios,
-        "etapas":      etapas,
-        "proxima":     proxima,
+        "configurado":    bool(config.get("token")),
+        "token":          config.get("token", ""),
+        "cliente":        cliente,
+        "horarios":       horarios,
+        "etapas":         etapas,
+        "proxima":        proxima,
+        "nome_impressora": config.get("nome_impressora", ""),
         "rodando":     rodando,
         "sessao_ok":   sessao_ok,
     })
@@ -1006,35 +1008,53 @@ def picklist_disponivel():
 
 @app.route("/etiqueta/<order_number>", methods=["GET"])
 def servir_etiqueta(order_number):
-    """Serve o PDF da etiqueta da subpasta local ou baixa do Supabase."""
+    """Serve ou imprime diretamente a etiqueta da subpasta local / Supabase."""
     from flask import Response
     import urllib.request as _ul
     pdf_path = PASTA_ETIQUETAS / f"etiqueta_{order_number}.pdf"
 
-    # Caminho 1: cache local
-    if pdf_path.exists():
-        conteudo = pdf_path.read_bytes()
-        resp = Response(conteudo, mimetype="application/pdf")
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        return resp
+    config = json.loads(CONFIG_FILE.read_text(encoding="utf-8")) if CONFIG_FILE.exists() else {}
+    nome_impressora = config.get("nome_impressora", "").strip()
 
-    # Caminho 2: label_url no Supabase
-    try:
-        supa = create_client(SUPABASE_URL, SUPABASE_KEY)
-        r = supa.table("pedidos").select("label_url").eq("order_number", order_number).single().execute()
-        url = r.data.get("label_url") if r.data else None
-        if url:
-            _ul.urlretrieve(url, str(pdf_path))
-            conteudo = pdf_path.read_bytes()
-            resp = Response(conteudo, mimetype="application/pdf")
-            resp.headers["Access-Control-Allow-Origin"] = "*"
-            return resp
-    except Exception:
-        pass
+    def _obter_pdf() -> bool:
+        if pdf_path.exists():
+            return True
+        try:
+            supa = create_client(SUPABASE_URL, SUPABASE_KEY)
+            r = supa.table("pedidos").select("label_url").eq("order_number", order_number).single().execute()
+            url = r.data.get("label_url") if r.data else None
+            if url:
+                _ul.urlretrieve(url, str(pdf_path))
+                return True
+        except Exception:
+            pass
+        return False
 
-    r = jsonify({"erro": "Etiqueta não disponível — execute o robô primeiro"})
-    r.headers["Access-Control-Allow-Origin"] = "*"
-    return r, 404
+    if not _obter_pdf():
+        r = jsonify({"erro": "Etiqueta não disponível — execute o robô primeiro"})
+        r.headers["Access-Control-Allow-Origin"] = "*"
+        return r, 404
+
+    # Com impressora configurada: imprime direto e retorna confirmação
+    if nome_impressora and platform.system() == "Windows":
+        try:
+            subprocess.run(
+                ["powershell", "-Command",
+                 f'Start-Process -FilePath "{pdf_path}" -Verb PrintTo -ArgumentList "{nome_impressora}" -Wait'],
+                creationflags=subprocess.CREATE_NO_WINDOW, timeout=30
+            )
+            log(f"[etiqueta] 🖨️ {order_number} → {nome_impressora}")
+        except Exception as e:
+            log(f"[etiqueta] ⚠️ Erro ao imprimir: {e}")
+        r = jsonify({"ok": True, "impresso": True})
+        r.headers["Access-Control-Allow-Origin"] = "*"
+        return r
+
+    # Sem impressora configurada: serve o PDF para o browser abrir
+    conteudo = pdf_path.read_bytes()
+    resp = Response(conteudo, mimetype="application/pdf")
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
 
 
 @app.route("/picklist-pdf", methods=["GET"])
