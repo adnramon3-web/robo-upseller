@@ -1035,20 +1035,34 @@ def servir_etiqueta(order_number):
         r.headers["Access-Control-Allow-Origin"] = "*"
         return r, 404
 
-    # Com impressora configurada: imprime direto e retorna confirmação
-    if nome_impressora and platform.system() == "Windows":
-        try:
-            subprocess.run(
-                ["powershell", "-Command",
-                 f'Start-Process -FilePath "{pdf_path}" -Verb PrintTo -ArgumentList "{nome_impressora}" -Wait'],
-                creationflags=subprocess.CREATE_NO_WINDOW, timeout=30
-            )
-            log(f"[etiqueta] 🖨️ {order_number} → {nome_impressora}")
-        except Exception as e:
-            log(f"[etiqueta] ⚠️ Erro ao imprimir: {e}")
-        r = jsonify({"ok": True, "impresso": True})
-        r.headers["Access-Control-Allow-Origin"] = "*"
-        return r
+    # Com impressora: imprime direto e retorna confirmação JSON
+    if platform.system() == "Windows":
+        # Usa impressora configurada ou busca a padrão do sistema
+        impressora = nome_impressora
+        if not impressora:
+            try:
+                r_imp = subprocess.run(
+                    ["powershell", "-Command",
+                     "Get-Printer | Where-Object {$_.Default -eq $true} | Select-Object -First 1 -ExpandProperty Name"],
+                    capture_output=True, text=True, timeout=5,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                impressora = r_imp.stdout.strip()
+            except Exception:
+                impressora = ""
+        if impressora:
+            try:
+                subprocess.run(
+                    ["powershell", "-Command",
+                     f'Start-Process -FilePath "{pdf_path}" -Verb PrintTo -ArgumentList "{impressora}" -Wait'],
+                    creationflags=subprocess.CREATE_NO_WINDOW, timeout=30
+                )
+                log(f"[etiqueta] 🖨️ {order_number} → {impressora}")
+            except Exception as e:
+                log(f"[etiqueta] ⚠️ Erro ao imprimir: {e}")
+            r = jsonify({"ok": True, "impresso": True, "impressora": impressora})
+            r.headers["Access-Control-Allow-Origin"] = "*"
+            return r
 
     # Sem impressora configurada: serve o PDF para o browser abrir
     conteudo = pdf_path.read_bytes()
