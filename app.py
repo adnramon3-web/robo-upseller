@@ -1004,6 +1004,39 @@ def picklist_disponivel():
     return r
 
 
+@app.route("/etiqueta/<order_number>", methods=["GET"])
+def servir_etiqueta(order_number):
+    """Serve o PDF da etiqueta da subpasta local ou baixa do Supabase."""
+    from flask import Response
+    import urllib.request as _ul
+    pdf_path = PASTA_ETIQUETAS / f"etiqueta_{order_number}.pdf"
+
+    # Caminho 1: cache local
+    if pdf_path.exists():
+        conteudo = pdf_path.read_bytes()
+        resp = Response(conteudo, mimetype="application/pdf")
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp
+
+    # Caminho 2: label_url no Supabase
+    try:
+        supa = create_client(SUPABASE_URL, SUPABASE_KEY)
+        r = supa.table("pedidos").select("label_url").eq("order_number", order_number).single().execute()
+        url = r.data.get("label_url") if r.data else None
+        if url:
+            _ul.urlretrieve(url, str(pdf_path))
+            conteudo = pdf_path.read_bytes()
+            resp = Response(conteudo, mimetype="application/pdf")
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            return resp
+    except Exception:
+        pass
+
+    r = jsonify({"erro": "Etiqueta não disponível — execute o robô primeiro"})
+    r.headers["Access-Control-Allow-Origin"] = "*"
+    return r, 404
+
+
 @app.route("/picklist-pdf", methods=["GET"])
 def picklist_pdf():
     arquivos = sorted(PASTA_PICKLISTS.glob("picklist_*.pdf"))
