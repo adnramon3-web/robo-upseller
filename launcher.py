@@ -79,8 +79,15 @@ def garantir_chromium():
     if chromium_existe:
         return
     print("[launcher] Instalando Chromium (primeira vez, pode levar alguns minutos)...")
-    cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
-    subprocess.run(cmd, check=False)
+    try:
+        # Usa o driver do playwright diretamente — evita re-executar o .exe no modo frozen
+        from playwright._impl._driver import compute_driver_executable
+        driver = compute_driver_executable()
+        subprocess.run([str(driver), "install", "chromium"], check=False)
+    except Exception:
+        # Fallback: python real (não-frozen) ou playwright no PATH
+        python = sys.executable if not getattr(sys, "frozen", False) else "python"
+        subprocess.run([python, "-m", "playwright", "install", "chromium"], check=False)
     print("[launcher] Chromium instalado.")
 
 
