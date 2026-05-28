@@ -488,6 +488,7 @@ def status():
 
     return jsonify({
         "configurado": bool(config.get("token")),
+        "token":       config.get("token", ""),
         "cliente":     cliente,
         "horarios":    horarios,
         "etapas":      etapas,
