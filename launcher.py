@@ -116,8 +116,9 @@ def iniciar_app():
         input("Pressione Enter para sair.")
         sys.exit(1)
 
-    spec = importlib.util.spec_from_file_location("app", APP_FILE)
+    spec = importlib.util.spec_from_file_location("__main__", APP_FILE)
     mod  = importlib.util.module_from_spec(spec)
+    mod.__name__ = "__main__"
     sys.modules["app"] = mod
     spec.loader.exec_module(mod)
 
