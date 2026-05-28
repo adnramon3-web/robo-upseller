@@ -810,7 +810,8 @@ async def _imprimir_ou_pdf(popup, tem_impressora: bool, nome: str, prefixo: str)
         try:
             urllib.request.urlretrieve(url, str(pdf_path))
             log(f"[{prefixo}] 📄 PDF salvo: {pdf_path.name}")
-            _abrir(pdf_path)
+            if prefixo != "picklist":
+                _abrir(pdf_path)
         except Exception as e:
             log(f"[{prefixo}] ⚠️ Erro ao baixar PDF: {e}")
         return
@@ -819,6 +820,11 @@ async def _imprimir_ou_pdf(popup, tem_impressora: bool, nome: str, prefixo: str)
     pdf_path = pasta_pdf / f"{prefixo}_{nome}.pdf"
     await popup.pdf(path=str(pdf_path), print_background=True, format="A4")
     log(f"[{prefixo}] 📄 PDF gerado: {pdf_path.name}")
+
+    # Picklist: não abre automaticamente — PCP serve e imprime
+    if prefixo == "picklist":
+        log("[picklist] 📋 PDF disponível na pasta — imprima pelo PCP")
+        return
 
     if tem_impressora:
         try:
@@ -908,7 +914,8 @@ async def _imprimir_picklist_playwright(config: dict):
             # Fecha qualquer popup/aviso (Avisos, NF-e, etc.)
             await _fechar_popups_upseller(page)
 
-            # Seleciona todos — checkbox no cabeçalho da tabela
+            # Seleciona todos — o UpSeller já filtra: só mostra o que ainda está em "Para Emitir"
+            # Pedidos já processados saem da lista automaticamente
             log("[picklist] ☑️ Selecionando todos os pedidos...")
             header_cb = page.locator("th .ant-checkbox-input").first
             await header_cb.click()
@@ -931,7 +938,8 @@ async def _imprimir_picklist_playwright(config: dict):
             await popup.wait_for_load_state("networkidle", timeout=30_000)
             await popup.wait_for_timeout(1500)
 
-            await _imprimir_ou_pdf(popup, tem_impressora, "picklist", "picklist")
+            nome_pick = datetime.now().strftime("%Y%m%d_%H%M")
+            await _imprimir_ou_pdf(popup, tem_impressora, nome_pick, "picklist")
             log("[picklist] ✅ Picklist processado!")
 
             # Marca todos os pedidos não impressos do cliente como impressos agora
@@ -979,6 +987,33 @@ def imprimir_picklist():
     r = jsonify({"ok": True})
     r.headers["Access-Control-Allow-Origin"] = "*"
     return r
+
+
+@app.route("/picklist-disponivel", methods=["GET"])
+def picklist_disponivel():
+    arquivos = sorted(PASTA_PICKLISTS.glob("picklist_*.pdf"))
+    r = jsonify({"disponivel": len(arquivos) > 0, "total": len(arquivos)})
+    r.headers["Access-Control-Allow-Origin"] = "*"
+    return r
+
+
+@app.route("/picklist-pdf", methods=["GET"])
+def picklist_pdf():
+    arquivos = sorted(PASTA_PICKLISTS.glob("picklist_*.pdf"))
+    if not arquivos:
+        r = jsonify({"erro": "Nenhum picklist disponível"})
+        r.headers["Access-Control-Allow-Origin"] = "*"
+        return r, 404
+    pdf = arquivos[0]  # mais antigo primeiro
+    conteudo = pdf.read_bytes()
+    try:
+        pdf.unlink()
+    except Exception:
+        pass
+    from flask import Response
+    resp = Response(conteudo, mimetype="application/pdf")
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
 
 
 # ── Playwright: capturar etiquetas em lote (pré-download) ────────────────────

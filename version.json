@@ -1,4 +1,4 @@
 {
-  "version": "1.0.2",
-  "descricao": "Total do pedido soma as quantidades por item"
+  "version": "1.1.1",
+  "descricao": "Picklist acumulado por timestamp, botão de impressão na tela de bipar do PCP"
 }
