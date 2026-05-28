@@ -818,7 +818,13 @@ async def _imprimir_ou_pdf(popup, tem_impressora: bool, nome: str, prefixo: str)
 
     # Página HTML — gera PDF (headless obrigatório) e imprime ou abre
     pdf_path = pasta_pdf / f"{prefixo}_{nome}.pdf"
-    await popup.pdf(path=str(pdf_path), print_background=True, format="A4")
+    # Picklist: 4x6 polegadas (impressora térmica Elgin/Epson). Demais: A4
+    if prefixo == "picklist":
+        await popup.pdf(path=str(pdf_path), print_background=True,
+                        width="4in", height="6in",
+                        margin={"top": "4mm", "bottom": "4mm", "left": "4mm", "right": "4mm"})
+    else:
+        await popup.pdf(path=str(pdf_path), print_background=True, format="A4")
     log(f"[{prefixo}] 📄 PDF gerado: {pdf_path.name}")
 
     # Picklist: não abre automaticamente — PCP serve e imprime
