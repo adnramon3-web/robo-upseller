@@ -1,4 +1,4 @@
 {
-  "version": "1.1.4",
-  "descricao": "PCP detecta token do robô automaticamente para tela de bipagem"
+  "version": "1.1.5",
+  "descricao": "Fix impressão Windows: espera spool antes de deletar PDF"
 }

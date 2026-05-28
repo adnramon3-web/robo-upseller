@@ -1289,11 +1289,14 @@ def _imprimir_pdf_local(pdf_path: Path, order_number: str, config: dict) -> dict
                 subprocess.Popen(["lp", str(pdf_path)])
                 log(f"[etiqueta] 🖨️ {order_number} enviado para impressora")
             elif platform.system() == "Windows":
-                subprocess.Popen(
+                # run() bloqueante: espera o spool terminar antes de deletar o arquivo
+                subprocess.run(
                     ["powershell", "-Command",
                      f'Start-Process -FilePath "{pdf_path}" -Verb Print -Wait'],
-                    creationflags=subprocess.CREATE_NO_WINDOW
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    timeout=30
                 )
+                log(f"[etiqueta] 🖨️ {order_number} enviado para impressora")
         else:
             if platform.system() == "Darwin":
                 subprocess.Popen(["open", str(pdf_path)])
