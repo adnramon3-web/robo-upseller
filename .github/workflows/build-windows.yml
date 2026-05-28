@@ -14,11 +14,18 @@ jobs:
         with:
           python-version: "3.11"
       - name: Instalar dependências
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}\pw_browsers
         run: |
           pip install flask supabase playwright openpyxl pyinstaller python-dotenv
           playwright install chromium --with-deps
       - name: Compilar
         run: pyinstaller robo_upseller.spec
+      - name: Copiar browsers para o dist
+        run: |
+          if (Test-Path "pw_browsers") {
+            Copy-Item -Recurse -Force pw_browsers dist\RoboUpSeller\pw_browsers
+          }
       - name: Criar ZIP
         run: Compress-Archive -Path dist\RoboUpSeller\* -DestinationPath RoboUpSeller_Windows.zip
       - uses: actions/upload-artifact@v4

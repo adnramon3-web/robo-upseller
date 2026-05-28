@@ -73,22 +73,32 @@ def atualizar():
     print("[launcher] Atualização concluída.")
 
 
+def _chromium_pronto() -> bool:
+    """Verifica se o executável do Chromium realmente existe (não só a pasta)."""
+    if not BROWSERS_DIR.exists():
+        return False
+    for nome in ["chrome.exe", "chrome-headless-shell.exe", "chromium.exe", "chromium"]:
+        if list(BROWSERS_DIR.rglob(nome)):
+            return True
+    return False
+
+
 def garantir_chromium():
-    """Instala o Chromium se ainda não estiver presente."""
-    chromium_existe = any(BROWSERS_DIR.glob("chromium-*")) if BROWSERS_DIR.exists() else False
-    if chromium_existe:
+    """Instala o Chromium se ainda não estiver presente ou se a instalação estiver incompleta."""
+    if _chromium_pronto():
         return
     print("[launcher] Instalando Chromium (primeira vez, pode levar alguns minutos)...")
     try:
-        # Usa o driver do playwright diretamente — evita re-executar o .exe no modo frozen
         from playwright._impl._driver import compute_driver_executable
         driver = compute_driver_executable()
         subprocess.run([str(driver), "install", "chromium"], check=False)
     except Exception:
-        # Fallback: python real (não-frozen) ou playwright no PATH
         python = sys.executable if not getattr(sys, "frozen", False) else "python"
         subprocess.run([python, "-m", "playwright", "install", "chromium"], check=False)
-    print("[launcher] Chromium instalado.")
+    if _chromium_pronto():
+        print("[launcher] Chromium instalado com sucesso.")
+    else:
+        print("[launcher] ⚠️ Chromium pode não ter sido instalado corretamente.")
 
 
 # ── Verificação / atualização ──────────────────────────────────────────────────
