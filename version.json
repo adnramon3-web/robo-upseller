@@ -1,4 +1,4 @@
 {
-  "version": "1.1.1",
-  "descricao": "Picklist acumulado por timestamp, botão de impressão na tela de bipar do PCP"
+  "version": "1.1.2",
+  "descricao": "Fix encoding UTF-8 para Windows — caracteres especiais em nomes de produtos"
 }
