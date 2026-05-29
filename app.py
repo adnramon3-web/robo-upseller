@@ -2200,9 +2200,25 @@ def _loop_agendador():
 
 
 # ── Inicia o servidor ─────────────────────────────────────────────────────────
+def _limpar_etiquetas_antigas():
+    """Apaga PDFs de etiquetas do dia anterior ao iniciar o robô."""
+    hoje = date.today()
+    removidos = 0
+    for pdf in PASTA_ETIQUETAS.glob("etiqueta_*.pdf"):
+        try:
+            if date.fromtimestamp(pdf.stat().st_mtime) < hoje:
+                pdf.unlink()
+                removidos += 1
+        except Exception:
+            pass
+    if removidos:
+        log(f"🗑️ {removidos} etiqueta(s) antigas removidas da pasta")
+
+
 if __name__ == "__main__":
     PASTA_ETIQUETAS.mkdir(exist_ok=True)
     PASTA_PICKLISTS.mkdir(exist_ok=True)
+    _limpar_etiquetas_antigas()
     # No Mac, mantém o sistema acordado enquanto o app estiver rodando
     if platform.system() == "Darwin":
         import os

@@ -1,4 +1,4 @@
 {
-  "version": "1.1.7",
-  "descricao": "Campo nome da impressora — etiqueta direto na impressora ao bipar"
+  "version": "1.1.8",
+  "descricao": "Limpeza automática de etiquetas antigas ao iniciar o robô"
 }
