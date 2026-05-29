@@ -1,4 +1,4 @@
 {
-  "version": "1.1.8",
-  "descricao": "Limpeza automática de etiquetas antigas ao iniciar o robô"
+  "version": "1.1.9",
+  "descricao": "Limpeza de etiquetas com mais de 7 dias ao iniciar"
 }
