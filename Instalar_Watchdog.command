@@ -20,20 +20,19 @@ fi
 
 echo "  Baixando arquivos necessários..."
 
-# Baixa watchdog.py se não existir ou se veio de Download
-if [ ! -f "$PASTA/watchdog.py" ]; then
-  curl -fsSL "$BASE_URL/watchdog.py" -o "$PASTA/watchdog.py" 2>/dev/null
-  if [ $? -ne 0 ]; then
-    echo "  ❌ Erro ao baixar watchdog.py. Verifique sua conexão."
-    read -p "  Pressione Enter para fechar..."
-    exit 1
-  fi
+# Sempre baixa a versão mais recente do watchdog
+curl -fsSL "$BASE_URL/watchdog.py" -o "$PASTA/watchdog.py" 2>/dev/null
+if [ $? -ne 0 ]; then
+  echo "  ❌ Erro ao baixar watchdog.py. Verifique sua conexão."
+  read -p "  Pressione Enter para fechar..."
+  exit 1
 fi
 
-# Baixa plist base se não existir
-if [ ! -f "$PASTA/com.adnsys.robo-watchdog.plist" ]; then
-  curl -fsSL "$BASE_URL/com.adnsys.robo-watchdog.plist" -o "$PASTA/com.adnsys.robo-watchdog.plist" 2>/dev/null
-fi
+curl -fsSL "$BASE_URL/com.adnsys.robo-watchdog.plist" -o "$PASTA/com.adnsys.robo-watchdog.plist" 2>/dev/null
+
+# Encerra qualquer watchdog antigo antes de reinstalar
+pkill -f "watchdog.py" 2>/dev/null
+sleep 1
 
 # Gera o plist final com caminhos reais
 mkdir -p "$HOME/Library/LaunchAgents"

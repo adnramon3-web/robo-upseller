@@ -20,7 +20,7 @@ from flask import Flask, jsonify, request
 PASTA_RAIZ = Path(__file__).parent
 APP_PY     = PASTA_RAIZ / "app.py"
 PORT_ROBO  = 5001
-PORT_WD    = 5000
+PORT_WD    = 5055
 
 _proc: subprocess.Popen | None = None
 _lock = threading.Lock()
@@ -176,4 +176,5 @@ def _autostart():
 
 if __name__ == "__main__":
     threading.Thread(target=_autostart, daemon=True).start()
+    print(f"[watchdog] Iniciando na porta {PORT_WD}...")
     app.run(host="127.0.0.1", port=PORT_WD, debug=False, use_reloader=False)
