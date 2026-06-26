@@ -40,8 +40,9 @@ sed "s|PASTA_RAIZ|$PASTA|g" "$PASTA/com.adnsys.robo-watchdog.plist" > "$PLIST_DE
 sed -i '' "s|/usr/bin/python3|$PY|g" "$PLIST_DEST"
 
 # Instala dependências
-echo "  Instalando dependências..."
-"$PY" -m pip install flask --quiet 2>/dev/null
+echo "  Instalando dependências (pode demorar 1-2 minutos)..."
+"$PY" -m pip install flask supabase pypdf playwright --quiet 2>/dev/null
+"$PY" -m playwright install chromium --quiet 2>/dev/null || true
 
 # Registra o serviço para iniciar automaticamente
 launchctl unload "$PLIST_DEST" 2>/dev/null
