@@ -935,6 +935,14 @@ def parar():
     return _cors(jsonify({"ok": True}))
 
 
+@app.route("/recarregar-config", methods=["POST", "OPTIONS"], provide_automatic_options=False)
+def recarregar_config():
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    log("🔄 Configuração recarregada pelo PCP")
+    return _cors(jsonify({"ok": True}))
+
+
 @app.route("/reiniciar", methods=["POST"])
 def reiniciar():
     def _restart():

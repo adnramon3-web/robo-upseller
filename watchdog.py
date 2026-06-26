@@ -156,6 +156,37 @@ def wd_log():
     return _cors(jsonify({"log": txt, "ultimo_erro": _ultimo_erro}))
 
 
+@app.route("/wd/config", methods=["GET", "POST", "OPTIONS"], provide_automatic_options=False)
+def wd_config():
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    CONFIG_FILE = PASTA_RAIZ / "config.json"
+    if request.method == "GET":
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8")) if CONFIG_FILE.exists() else {}
+        except Exception:
+            cfg = {}
+        return _cors(jsonify(cfg))
+    # POST — salva campos enviados (merge com existente)
+    dados = request.get_json(silent=True) or {}
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8")) if CONFIG_FILE.exists() else {}
+    except Exception:
+        cfg = {}
+    cfg.update({k: v for k, v in dados.items() if v is not None})
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Avisa o robô para recarregar config sem reiniciar
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{PORT_ROBO}/recarregar-config",
+            data=b"{}", headers={"Content-Type": "application/json"}, method="POST",
+        )
+        urllib.request.urlopen(req, timeout=3)
+    except Exception:
+        pass
+    return _cors(jsonify({"ok": True}))
+
+
 @app.route("/wd/parar", methods=["POST", "OPTIONS"], provide_automatic_options=False)
 def wd_parar():
     if request.method == "OPTIONS":
