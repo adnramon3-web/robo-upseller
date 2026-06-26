@@ -1,4 +1,4 @@
 {
-  "version": "1.5.77",
-  "descricao": "fix batch PDF: split por pedido (1 arquivo por página) — evita múltiplas etiquetas de pedidos diferentes ao bipar"
+  "version": "1.5.78",
+  "descricao": "resumo de etiquetas no Agendamento + modal explicativo ao bipar pedido TikTok sem etiqueta"
 }

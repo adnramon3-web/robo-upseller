@@ -945,6 +945,44 @@ def reiniciar():
     return jsonify({"ok": True})
 
 
+@app.route("/resumo-etiquetas", methods=["GET", "OPTIONS"], provide_automatic_options=False)
+def resumo_etiquetas():
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    try:
+        hoje  = datetime.now().strftime("%Y-%m-%d")
+        ontem = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        supa  = create_client(*_supa())
+
+        def _resumo_dia(data: str) -> dict:
+            rows = supa.table("pedidos") \
+                .select("order_number,label_url,plataforma") \
+                .eq("data", data).execute().data or []
+            # deduplica por order_number (uma linha por SKU)
+            vistos: dict = {}
+            for r in rows:
+                on = r.get("order_number")
+                if on not in vistos:
+                    vistos[on] = r
+            total    = len(vistos)
+            com_lbl  = sum(1 for r in vistos.values() if r.get("label_url"))
+            sem_lbl  = total - com_lbl
+            # breakdown por plataforma para os sem etiqueta
+            sem_por_plat: dict = {}
+            for r in vistos.values():
+                if not r.get("label_url"):
+                    plat = r.get("plataforma") or "Outros"
+                    sem_por_plat[plat] = sem_por_plat.get(plat, 0) + 1
+            return {"total": total, "com_etiqueta": com_lbl, "sem_etiqueta": sem_lbl, "sem_por_plataforma": sem_por_plat}
+
+        return _cors(jsonify({
+            "hoje":  _resumo_dia(hoje),
+            "ontem": _resumo_dia(ontem),
+        }))
+    except Exception as e:
+        return _cors(jsonify({"erro": str(e)}))
+
+
 @app.route("/verificar-atualizacao", methods=["GET", "OPTIONS"], provide_automatic_options=False)
 def verificar_atualizacao():
     if request.method == "OPTIONS":
@@ -3247,7 +3285,7 @@ async def _emitir_etiqueta_playwright(config: dict, order_number: str) -> dict:
             # No fluxo de 6h, pedidos estarão em Para Emitir e serão processados normalmente
             if await imprimir.count() == 0:
                 log(f"[etiqueta] ℹ️ Pedido {order_number} não está em Para Imprimir — verifique o estado no UpSeller")
-                return {"ok": False, "erro": "Pedido não está em Para Imprimir — etiqueta disponível apenas durante processamento"}
+                return {"ok": False, "sem_etiqueta": True, "erro": "Etiqueta não disponível no UpSeller — pedido TikTok/iMile requer impressão manual"}
 
             if await imprimir.count() == 0:
                 screenshot = PASTA_RAIZ / f"debug_etiqueta_{order_number}.png"
