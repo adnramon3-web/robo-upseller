@@ -6,22 +6,36 @@ Acesse em:  http://127.0.0.1:5001
 
 import asyncio
 import json
+import os
 import platform
 import subprocess
 import sys
 import threading
 import queue
 import time
+import urllib.request
 import webbrowser
 from datetime import date, timedelta, datetime
 from pathlib import Path
 
-from flask import Flask, render_template, request, jsonify, Response
+from flask import Flask, render_template, request, jsonify, Response, make_response
 from supabase import create_client
 
 # ── Configurações ─────────────────────────────────────────────────────────────
 SUPABASE_URL = "https://qaqlaqlxxeilouvbwgiv.supabase.co"
 SUPABASE_KEY = "sb_publishable_D0C2IC4Cxmtmu2crnFYXxw_JggkMuNS"
+
+def _supa() -> tuple[str, str]:
+    """Retorna (url, key) — usa Supabase privado do cliente se configurado."""
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8")) if CONFIG_FILE.exists() else {}
+        url = (cfg.get("supabase_url") or "").strip()
+        key = (cfg.get("supabase_key") or "").strip()
+        if url and key:
+            return url, key
+    except Exception:
+        pass
+    return SUPABASE_URL, SUPABASE_KEY
 
 # Quando rodado via launcher (importlib), __file__ aponta para robo_app/app.py
 # e o diretório de dados/config fica ao lado (BASE_DIR = pasta do exe)
@@ -38,8 +52,22 @@ _template_dir = PASTA_RAIZ / "templates"
 app = Flask(__name__, template_folder=str(_template_dir))
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 
+_ignorar_paths = {"/", "/status", "/log", "/log-stream", "/favicon.ico"}
+
+@app.before_request
+def _log_req():
+    from flask import request
+    p = request.path
+    if p in _ignorar_paths or p.startswith("/static"):
+        return
+    log(f"[req] {request.method} {p} | origem={request.remote_addr}")
+
 log_queue        = queue.Queue()
 rodando          = False
+_pos_import_ativo = False             # captura/NF-e/envio rodando após import (não bloqueia PCP)
+_parar           = threading.Event()  # sinaliza parada solicitada pelo usuário
+_captura_lock    = threading.Lock()   # evita duas capturas simultâneas
+_capturar_skip   = set()              # pedidos com URL inválida nesta sessão (background ignora)
 
 
 def _carregar_execucoes() -> set:
@@ -74,8 +102,10 @@ def index():
 
 
 # ── Salvar configuração ───────────────────────────────────────────────────────
-@app.route("/salvar", methods=["POST"])
+@app.route("/salvar", methods=["POST", "OPTIONS"], provide_automatic_options=False)
 def salvar():
+    if request.method == "OPTIONS":
+        return _cors_preflight()
     dados = request.json
     erros = []
 
@@ -91,27 +121,388 @@ def salvar():
     except SystemExit:
         return jsonify({"ok": False, "erro": "Token inválido ou não encontrado"})
 
+    # Preserva campos não exibidos na UI (ncm_padrao, ncm_produtos, etc.)
+    config_existente = {}
+    if CONFIG_FILE.exists():
+        try:
+            config_existente = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
     config = {
+        "ncm_padrao": "6109.10.00",
+        **config_existente,
         "token":           dados["token"].strip(),
         "upseller_email":  dados["upseller_email"].strip(),
         "upseller_senha":  dados["upseller_senha"].strip(),
         "horarios":        dados.get("horarios", []),
         "etapas":          dados.get("etapas", {"importar": True, "picklist": True, "nfe": True, "envio": True}),
-        "nome_impressora": dados.get("nome_impressora", "").strip(),
+        "nome_impressora":         dados.get("nome_impressora", "").strip(),
+        "auto_imprimir_etiquetas": bool(dados.get("auto_imprimir_etiquetas", False)),
     }
     CONFIG_FILE.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     return jsonify({"ok": True, "cliente": nome})
 
 
+@app.route("/salvar-config-parcial", methods=["POST", "OPTIONS"], provide_automatic_options=False)
+def salvar_config_parcial():
+    """Salva campos específicos no config sem exigir token/email/senha."""
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    dados = request.json or {}
+    config = {}
+    if CONFIG_FILE.exists():
+        try:
+            config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    for k, v in dados.items():
+        config[k] = v
+    CONFIG_FILE.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    return _cors(jsonify({"ok": True}))
+
+
+# ── Importação retroativa ─────────────────────────────────────────────────────
+@app.route("/importar-retroativo", methods=["POST"])
+def importar_retroativo():
+    """Importa pedidos de N dias atrás para preencher lacunas no Supabase."""
+    dados = request.json or {}
+    dias  = int(dados.get("dias", 30))
+    if not CONFIG_FILE.exists():
+        return jsonify({"ok": False, "erro": "Configure o robô primeiro"})
+
+    def _rodar():
+        config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        asyncio.run(_backfill_historico(config, dias))
+
+    import threading as _t
+    _t.Thread(target=_rodar, daemon=True).start()
+    return jsonify({"ok": True, "msg": f"Backfill iniciado — últimos {dias} dias — acompanhe no log"})
+
+
+async def _backfill_historico(config: dict, dias: int):
+    """Busca todos os pedidos dos últimos N dias no UpSeller e insere os faltantes no Supabase."""
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        log("[backfill] ❌ Playwright não instalado")
+        return
+
+    token = config.get("token", "")
+    log(f"[backfill] 🔄 Importando pedidos dos últimos {dias} dias...")
+
+    from datetime import date, timedelta
+    data_ini = (date.today() - timedelta(days=dias)).strftime("%Y-%m-%d")
+    data_fim = date.today().strftime("%Y-%m-%d")
+
+    # Estados a varrer (inclui concluídos/enviados)
+    ESTADOS = [
+        "in_process",
+        "invoice_pending",
+        "to_ship",
+        "shipped",
+        "to_pickup",
+    ]
+
+    PLAT = {"shopee": "Shopee", "shein": "Shein", "mercado": "Mercado Livre",
+            "tiktok": "TikTok", "kwai": "Kwai"}
+
+    todos: list = []
+
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=str(PASTA_SESSAO),
+            headless=True, args=["--window-size=1280,900"],
+        )
+        try:
+            page = context.pages[0] if context.pages else await context.new_page()
+            await page.goto("https://app.upseller.com/pt/order/in-process",
+                            wait_until="domcontentloaded", timeout=60_000)
+            await page.wait_for_timeout(1500)
+
+            if "/login" in page.url:
+                log("[backfill] ⚠️ Sessão expirada — faça login primeiro")
+                return
+
+            for estado in ESTADOS:
+                page_num = 1
+                total_estado = None
+                log(f"[backfill] 🔍 {estado}...")
+                while True:
+                    body = (
+                        f"timeType=1&startTime={data_ini}&endTime={data_fim}"
+                        f"&searchType=0&sortName=1&sortValue=1"
+                        f"&orderState={estado}&pageNum={page_num}&pageSize=50"
+                    )
+                    r = await page.evaluate(f"""async () => {{
+                        const resp = await fetch('/api/order/index', {{
+                            method:'POST',
+                            headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+                            body:'{body}'
+                        }});
+                        return await resp.json();
+                    }}""")
+                    data = (r.get("data") or {})
+                    lista = data.get("list") or []
+                    total = data.get("total") or 0
+                    if total_estado is None:
+                        total_estado = total
+                        log(f"[backfill]   → {total} pedido(s) em {estado}")
+                    for o in lista:
+                        o["_state"] = estado
+                    todos.extend(lista)
+                    if page_num * 50 >= total_estado or not lista:
+                        break
+                    page_num += 1
+        except Exception as e:
+            log(f"[backfill] ❌ Erro ao consultar API: {e}")
+        finally:
+            await context.close()
+
+    if not todos:
+        log("[backfill] ℹ️ Nenhum pedido encontrado")
+        return
+
+    log(f"[backfill] 📊 {len(todos)} pedido(s) encontrados — verificando Supabase...")
+
+    # Monta dicts
+    pedidos_dict: dict = {}
+    itens_list:   list = []
+    for order in todos:
+        on = (order.get("orderNumber") or "").strip()
+        if not on:
+            continue
+        plataforma = PLAT.get((order.get("platform") or "").lower(), order.get("platform") or "")
+        try:
+            valor = float(order.get("orderAmount") or 0) or None
+        except Exception:
+            valor = None
+        api_label_url = None
+        for campo in ("labelUrl", "printUrl", "waybillUrl", "expressLabel", "packageLabel"):
+            v = (order.get(campo) or "").strip()
+            if v and v.startswith("http"):
+                api_label_url = v
+                break
+        items = order.get("orderItemList") or []
+        for item in items:
+            itens_list.append({
+                "order_number": on,
+                "sku":          (item.get("variationSku") or item.get("productSku") or "").strip(),
+                "product_name": (item.get("productName") or "").strip(),
+                "image_url":    (item.get("productImg")  or "").strip(),
+                "quantidade":   int(item.get("productCount") or 1),
+                "cliente":      token,
+                "data":         data_fim,
+            })
+        first     = items[0] if items else {}
+        qtd_total = sum(int(i.get("productCount") or 1) for i in items) or 1
+        # Usa payTime (data do pagamento) → createTime → fallback
+        data_pedido = data_fim
+        for campo_data in ("payTime", "createTime", "orderTime", "invoiceTime"):
+            v = (order.get(campo_data) or "")[:10]  # "YYYY-MM-DD"
+            if len(v) == 10 and v[4] == "-":
+                data_pedido = v
+                break
+
+        if on not in pedidos_dict:
+            pedidos_dict[on] = {
+                "order_number": on,
+                "sku":          (first.get("variationSku") or first.get("productSku") or "").strip(),
+                "product_name": (first.get("productName") or "").strip(),
+                "image_url":    (first.get("productImg")  or "").strip(),
+                "data":         data_pedido,
+                "quantidade":   qtd_total,
+                "plataforma":   plataforma,
+                "valor":        valor,
+                "cliente":      token,
+                "label_url":    api_label_url,
+            }
+
+    # Filtra só os que não estão no Supabase
+    supa = create_client(*_supa())
+    nums = list(pedidos_dict.keys())
+    existentes: set = set()
+    for i in range(0, len(nums), 100):
+        lote = nums[i:i + 100]
+        r = supa.table("pedidos").select("order_number").in_("order_number", lote).execute()
+        existentes.update(row["order_number"] for row in (r.data or []))
+
+    faltando = [pedidos_dict[n] for n in nums if n not in existentes]
+    log(f"[backfill] 📥 {len(faltando)} pedido(s) faltando no Supabase")
+
+    if not faltando:
+        log("[backfill] ✅ Supabase já está atualizado")
+        return
+
+    # Insere em lotes com tratamento de erro por coluna
+    inseridos = 0
+    erros = 0
+    COLUNAS_OPCIONAIS = {"plataforma", "valor", "label_url"}
+    for i in range(0, len(faltando), 50):
+        lote_orig = faltando[i:i + 50]
+        excluir: set = set()
+        lote = lote_orig
+        while True:
+            try:
+                supa.table("pedidos").upsert(lote, on_conflict="order_number").execute()
+                inseridos += len(lote)
+                break
+            except Exception as e:
+                msg = str(e)
+                col = next((c for c in COLUNAS_OPCIONAIS - excluir if c in msg), None)
+                if col:
+                    excluir.add(col)
+                    lote = [{k: v for k, v in row.items() if k not in excluir} for row in lote_orig]
+                else:
+                    log(f"[backfill] ⚠️ Erro insert lote {i//50+1}: {msg[:120]}")
+                    erros += len(lote_orig)
+                    break
+
+    # Insere itens dos faltando
+    ons_faltando = {p["order_number"] for p in faltando}
+    itens_inserir = [it for it in itens_list if it["order_number"] in ons_faltando]
+    for i in range(0, len(itens_inserir), 50):
+        try:
+            supa.table("pedido_itens").insert(itens_inserir[i:i + 50]).execute()
+        except Exception:
+            pass
+
+    log(f"[backfill] ✅ {inseridos} pedido(s) importados! ({len(itens_inserir)} itens){f' | {erros} erros' if erros else ''}")
+
+
+# ── Supabase privado: testar conexão ─────────────────────────────────────────
+@app.route("/testar-supabase", methods=["POST"])
+def testar_supabase():
+    dados = request.json or {}
+    url = (dados.get("supabase_url") or "").strip()
+    key = (dados.get("supabase_key") or "").strip()
+    if not url or not key:
+        return jsonify({"ok": False, "erro": "URL e chave são obrigatórios"})
+    try:
+        sb = create_client(url, key)
+        sb.table("pedidos").select("order_number").limit(1).execute()
+        return jsonify({"ok": True, "msg": "✅ Conexão bem-sucedida!"})
+    except Exception as e:
+        msg = str(e)
+        if "does not exist" in msg or "relation" in msg:
+            return jsonify({"ok": True, "msg": "✅ Conectado — tabelas ainda não criadas (use Migrar)"})
+        return jsonify({"ok": False, "erro": f"❌ {msg}"})
+
+
+# ── Supabase privado: migrar tabelas e dados ──────────────────────────────────
+@app.route("/migrar-supabase", methods=["POST"])
+def migrar_supabase():
+    dados = request.json or {}
+    url_destino = (dados.get("supabase_url") or "").strip()
+    key_destino = (dados.get("supabase_key") or "").strip()
+    if not url_destino or not key_destino:
+        return jsonify({"ok": False, "erro": "URL e chave do Supabase privado são obrigatórios"})
+
+    def _rodar():
+        try:
+            sb_orig = create_client(SUPABASE_URL, SUPABASE_KEY)
+            sb_dest = create_client(url_destino, key_destino)
+
+            # 1. Cria tabelas via RPC (SQL direto) —————————————————————————
+            SQL_SETUP = """
+CREATE TABLE IF NOT EXISTS pedidos (
+    id          BIGSERIAL PRIMARY KEY,
+    order_number TEXT UNIQUE NOT NULL,
+    sku         TEXT,
+    product_name TEXT,
+    image_url   TEXT,
+    data        DATE,
+    criado_em   TIMESTAMPTZ DEFAULT NOW(),
+    cliente     TEXT,
+    quantidade  INTEGER DEFAULT 1,
+    plataforma  TEXT,
+    valor       NUMERIC,
+    label_url   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS pedido_itens (
+    id           BIGSERIAL PRIMARY KEY,
+    order_number TEXT NOT NULL,
+    sku          TEXT,
+    product_name TEXT,
+    image_url    TEXT,
+    quantidade   INTEGER DEFAULT 1,
+    cliente      TEXT,
+    data         DATE,
+    criado_em    TIMESTAMPTZ DEFAULT NOW()
+);
+"""
+            try:
+                sb_dest.rpc("exec_sql", {"sql": SQL_SETUP}).execute()
+                log("[migrar] ✅ Tabelas criadas/verificadas")
+            except Exception:
+                log("[migrar] ℹ️ RPC exec_sql indisponível — crie as tabelas manualmente pelo painel Supabase")
+
+            # 2. Copia pedidos —————————————————————————————————————————————
+            log("[migrar] 📋 Copiando pedidos...")
+            offset, total = 0, 0
+            while True:
+                r = sb_orig.table("pedidos").select("*").range(offset, offset + 199).execute()
+                if not r.data:
+                    break
+                lote = [{k: v for k, v in row.items() if k != "id"} for row in r.data]
+                sb_dest.table("pedidos").upsert(lote, on_conflict="order_number").execute()
+                total += len(lote)
+                offset += 200
+                if len(r.data) < 200:
+                    break
+            log(f"[migrar] ✅ {total} pedido(s) copiados")
+
+            # 3. Copia pedido_itens ————————————————————————————————————————
+            log("[migrar] 📋 Copiando itens...")
+            offset, total_i = 0, 0
+            while True:
+                r = sb_orig.table("pedido_itens").select("*").range(offset, offset + 199).execute()
+                if not r.data:
+                    break
+                lote = [{k: v for k, v in row.items() if k != "id"} for row in r.data]
+                sb_dest.table("pedido_itens").insert(lote).execute()
+                total_i += len(lote)
+                offset += 200
+                if len(r.data) < 200:
+                    break
+            log(f"[migrar] ✅ {total_i} item(s) copiados")
+
+            # 4. Salva no config como Supabase ativo ——————————————————————
+            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8")) if CONFIG_FILE.exists() else {}
+            cfg["supabase_url"] = url_destino
+            cfg["supabase_key"] = key_destino
+            CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+            log("[migrar] ✅ Supabase privado ativado no config")
+
+        except Exception as e:
+            log(f"[migrar] ❌ Erro: {e}")
+
+    import threading as _t
+    _t.Thread(target=_rodar, daemon=True).start()
+    return jsonify({"ok": True, "msg": "Migração iniciada — acompanhe no log"})
+
+
 # ── Executar agora ────────────────────────────────────────────────────────────
-@app.route("/executar", methods=["POST"])
+def _cors(r):
+    r.headers["Access-Control-Allow-Origin"]  = "*"
+    r.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    r.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return r
+
+def _cors_preflight():
+    return _cors(make_response("", 204))
+
+@app.route("/executar", methods=["POST", "OPTIONS"], provide_automatic_options=False)
 def executar():
+    if request.method == "OPTIONS":
+        return _cors_preflight()
     global rodando
-    if rodando:
-        return jsonify({"ok": False, "erro": "Já está rodando, aguarde..."})
+    if rodando or _pos_import_ativo:
+        return _cors(jsonify({"ok": False, "erro": "Já está rodando, aguarde..."}))
 
     if not CONFIG_FILE.exists():
-        return jsonify({"ok": False, "erro": "Salve a configuração primeiro"})
+        return _cors(jsonify({"ok": False, "erro": "Salve a configuração primeiro"}))
 
     config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     modo   = request.json.get("modo", "hoje")
@@ -150,12 +541,14 @@ def executar():
             daemon=True
         ).start()
 
-    return jsonify({"ok": True})
+    return _cors(jsonify({"ok": True}))
 
 
 # ── Login UpSeller (abre browser para autenticação manual) ────────────────────
-@app.route("/login_upseller", methods=["POST"])
+@app.route("/login_upseller", methods=["POST", "OPTIONS"], provide_automatic_options=False)
 def login_upseller():
+    if request.method == "OPTIONS":
+        return _cors_preflight()
     global rodando
     if rodando:
         return jsonify({"ok": False, "erro": "Robô em execução, aguarde"})
@@ -279,8 +672,10 @@ def capturar_etiquetas():
 
 
 # ── Configurar inicialização automática ──────────────────────────────────────
-@app.route("/configurar_inicializacao", methods=["POST"])
+@app.route("/configurar_inicializacao", methods=["POST", "OPTIONS"], provide_automatic_options=False)
 def configurar_inicializacao():
+    if request.method == "OPTIONS":
+        return _cors_preflight()
     if not CONFIG_FILE.exists():
         return jsonify({"ok": False, "erro": "Salve a configuração primeiro"})
 
@@ -485,19 +880,125 @@ def status():
     agora   = datetime.now().strftime("%H:%M")
     proxima = next((h for h in sorted(horarios) if h > agora), horarios[0] if horarios else "—")
 
-    sessao_ok = PASTA_SESSAO.exists() and any(PASTA_SESSAO.iterdir())
+    # Verifica sessão real: checa se o cookie de autenticação existe e não expirou
+    sessao_ok = False
+    if PASTA_SESSAO.exists():
+        try:
+            import sqlite3 as _sq3, time as _time
+            db = PASTA_SESSAO / "Default" / "Cookies"
+            if db.exists():
+                con = _sq3.connect(str(db))
+                agr = _time.time()
+                # Cookies do upseller.com com expires_utc > agora (Chrome armazena em microssegundos desde 1601)
+                chrome_epoch = 11644473600  # segundos entre 1601-01-01 e 1970-01-01
+                agr_chrome = (agr + chrome_epoch) * 1_000_000
+                rows = con.execute(
+                    "SELECT COUNT(*) FROM cookies WHERE host_key LIKE '%upseller%' AND expires_utc > ?",
+                    (agr_chrome,)
+                ).fetchone()
+                con.close()
+                sessao_ok = (rows[0] > 0) if rows else False
+        except Exception:
+            sessao_ok = PASTA_SESSAO.exists() and any(PASTA_SESSAO.iterdir())
+
+    try:
+        versao = json.loads((PASTA_RAIZ / "version.json").read_text())["version"]
+    except Exception:
+        versao = "?"
 
     return jsonify({
         "configurado":    bool(config.get("token")),
         "token":          config.get("token", ""),
         "cliente":        cliente,
+        "email":          config.get("email", ""),
         "horarios":       horarios,
         "etapas":         etapas,
         "proxima":        proxima,
         "nome_impressora": config.get("nome_impressora", ""),
+        "auto_imprimir":  config.get("auto_imprimir", False),
         "rodando":     rodando,
         "sessao_ok":   sessao_ok,
+        "versao":      versao,
     })
+
+
+# ── Controles do processo ─────────────────────────────────────────────────────
+
+@app.route("/parar", methods=["POST", "OPTIONS"], provide_automatic_options=False)
+def parar():
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    global rodando
+    _parar.set()
+    rodando = False
+    log("⏹️ Robô parado pelo usuário")
+    return _cors(jsonify({"ok": True}))
+
+
+@app.route("/reiniciar", methods=["POST"])
+def reiniciar():
+    def _restart():
+        time.sleep(1.5)
+        os.execv(sys.executable, [sys.executable, str(PASTA_RAIZ / "app.py")])
+    threading.Thread(target=_restart, daemon=True).start()
+    log("🔄 Reiniciando em 2s...")
+    return jsonify({"ok": True})
+
+
+@app.route("/verificar-atualizacao", methods=["GET", "OPTIONS"], provide_automatic_options=False)
+def verificar_atualizacao():
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    BASE = "https://qaqlaqlxxeilouvbwgiv.supabase.co/storage/v1/object/public/robo-upseller"
+    try:
+        with urllib.request.urlopen(f"{BASE}/version.json", timeout=10) as r:
+            disponivel = json.loads(r.read())["version"]
+        atual = json.loads((PASTA_RAIZ / "version.json").read_text())["version"]
+        def _ver(v):
+            return tuple(int(x) for x in v.split("."))
+        tem = _ver(disponivel) > _ver(atual)
+        return _cors(jsonify({"atual": atual, "disponivel": disponivel, "tem_atualizacao": tem}))
+    except Exception as e:
+        try:
+            atual = json.loads((PASTA_RAIZ / "version.json").read_text())["version"]
+        except Exception:
+            atual = "?"
+        return _cors(jsonify({"atual": atual, "disponivel": atual, "tem_atualizacao": False, "erro": str(e)}))
+
+
+@app.route("/atualizar", methods=["POST", "OPTIONS"], provide_automatic_options=False)
+def atualizar():
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    BASE = "https://qaqlaqlxxeilouvbwgiv.supabase.co/storage/v1/object/public/robo-upseller"
+    ARQUIVOS_UPDATE = [
+        (f"{BASE}/version.json",         PASTA_RAIZ / "version.json"),
+        (f"{BASE}/app.py",               PASTA_RAIZ / "app.py"),
+        (f"{BASE}/templates/index.html", PASTA_RAIZ / "templates" / "index.html"),
+    ]
+    def _update():
+        try:
+            log("📥 Verificando atualização...")
+            with urllib.request.urlopen(f"{BASE}/version.json", timeout=10) as r:
+                nova_versao = json.loads(r.read())["version"]
+            versao_atual = json.loads((PASTA_RAIZ / "version.json").read_text())["version"]
+            def _ver(v):
+                return tuple(int(x) for x in v.split("."))
+            if _ver(nova_versao) <= _ver(versao_atual):
+                log(f"✅ Já está na versão mais recente ({versao_atual})")
+                return
+            log(f"⬆️ Atualizando {versao_atual} → {nova_versao}...")
+            for url, dest in ARQUIVOS_UPDATE:
+                with urllib.request.urlopen(url, timeout=30) as r:
+                    dest.write_bytes(r.read())
+                log(f"  ✓ {dest.name}")
+            log("✅ Atualização concluída — reiniciando...")
+            time.sleep(1.5)
+            os.execv(sys.executable, [sys.executable, str(PASTA_RAIZ / "app.py")])
+        except Exception as e:
+            log(f"❌ Erro na atualização: {e}")
+    threading.Thread(target=_update, daemon=True).start()
+    return _cors(jsonify({"ok": True}))
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -514,7 +1015,7 @@ def log(msg: str):
 
 
 def validar_token(token: str) -> str:
-    supa = create_client(SUPABASE_URL, SUPABASE_KEY)
+    supa = create_client(*_supa())
     resp = supa.table("clientes") \
         .select("nome, ativo").eq("token", token).single().execute()
     if not resp.data:
@@ -526,7 +1027,7 @@ def validar_token(token: str) -> str:
 
 def atualizar_ultima_execucao(token: str):
     try:
-        supa = create_client(SUPABASE_URL, SUPABASE_KEY)
+        supa = create_client(*_supa())
         supa.table("clientes").update(
             {"ultima_execucao": datetime.utcnow().isoformat()}
         ).eq("token", token).execute()
@@ -534,69 +1035,244 @@ def atualizar_ultima_execucao(token: str):
         pass
 
 
+_ultimo_retro: float = 0.0  # timestamp da última captura retroativa
+_INTERVALO_RETRO: float = 5 * 60  # retroativo a cada 5 minutos
+
+
+def _executar_captura(config: dict, aguardar: bool = True, background: bool = False):
+    """Roda captura com lock — impede duas execuções simultâneas.
+    Background: pula se já rodando. Executar principal: espera até 60s o background ceder.
+    """
+    global _ultimo_retro
+    if background:
+        if not _captura_lock.acquire(blocking=False):
+            log("[captura] ⏭️ Já em execução — pulando")
+            return
+    else:
+        # Executar principal: aguarda o background ceder (ele verifica `rodando` a cada pedido)
+        adquiriu = _captura_lock.acquire(timeout=60)
+        if not adquiriu:
+            log("[captura] ⚠️ Background ainda rodando após 60s — pulando captura")
+            return
+    try:
+        asyncio.run(_capturar_etiquetas_playwright(config, aguardar_se_vazio=aguardar, background=background))
+        # Retroativo: tenta capturar pedidos sem label_url a cada 5 min (só background)
+        if background:
+            agora = time.time()
+            if agora - _ultimo_retro >= _INTERVALO_RETRO:
+                asyncio.run(_capturar_retroativo_playwright(config))
+                _ultimo_retro = time.time()
+    finally:
+        _captura_lock.release()
+
+
+SUPABASE_STORAGE_URL = "https://qaqlaqlxxeilouvbwgiv.supabase.co/storage/v1/object/public/robo-upseller"
+
+
+def _upload_etiqueta_supabase(pdf_path: Path, order_number: str) -> str | None:
+    """Faz upload do PDF para Supabase Storage e retorna a URL pública permanente.
+    Retorna None em caso de falha — o fallback local continua funcionando.
+    """
+    try:
+        supa = create_client(*_supa())
+        caminho = f"etiquetas/etiqueta_{order_number}.pdf"
+        supa.storage.from_("robo-upseller").upload(
+            caminho,
+            pdf_path.read_bytes(),
+            {"content-type": "application/pdf", "upsert": "true"},
+        )
+        return f"{SUPABASE_STORAGE_URL}/{caminho}"
+    except Exception:
+        return None
+
+
+def _atualizar_supabase_com_pdfs_locais(token: str):
+    """Atualiza label_url no Supabase para todos os pedidos que já têm PDF em disco."""
+    pdfs = list(PASTA_ETIQUETAS.glob("etiqueta_*.pdf"))
+    if not pdfs:
+        return
+    try:
+        supa = create_client(*_supa())
+        atualizados = 0
+        for pdf in pdfs:
+            on = pdf.stem.replace("etiqueta_", "")
+            if not on:
+                continue
+            # Tenta URL pública Supabase Storage; fallback para localhost se upload falhar
+            url_publica = _upload_etiqueta_supabase(pdf, on)
+            label_url = url_publica or f"http://127.0.0.1:5001/etiqueta/{on}"
+            supa.table("pedidos").update({"label_url": label_url}) \
+                .eq("order_number", on).is_("label_url", "null").execute()
+            atualizados += 1
+        if atualizados:
+            log(f"[import] 🔗 Supabase: {atualizados} etiqueta(s) sincronizadas")
+    except Exception as e:
+        log(f"[import] ⚠️ Erro ao sincronizar PDFs com Supabase: {e}")
+
+
+def _atualizar_json_com_urls_robot(token: str):
+    """Reescreve o JSON mais recente com URLs do robô para todos os pedidos que têm PDF local."""
+    tkn8 = token[:8]
+    jsons = sorted(PASTA_DADOS.glob(f"lista_*_{tkn8}.json"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    if not jsons:
+        return
+    arq = jsons[0]
+    try:
+        pedidos = json.loads(arq.read_text(encoding="utf-8"))
+        atualizados = 0
+        for p in pedidos:
+            on = p.get("order_number", "")
+            if (PASTA_ETIQUETAS / f"etiqueta_{on}.pdf").exists():
+                p["label_url"] = f"http://127.0.0.1:5001/etiqueta/{on}"
+                atualizados += 1
+        arq.write_text(json.dumps(pedidos, ensure_ascii=False, indent=2), encoding="utf-8")
+        if atualizados:
+            log(f"[capturar] 🔗 JSON atualizado: {atualizados} etiqueta(s) com URL do robô")
+    except Exception as e:
+        log(f"[capturar] ⚠️ Erro ao atualizar JSON: {e}")
+
+
 def _pos_import(config: dict):
-    """Etapas executadas após qualquer import, respeitando os toggles em config['etapas']."""
+    """Etapas executadas após qualquer import, respeitando os toggles em config['etapas'].
+    Ordem: captura etiquetas prontas → picklist → NF-e → Envio → captura novas"""
     global _picklist_hoje
     etapas = config.get("etapas", {})
 
+    # 1. Sincroniza PDFs em disco com Supabase e captura o que já está em Para Imprimir
+    #    (feito ANTES da picklist para que o PCP já veja etiquetas disponíveis)
+    _atualizar_supabase_com_pdfs_locais(config.get("token", ""))
+    log("━━ Capturando etiquetas já prontas ━━")
+    _executar_captura(config, aguardar=False)
+    _atualizar_json_com_urls_robot(config.get("token", ""))
+
+    if _parar.is_set():
+        log("⏹️ Execução cancelada pelo usuário")
+        return
+
+    # 2. Picklist — gerada DEPOIS da captura inicial para incluir etiquetas já disponíveis
     if etapas.get("picklist", True):
         chave_pick = f"{date.today()}_pick"
         if chave_pick not in _picklist_hoje:
             _picklist_hoje.add(chave_pick)
             log("━━ Imprimindo picklist ━━")
             asyncio.run(_imprimir_picklist_playwright(config))
+        else:
+            log("━━ Picklist já impressa hoje — pulando ━━")
 
+    if _parar.is_set():
+        log("⏹️ Execução cancelada pelo usuário")
+        return
+
+    # 3. Emite NF-e em loop até Para Emitir esvaziar
     if etapas.get("nfe", True):
         log("━━ Emitindo NF-e em massa ━━")
         asyncio.run(_emitir_nfe_massa_playwright(config))
 
+    if _parar.is_set():
+        log("⏹️ Execução cancelada pelo usuário")
+        return
+
+    # 4. Programa envio em loop até Para Enviar esvaziar
     if etapas.get("envio", True):
         log("━━ Programando envio ━━")
         asyncio.run(_programar_envio_playwright(config))
-        log("━━ Capturando etiquetas ━━")
-        asyncio.run(_capturar_etiquetas_playwright(config))
+
+    if _parar.is_set():
+        log("⏹️ Execução cancelada pelo usuário")
+        return
+
+    # 5. Captura etiquetas que chegaram após NF-e+Envio (aguarda até 60s se Para Imprimir vazio)
+    log("━━ Capturando etiquetas novas ━━")
+    _executar_captura(config, aguardar=True)
+    _atualizar_json_com_urls_robot(config.get("token", ""))
 
 
 def _rodar_em_thread(config: dict, data_inicio: datetime, data_fim: datetime):
-    global rodando
+    global rodando, _pos_import_ativo
     rodando = True
+    _pos_import_ativo = True
+    _parar.clear()
+    _capturar_skip.clear()
+    # Aguarda o background capturar fechar o Chrome antes de abrir o Excel
+    # (dois processos no mesmo perfil causam conflito)
+    adquiriu = _captura_lock.acquire(timeout=45)
+    if adquiriu:
+        _captura_lock.release()
+    else:
+        log("⚠️ Background capturar demorou — prosseguindo mesmo assim")
     try:
         etapas = config.get("etapas", {})
         if etapas.get("importar", True):
-            sucesso = asyncio.run(_baixar_excel_playwright(config, data_inicio, data_fim))
-            if sucesso:
-                extrair(config, data_fim.date())
+            data_arquivo = data_fim.date().strftime("%Y-%m-%d")
+            log("Importando pedidos via API UpSeller...")
+            sucesso = asyncio.run(_importar_via_api(config, data_arquivo))
+            if not sucesso:
+                log("⚠️ API falhou — usando Excel como fallback...")
+                sucesso = asyncio.run(_baixar_excel_playwright(config, data_inicio, data_fim))
+                if not sucesso:
+                    log("[excel] ⚠️ Tentativa 1 falhou — retentando em 10s...")
+                    import time as _t; _t.sleep(10)
+                    sucesso = asyncio.run(_baixar_excel_playwright(config, data_inicio, data_fim))
+                if sucesso:
+                    extrair(config, data_fim.date())
+
+        # Pedidos que já têm PDF em disco: marca label_url no Supabase antes de liberar o PCP
+        _atualizar_supabase_com_pdfs_locais(config.get("token", ""))
+
+        # Import concluído — PCP já pode carregar pedidos e imprimir etiquetas disponíveis
+        rodando = False
+        log("__fim__")
+
+        # Captura, NF-e e envio continuam sem bloquear o PCP
         _pos_import(config)
     except Exception as e:
         log(f"❌ Erro inesperado: {e}")
     finally:
         rodando = False
-        log("__fim__")
+        _pos_import_ativo = False
 
 
 def _rodar_em_thread_duplo(config: dict,
                            ontem_ini: datetime, ontem_fim: datetime,
                            hoje_ini: datetime,  hoje_fim: datetime):
     """Puxa ontem completo, depois hoje até agora."""
-    global rodando
+    global rodando, _pos_import_ativo
     rodando = True
+    _pos_import_ativo = True
+    _parar.clear()
+    adquiriu = _captura_lock.acquire(timeout=45)
+    if adquiriu:
+        _captura_lock.release()
+    else:
+        log("⚠️ Background capturar demorou — prosseguindo mesmo assim")
     try:
         etapas = config.get("etapas", {})
         if etapas.get("importar", True):
-            log("━━ Carga do dia anterior ━━")
-            ok = asyncio.run(_baixar_excel_playwright(config, ontem_ini, ontem_fim))
-            if ok:
-                extrair(config, ontem_fim.date())
-            log("━━ Atualização de hoje ━━")
-            ok2 = asyncio.run(_baixar_excel_playwright(config, hoje_ini, hoje_fim))
-            if ok2:
-                extrair(config, hoje_fim.date())
+            data_hoje = hoje_fim.date().strftime("%Y-%m-%d")
+            log("Importando pedidos via API UpSeller...")
+            ok = asyncio.run(_importar_via_api(config, data_hoje))
+            if not ok:
+                log("⚠️ API falhou — usando Excel como fallback...")
+                log("━━ Carga do dia anterior ━━")
+                ok = asyncio.run(_baixar_excel_playwright(config, ontem_ini, ontem_fim))
+                if ok:
+                    extrair(config, ontem_fim.date())
+                log("━━ Atualização de hoje ━━")
+                ok2 = asyncio.run(_baixar_excel_playwright(config, hoje_ini, hoje_fim))
+                if ok2:
+                    extrair(config, hoje_fim.date())
+
+        # Import concluído — PCP já pode carregar pedidos e imprimir etiquetas disponíveis
+        rodando = False
+        log("__fim__")
+
         _pos_import(config)
     except Exception as e:
         log(f"❌ Erro inesperado: {e}")
     finally:
         rodando = False
-        log("__fim__")
+        _pos_import_ativo = False
 
 
 def _imprimir_picklist_thread(config: dict):
@@ -621,6 +1297,7 @@ async def _baixar_excel_playwright(config: dict, data_inicio: datetime, data_fim
         log("❌ Playwright não instalado. Rode: pip install playwright && playwright install chromium")
         return False
 
+    _limpar_crash_chrome()
     data_arquivo    = data_fim.strftime("%Y-%m-%d")
     ini_str         = data_inicio.strftime("%d/%m/%Y %H:%M:%S")
     fim_str         = data_fim.strftime("%d/%m/%Y %H:%M:%S")
@@ -673,11 +1350,13 @@ async def _baixar_excel_playwright(config: dict, data_inicio: datetime, data_fim
 
             log("Conectado. Aplicando filtro de data...")
 
-            await page.locator("input[placeholder='Filtrar por data']").first.click()
+            await _fechar_popups_upseller(page)
+
+            await page.locator("input[placeholder='Filtrar por data']").first.click(force=True)
             await page.wait_for_timeout(1500)
 
             start_input = page.locator("input[placeholder='Filtrar por data']").last
-            await start_input.click(click_count=3)
+            await start_input.click(click_count=3, force=True)
             await start_input.type(ini_str, delay=30)
             await page.wait_for_timeout(300)
             await page.keyboard.press("Tab")
@@ -687,50 +1366,230 @@ async def _baixar_excel_playwright(config: dict, data_inicio: datetime, data_fim
 
             ok_btn = page.locator(".ant-calendar-ok-btn")
             if await ok_btn.count() > 0:
-                await ok_btn.click()
+                await ok_btn.click(force=True)
             await page.wait_for_timeout(2000)
             log(f"Filtro: {ini_str} → {fim_str}")
 
             log("Exportando Excel...")
-            await page.get_by_role("button", name="Exportar").click()
-            await page.wait_for_timeout(800)
-            await page.get_by_text("Exportar Todos os Pedidos", exact=True).click()
-            await page.wait_for_timeout(1500)
+            # Garante que o botão está visível antes de clicar (page pode estar scrollada)
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(400)
+            # Usa mouse.click() com coordenadas reais — dispara pointer events que o React/AntD precisa
+            pos_exportar = await page.evaluate("""() => {
+                const btn = Array.from(document.querySelectorAll('button'))
+                    .find(b => b.innerText.trim().includes('Exportar') && b.offsetParent !== null
+                          && !b.innerText.includes('Todos'));
+                if (!btn) return null;
+                btn.scrollIntoView({block: 'center'});
+                const r = btn.getBoundingClientRect();
+                return {x: r.x + r.width/2, y: r.y + r.height/2};
+            }""")
+            if pos_exportar:
+                await page.mouse.click(pos_exportar['x'], pos_exportar['y'])
+                log(f"[excel] Clicou Exportar em ({pos_exportar['x']:.0f},{pos_exportar['y']:.0f})")
+            else:
+                log("[excel] ⚠️ Botão Exportar não encontrado na página")
+            await page.wait_for_timeout(1200)
 
-            modal_exportar = page.locator(".ant-modal-content").get_by_role("button", name="Exportar")
-            if await modal_exportar.count() > 0:
-                await modal_exportar.click()
-                await page.wait_for_timeout(1500)
+            pos_todos = await page.evaluate("""() => {
+                const el = Array.from(document.querySelectorAll('li, .ant-dropdown-menu-item, [role="menuitem"]'))
+                    .find(e => e.innerText && e.innerText.trim().includes('Exportar Todos') && e.offsetParent !== null);
+                if (!el) return null;
+                const r = el.getBoundingClientRect();
+                return {x: r.x + r.width/2, y: r.y + r.height/2};
+            }""")
+            if pos_todos:
+                await page.mouse.click(pos_todos['x'], pos_todos['y'])
+                log(f"[excel] Clicou 'Exportar Todos' em ({pos_todos['x']:.0f},{pos_todos['y']:.0f})")
+            else:
+                log("[excel] ⚠️ 'Exportar Todos os Pedidos' não encontrado no dropdown")
 
-            inputs_pagina = page.locator(".ant-modal-content input")
-            if await inputs_pagina.count() >= 2:
-                await inputs_pagina.nth(1).click(click_count=3)
-                await inputs_pagina.nth(1).fill("999")
-                await page.keyboard.press("Tab")
-                await page.wait_for_timeout(300)
-                valor_final = await inputs_pagina.nth(1).input_value()
-                log(f"Exportando páginas 1 a {valor_final}")
+            # Aguarda modal abrir — não chamar _fechar_popups aqui (fecharia o modal)
+            try:
+                await page.wait_for_selector('.ant-modal-content', timeout=6000)
+                log("[excel] Modal de exportar aberto")
+            except Exception:
+                log("[excel] ⚠️ Modal não apareceu após 6s")
 
-            await page.locator(".ant-modal-content").get_by_role("button", name="Exportar").click()
-            log("Gerando arquivo, aguardando...")
-            await page.wait_for_timeout(5001)
+            # Intercepta respostas HTTP para capturar o Excel diretamente da rede
+            # (funciona mesmo quando UpSeller não usa download do browser)
+            _excel_capturado: list = []
+            _excel_event = asyncio.Event()
 
-            async with page.expect_download(timeout=60_000) as dl_info:
-                baixar_btn = page.locator(".ant-modal-content").get_by_role("button", name="Baixar")
-                await baixar_btn.wait_for(timeout=30_000)
-                await baixar_btn.click()
-                log("Baixando arquivo...")
+            async def _captura_resposta_excel(response):
+                if _excel_event.is_set():
+                    return
+                ct = response.headers.get('content-type', '').lower()
+                cd = response.headers.get('content-disposition', '').lower()
+                if ('spreadsheet' in ct or 'excel' in ct or
+                        ('attachment' in cd and ('xls' in cd or 'xlsx' in cd))):
+                    try:
+                        body = await response.body()
+                        if len(body) > 5000 and body[:2] == b'PK':  # XLSX = ZIP
+                            _excel_capturado.append(body)
+                            _excel_event.set()
+                            log(f"[excel] 📥 Excel capturado via rede ({len(body)//1024}KB)")
+                    except Exception:
+                        pass
 
-            download = await dl_info.value
-            await download.save_as(caminho_destino)
-            log(f"✅ Excel salvo: pedidos_{data_arquivo}.xlsx")
-            return True
+            page.on('response', _captura_resposta_excel)
+
+            # Também monitora requests para diagnóstico
+            _reqs_exportar: list = []
+
+            async def _log_req(request):
+                url = request.url
+                if 'upseller.com' in url and '/order/all-orders' not in url:
+                    _reqs_exportar.append(f"{request.method} {url[:120]}")
+
+            page.on('request', _log_req)
+
+            # Envolve TODO o fluxo do modal num único expect_download (300s)
+            async with page.expect_download(timeout=300_000) as dl_info:
+
+                # Loga os botões disponíveis no modal para diagnóstico
+                botoes_modal = await page.evaluate("""() => {
+                    const modal = document.querySelector('.ant-modal-content');
+                    if (!modal) return [];
+                    return Array.from(modal.querySelectorAll('button'))
+                        .filter(b => b.offsetParent !== null)
+                        .map(b => ({text: b.innerText.trim(), disabled: b.disabled}));
+                }""")
+                log(f"[excel] 🔎 Botões no modal: {botoes_modal}")
+
+                # Clica "Exportar" dentro do modal (abre sub-form de páginas)
+                pos_modal_exp = await page.evaluate("""() => {
+                    const modal = document.querySelector('.ant-modal-content');
+                    if (!modal) return null;
+                    const btn = Array.from(modal.querySelectorAll('button'))
+                        .find(b => b.innerText.trim().includes('Exportar') && b.offsetParent !== null);
+                    if (!btn) return null;
+                    const r = btn.getBoundingClientRect();
+                    return {x: r.x + r.width/2, y: r.y + r.height/2, disabled: btn.disabled};
+                }""")
+                if pos_modal_exp:
+                    log(f"[excel] Clicando Exportar no modal (disabled={pos_modal_exp.get('disabled')})")
+                    await page.mouse.click(pos_modal_exp['x'], pos_modal_exp['y'])
+                    await page.wait_for_timeout(2000)  # aguarda form de páginas carregar
+
+                # Preenche "até página 999" — aguarda até 5s pelo input aparecer
+                inputs_pagina = page.locator(
+                    ".ant-modal-content input[type='number'], "
+                    ".ant-modal-content input[type='text'], "
+                    ".ant-modal-content .ant-input-number-input"
+                )
+                n_inputs = await inputs_pagina.count()
+                if n_inputs == 0:
+                    await page.wait_for_timeout(2000)
+                    n_inputs = await inputs_pagina.count()
+                log(f"[excel] {n_inputs} input(s) encontrado(s) no modal")
+
+                if n_inputs >= 1:
+                    ultimo = inputs_pagina.nth(n_inputs - 1)
+                    await ultimo.click(click_count=3, force=True)
+                    await ultimo.fill("999")
+                    await page.keyboard.press("Tab")
+                    await page.wait_for_timeout(300)
+                    valor_final = await ultimo.input_value()
+                    log(f"[excel] Exportando páginas 1 a {valor_final}")
+
+                    pos_modal_exp2 = await page.evaluate("""() => {
+                        const modal = document.querySelector('.ant-modal-content');
+                        if (!modal) return null;
+                        const btn = Array.from(modal.querySelectorAll('button'))
+                            .find(b => b.innerText.trim().includes('Exportar') && b.offsetParent !== null);
+                        if (!btn) return null;
+                        const r = btn.getBoundingClientRect();
+                        return {x: r.x + r.width/2, y: r.y + r.height/2};
+                    }""")
+                    if pos_modal_exp2:
+                        await page.mouse.click(pos_modal_exp2['x'], pos_modal_exp2['y'])
+                        log("[excel] Exportar submetido")
+                else:
+                    # 0 inputs — loga requests ANTES do 2º clique para diagnóstico
+                    log(f"[excel] 🔎 Requests após 1º clique: {_reqs_exportar}")
+
+                    # Screenshot do estado do modal para diagnóstico
+                    sc_modal = PASTA_RAIZ / "debug_excel_modal.png"
+                    try:
+                        await page.screenshot(path=str(sc_modal))
+                        log(f"[excel] 📸 Screenshot: {sc_modal.name}")
+                    except Exception:
+                        pass
+
+                    # Tenta JS click (força o handler React/Vue independente de estado)
+                    clicou_js = await page.evaluate("""() => {
+                        const modal = document.querySelector('.ant-modal-content');
+                        if (!modal) return false;
+                        const btn = Array.from(modal.querySelectorAll('button'))
+                            .find(b => b.innerText.trim().includes('Exportar'));
+                        if (!btn) return false;
+                        btn.removeAttribute('disabled');
+                        btn.click();
+                        return true;
+                    }""")
+                    log(f"[excel] JS click Exportar: {clicou_js}")
+                    await page.wait_for_timeout(2000)
+                    log(f"[excel] 🔎 Requests após JS click: {_reqs_exportar}")
+
+                log("Gerando arquivo, aguardando...")
+                await page.wait_for_timeout(3000)
+
+                # Tenta encontrar e clicar "Baixar"
+                try:
+                    baixar_btn = page.locator("button:has-text('Baixar'), a:has-text('Baixar')").first
+                    await baixar_btn.wait_for(timeout=300_000)
+                    await baixar_btn.click(force=True)
+                    log("Baixando arquivo...")
+                except Exception:
+                    log("[excel] ℹ️ Botão Baixar não apareceu — verificando captura de rede...")
+                    # Aguarda até 90s pela captura via interceptação HTTP
+                    try:
+                        await asyncio.wait_for(_excel_event.wait(), timeout=90)
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(3000)
+
+            # Tenta download do browser primeiro
+            try:
+                download = await dl_info.value
+                await download.save_as(caminho_destino)
+                log(f"✅ Excel salvo: pedidos_{data_arquivo}.xlsx")
+                return True
+            except Exception:
+                pass
+
+            # Fallback: arquivo capturado via interceptação HTTP
+            if _excel_capturado:
+                caminho_destino.write_bytes(_excel_capturado[0])
+                log(f"✅ Excel salvo (via rede): pedidos_{data_arquivo}.xlsx")
+                return True
+
+            log("❌ Excel não capturado por nenhum método")
+            return False
 
         except Exception as e:
             log(f"❌ Erro ao baixar Excel: {e}")
             return False
         finally:
             await context.close()
+
+
+# ── Limpa estado de crash do perfil Chrome ───────────────────────────────────
+
+def _limpar_crash_chrome():
+    """Reseta exit_type no perfil Chrome para evitar o modo recuperação de crash."""
+    import json as _json
+    prefs_path = PASTA_SESSAO / "Default" / "Preferences"
+    if not prefs_path.exists():
+        return
+    try:
+        prefs = _json.loads(prefs_path.read_text(encoding="utf-8"))
+        if prefs.get("profile", {}).get("exit_type") not in (None, "Normal"):
+            prefs.setdefault("profile", {})["exit_type"] = "Normal"
+            prefs_path.write_text(_json.dumps(prefs), encoding="utf-8")
+    except Exception:
+        pass
 
 
 # ── Fecha popups/modais do UpSeller ──────────────────────────────────────────
@@ -752,6 +1611,26 @@ async def _fechar_popups_upseller(page) -> None:
         }""")
         if fechou_driver:
             await page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+    # Modal com YouTube iframe (UpSeller promotional popup) — remove do DOM diretamente
+    try:
+        removeu = await page.evaluate("""() => {
+            const modals = Array.from(document.querySelectorAll('.ant-modal-wrap, .ant-modal-root'));
+            let removido = 0;
+            modals.forEach(m => {
+                if (m.querySelector('iframe[src*="youtube"]') || m.offsetParent !== null) {
+                    m.remove();
+                    removido++;
+                }
+            });
+            // Remove também o overlay de fundo
+            document.querySelectorAll('.ant-modal-mask').forEach(el => el.remove());
+            return removido > 0;
+        }""")
+        if removeu:
+            await page.wait_for_timeout(300)
     except Exception:
         pass
 
@@ -806,17 +1685,30 @@ async def _imprimir_ou_pdf(popup, tem_impressora: bool, nome: str, prefixo: str)
             subprocess.Popen(["xdg-open", str(path)])
 
     # PDF hospedado externamente (ex: print-label.upseller.cn)
-    pasta_pdf = PASTA_PICKLISTS if prefixo == "picklist" else PASTA_RAIZ
+    pasta_pdf = PASTA_PICKLISTS if prefixo == "picklist" else PASTA_ETIQUETAS
 
     if url.lower().endswith(".pdf") or "print-label" in url.lower():
         pdf_path = pasta_pdf / f"{prefixo}_{nome}.pdf"
         try:
             urllib.request.urlretrieve(url, str(pdf_path))
-            log(f"[{prefixo}] 📄 PDF salvo: {pdf_path.name}")
+            # Corrige dimensões (A4 → 100×150mm) e substitui o original para que o
+            # arquivo salvo na pasta já esteja no tamanho certo para impressão manual
             if prefixo != "picklist":
+                _corr = _corrigir_mediabox(pdf_path)
+                if _corr != pdf_path and _corr.exists():
+                    _corr.replace(pdf_path)
+            log(f"[{prefixo}] 📄 PDF salvo: {pdf_path.name}")
+            if prefixo != "picklist" and tem_impressora:
+                if platform.system() == "Windows":
+                    cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8")) if CONFIG_FILE.exists() else {}
+                    _imprimir_windows(pdf_path, cfg.get("nome_impressora", "").strip())
+                elif platform.system() == "Darwin":
+                    subprocess.Popen(["lp", str(pdf_path)])
+                log(f"[{prefixo}] 🖨️ Impresso direto da pasta")
+            elif prefixo != "picklist":
                 _abrir(pdf_path)
         except Exception as e:
-            log(f"[{prefixo}] ⚠️ Erro ao baixar PDF: {e}")
+            log(f"[{prefixo}] ⚠️ Erro ao baixar/imprimir PDF: {e}")
         return
 
     # Página HTML — gera PDF (headless obrigatório) e imprime ou abre
@@ -841,17 +1733,246 @@ async def _imprimir_ou_pdf(popup, tem_impressora: bool, nome: str, prefixo: str)
                 subprocess.Popen(["lp", str(pdf_path)])
                 log(f"[{prefixo}] 🖨️ Enviado para impressora (lp)")
             elif platform.system() == "Windows":
-                subprocess.Popen(
-                    ["powershell", "-Command",
-                     f'Start-Process -FilePath "{pdf_path}" -Verb Print -Wait'],
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                )
+                cfg2 = json.loads(CONFIG_FILE.read_text(encoding="utf-8")) if CONFIG_FILE.exists() else {}
+                _imprimir_windows(_corrigir_mediabox(pdf_path), cfg2.get("nome_impressora", "").strip())
                 log(f"[{prefixo}] 🖨️ Enviado para impressora (Windows)")
         except Exception as e:
             log(f"[{prefixo}] ⚠️ Erro ao imprimir: {e} — abrindo PDF")
             _abrir(pdf_path)
     else:
         _abrir(pdf_path)
+
+
+# ── Helpers de PDF ────────────────────────────────────────────────────────────
+
+def _contar_paginas_pdf(pdf_path: "Path") -> int:
+    try:
+        from pypdf import PdfReader
+        return len(PdfReader(str(pdf_path), strict=False).pages)
+    except Exception:
+        return 1
+
+def _garantir_pagina_unica(pdf_path: "Path") -> None:
+    """Se o PDF tiver múltiplas páginas (batch), mantém só a página 1."""
+    try:
+        from pypdf import PdfReader, PdfWriter
+        reader = PdfReader(str(pdf_path), strict=False)
+        if len(reader.pages) <= 1:
+            return
+        writer = PdfWriter()
+        writer.add_page(reader.pages[0])
+        with open(str(pdf_path), "wb") as f:
+            writer.write(f)
+        # Remove versão _c para regenerar com dimensões corretas
+        corr = pdf_path.with_stem(pdf_path.stem + "_c")
+        corr.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+def _split_pdf_batch(pdf_path: "Path", ordens: list) -> list:
+    """Divide PDF batch (N páginas) em um arquivo por pedido. Retorna lista de order_numbers salvos."""
+    try:
+        from pypdf import PdfReader, PdfWriter
+        reader = PdfReader(str(pdf_path), strict=False)
+        n_pages = len(reader.pages)
+        salvos = []
+        for i, on in enumerate(ordens):
+            if i >= n_pages:
+                break
+            dest = PASTA_ETIQUETAS / f"etiqueta_{on}.pdf"
+            if dest.exists():
+                salvos.append(on)
+                continue
+            writer = PdfWriter()
+            writer.add_page(reader.pages[i])
+            with open(str(dest), "wb") as f:
+                writer.write(f)
+            c = _corrigir_mediabox(dest)
+            if c != dest and c.exists():
+                c.replace(dest)
+            salvos.append(on)
+        return salvos
+    except Exception as e:
+        log(f"[capturar] ⚠️ Split PDF falhou: {e}")
+        return []
+
+
+# ── SumatraPDF (impressão com escala no Windows) ─────────────────────────────
+
+def _corrigir_mediabox(pdf_path: "Path") -> "Path":
+    """Recorta o PDF para 100×150mm (papel térmico padrão).
+    Para PDFs A4 de carrier (TikTok/iMile) a etiqueta fica no canto superior esquerdo."""
+    import re, zlib
+
+    out = pdf_path.with_stem(pdf_path.stem + "_c")
+    if out.exists():
+        return out
+    try:
+        data = pdf_path.read_bytes()
+
+        # --- Lê o MediaBox original (bytes crus ou stream comprimido) ---
+        streams_raw = re.findall(rb'stream\r?\n(.*?)\r?\nendstream', data, re.DOTALL)
+
+        m_orig = re.search(rb'/MediaBox\s*\[([^\]]+)\]', data)
+        if not m_orig:
+            for s in streams_raw:
+                try:
+                    dec = zlib.decompress(s)
+                    m_orig = re.search(rb'/MediaBox\s*\[([^\]]+)\]', dec)
+                    if m_orig:
+                        break
+                except Exception:
+                    pass
+
+        if not m_orig:
+            return pdf_path
+
+        orig_vals = list(map(float, m_orig.group(1).split()))
+        if len(orig_vals) != 4:
+            return pdf_path
+
+        orig_w = orig_vals[2] - orig_vals[0]
+        orig_h = orig_vals[3] - orig_vals[1]
+
+        # Se já é tamanho de etiqueta térmica (≤ 130mm × 170mm ≈ 368pt × 481pt), não corrige
+        if orig_w <= 368 and orig_h <= 481:
+            return pdf_path
+
+        # --- Calcula novo MediaBox ---
+        LABEL_W = 283.46   # 100mm em points (72pt/in)
+        LABEL_H = 425.20   # 150mm em points
+        x0_new = y0_new = x1_new = y1_new = None
+
+        # Caso A4 portrait (etiqueta no canto superior esquerdo — confirmado para TikTok/iMile)
+        if abs(orig_w - 595.28) < 20 and abs(orig_h - 841.89) < 20:
+            x0_new, y0_new = 0.0, 841.89 - LABEL_H   # ≈ 416.69
+            x1_new, y1_new = LABEL_W, 841.89
+
+        # Caso A4 landscape
+        elif abs(orig_w - 841.89) < 20 and abs(orig_h - 595.28) < 20:
+            x0_new, y0_new = 0.0, 595.28 - LABEL_H
+            x1_new, y1_new = LABEL_W, 595.28
+
+        else:
+            # Fallback: tenta detectar Form XObject + BBox (método original)
+            tx = ty = bw = bh = None
+            for s in streams_raw:
+                for raw in [False, True]:
+                    try:
+                        text = (zlib.decompress(s) if raw else s).decode('latin-1', errors='ignore')
+                    except Exception:
+                        continue
+                    m = re.search(
+                        r'([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+cm\s*/\w+\s+Do',
+                        text)
+                    if m:
+                        a, b, c, d, e, f = (float(m.group(i)) for i in range(1, 7))
+                        if abs(a - 1) < 0.1 and abs(d - 1) < 0.1 and abs(b) < 0.1 and abs(c) < 0.1:
+                            tx, ty = e, f
+                    m2 = re.search(r'/BBox\s*\[([^\]]+)\]', text)
+                    if m2:
+                        bb = list(map(float, m2.group(1).split()))
+                        if len(bb) == 4:
+                            bw, bh = bb[2] - bb[0], bb[3] - bb[1]
+                    if tx is not None and bw is not None:
+                        break
+                if tx is not None and bw is not None:
+                    break
+
+            if tx is not None and bw is not None and bw >= 60 and bh >= 80:
+                x0_new, y0_new = tx, ty
+                x1_new, y1_new = tx + bw, ty + bh
+
+        if x0_new is None:
+            return pdf_path  # não conseguiu detectar
+
+        new_mb_bytes = f'/MediaBox[{x0_new:.4f} {y0_new:.4f} {x1_new:.4f} {y1_new:.4f}]'.encode('latin-1')
+
+        # Tenta patch nos bytes crus (MediaBox fora de stream comprimido)
+        patched = re.sub(rb'/MediaBox\s*\[[^\]]+\]', new_mb_bytes, data)
+        if patched != data:
+            out.write_bytes(patched)
+            log(f"[etiqueta] ✂️ MediaBox {orig_w/2.835:.0f}×{orig_h/2.835:.0f}mm → {(x1_new-x0_new)/2.835:.0f}×{(y1_new-y0_new)/2.835:.0f}mm")
+            return out
+
+        # Se MediaBox está dentro de stream comprimido, recomprime
+        def patch_stream(m):
+            hdr, length_s, mid, sdata, tail = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+            try:
+                dec = zlib.decompress(sdata)
+                text = dec.decode('latin-1', errors='ignore')
+                if 'MediaBox' not in text:
+                    return m.group(0)
+                new_text = re.sub(r'/MediaBox\[[^\]]+\]', new_mb_bytes.decode('latin-1'), text)
+                if new_text == text:
+                    return m.group(0)
+                new_comp = zlib.compress(new_text.encode('latin-1'))
+                new_len = str(len(new_comp)).encode()
+                new_hdr = re.sub(rb'/Length\s+\d+', b'/Length ' + new_len, hdr + length_s + mid)
+                return new_hdr + new_comp + tail
+            except Exception:
+                return m.group(0)
+
+        pattern = re.compile(
+            rb'(<<.*?/Filter/FlateDecode.*?/Length\s+)(\d+)(.*?>>\s*stream\r?\n)([\x00-\xff]+?)(\r?\nendstream)',
+            re.DOTALL
+        )
+        result = pattern.sub(patch_stream, data)
+        out.write_bytes(result)
+        log(f"[etiqueta] ✂️ MediaBox {orig_w/2.835:.0f}×{orig_h/2.835:.0f}mm → {(x1_new-x0_new)/2.835:.0f}×{(y1_new-y0_new)/2.835:.0f}mm (stream)")
+        return out
+    except Exception as e:
+        log(f"[etiqueta] ⚠️ _corrigir_mediabox falhou: {e}")
+        return pdf_path
+
+
+def _obter_sumatra() -> "Path | None":
+    """Retorna path do SumatraPDF.exe — baixa portátil se não encontrar."""
+    import shutil
+    local = PASTA_RAIZ / "SumatraPDF.exe"
+    if local.exists():
+        return local
+    sys_path = shutil.which("SumatraPDF")
+    if sys_path:
+        return Path(sys_path)
+    try:
+        url = ("https://qaqlaqlxxeilouvbwgiv.supabase.co"
+               "/storage/v1/object/public/robo-upseller/SumatraPDF.exe")
+        log("[sumatra] 📥 Baixando SumatraPDF...")
+        import urllib.request as _ur
+        _ur.urlretrieve(url, str(local))
+        log("[sumatra] ✅ SumatraPDF pronto")
+        return local
+    except Exception as e:
+        log(f"[sumatra] ⚠️ Não foi possível baixar: {e}")
+        return None
+
+
+def _imprimir_windows(pdf_path: "Path", impressora: str) -> bool:
+    """Imprime PDF no Windows usando SumatraPDF (escala para preencher o papel)."""
+    sumatra = _obter_sumatra()
+    if sumatra:
+        if impressora:
+            cmd = [str(sumatra), "-print-to", impressora,
+                   "-print-settings", "shrink,color", str(pdf_path)]
+        else:
+            cmd = [str(sumatra), "-print-to-default",
+                   "-print-settings", "shrink,color", str(pdf_path)]
+        try:
+            subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW, timeout=60)
+            return True
+        except Exception as e:
+            log(f"[etiqueta] ⚠️ SumatraPDF erro: {e}")
+    # Fallback: PowerShell
+    try:
+        ps = (f'Start-Process -FilePath "{pdf_path}" -Verb PrintTo -ArgumentList "{impressora}" -Wait'
+              if impressora else
+              f'Start-Process -FilePath "{pdf_path}" -Verb Print -Wait')
+        subprocess.run(["powershell", "-Command", ps],
+                       creationflags=subprocess.CREATE_NO_WINDOW, timeout=30)
+    except Exception as e:
+        log(f"[etiqueta] ⚠️ Fallback erro: {e}")
+    return True
 
 
 # ── Verificação de impressora ─────────────────────────────────────────────────
@@ -887,6 +2008,7 @@ async def _imprimir_picklist_playwright(config: dict):
         log("[picklist] ❌ Playwright não instalado")
         return False
 
+    _limpar_crash_chrome()
     log("[picklist] 🗒️ Abrindo UpSeller — Para Emitir...")
 
     async with async_playwright() as p:
@@ -923,6 +2045,14 @@ async def _imprimir_picklist_playwright(config: dict):
             # Fecha qualquer popup/aviso (Avisos, NF-e, etc.)
             await _fechar_popups_upseller(page)
 
+            # Verifica se há pedidos antes de tentar imprimir (aguarda a tabela carregar)
+            await page.wait_for_timeout(2000)
+            linhas_pick = await page.locator("tbody tr").count()
+            if linhas_pick == 0:
+                log("[picklist] ℹ️ Para Emitir vazio — picklist não gerada")
+                return True
+            log(f"[picklist] 📋 {linhas_pick} pedido(s) para imprimir")
+
             # Seleciona todos — o UpSeller já filtra: só mostra o que ainda está em "Para Emitir"
             # Pedidos já processados saem da lista automaticamente
             log("[picklist] ☑️ Selecionando todos os pedidos...")
@@ -953,7 +2083,7 @@ async def _imprimir_picklist_playwright(config: dict):
 
             # Marca todos os pedidos não impressos do cliente como impressos agora
             try:
-                supa  = create_client(SUPABASE_URL, SUPABASE_KEY)
+                supa  = create_client(*_supa())
                 agora = datetime.utcnow().isoformat()
                 supa.from_("pedidos").update({"picklist_impresso_em": agora}) \
                     .is_("picklist_impresso_em", "null") \
@@ -1009,22 +2139,39 @@ def picklist_disponivel():
 @app.route("/etiqueta/<order_number>", methods=["GET"])
 def servir_etiqueta(order_number):
     """Serve ou imprime diretamente a etiqueta da subpasta local / Supabase."""
-    from flask import Response
+    from flask import Response, request as _req
     import urllib.request as _ul
     pdf_path = PASTA_ETIQUETAS / f"etiqueta_{order_number}.pdf"
+
+    # ?raw=1 → serve o PDF binário diretamente (para browser abrir/imprimir)
+    if _req.args.get("raw"):
+        if pdf_path.exists():
+            conteudo = pdf_path.read_bytes()
+            resp = Response(conteudo, mimetype="application/pdf")
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            return resp
+        return jsonify({"erro": "PDF não encontrado"}), 404
+
+    # Log imediato — aparece ANTES de qualquer verificação, inclusive para 404
+    log(f"[etiqueta] 🔔 PCP solicitou: {order_number} | existe={pdf_path.exists()}")
 
     config = json.loads(CONFIG_FILE.read_text(encoding="utf-8")) if CONFIG_FILE.exists() else {}
     nome_impressora = config.get("nome_impressora", "").strip()
 
     def _obter_pdf() -> bool:
         if pdf_path.exists():
+            _garantir_pagina_unica(pdf_path)  # corrige PDFs batch multi-página
             return True
         try:
-            supa = create_client(SUPABASE_URL, SUPABASE_KEY)
-            r = supa.table("pedidos").select("label_url").eq("order_number", order_number).single().execute()
-            url = r.data.get("label_url") if r.data else None
-            if url:
+            supa = create_client(*_supa())
+            # limit(1) em vez de .single() — pedidos tem múltiplas linhas por order_number (1 por SKU)
+            r = supa.table("pedidos").select("label_url").eq("order_number", order_number).limit(1).execute()
+            rows = r.data or []
+            url = rows[0].get("label_url") if rows else None
+            # Ignora URLs que apontam para o próprio robô (evita loop infinito)
+            if url and "127.0.0.1:5001" not in url and "localhost:5001" not in url:
                 _ul.urlretrieve(url, str(pdf_path))
+                _garantir_pagina_unica(pdf_path)
                 return True
         except Exception:
             pass
@@ -1035,40 +2182,54 @@ def servir_etiqueta(order_number):
         r.headers["Access-Control-Allow-Origin"] = "*"
         return r, 404
 
-    # Com impressora: imprime direto e retorna confirmação JSON
-    if platform.system() == "Windows":
-        # Usa impressora configurada ou busca a padrão do sistema
-        impressora = nome_impressora
-        if not impressora:
-            try:
-                r_imp = subprocess.run(
-                    ["powershell", "-Command",
-                     "Get-Printer | Where-Object {$_.Default -eq $true} | Select-Object -First 1 -ExpandProperty Name"],
-                    capture_output=True, text=True, timeout=5,
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                )
-                impressora = r_imp.stdout.strip()
-            except Exception:
-                impressora = ""
-        if impressora:
-            try:
-                subprocess.run(
-                    ["powershell", "-Command",
-                     f'Start-Process -FilePath "{pdf_path}" -Verb PrintTo -ArgumentList "{impressora}" -Wait'],
-                    creationflags=subprocess.CREATE_NO_WINDOW, timeout=30
-                )
-                log(f"[etiqueta] 🖨️ {order_number} → {impressora}")
-            except Exception as e:
-                log(f"[etiqueta] ⚠️ Erro ao imprimir: {e}")
-            r = jsonify({"ok": True, "impresso": True, "impressora": impressora})
+    # Valida que o arquivo é realmente um PDF
+    try:
+        header_bytes = pdf_path.read_bytes()[:8]
+        if not header_bytes.startswith(b'%PDF'):
+            log(f"[etiqueta] ❌ {order_number} — arquivo não é PDF (inicia com: {header_bytes[:20]})")
+            pdf_path.unlink(missing_ok=True)
+            r = jsonify({"erro": "Arquivo de etiqueta inválido — será baixado novamente"})
+            r.headers["Access-Control-Allow-Origin"] = "*"
+            return r, 500
+    except Exception:
+        pass
+
+    # Tenta imprimir direto; se não conseguir, serve o PDF para o browser
+    sistema = platform.system()
+    tem_impressora = _verificar_impressora()
+    log(f"[etiqueta] 📄 {order_number} | impressora={nome_impressora or '(padrão)'} | tem_impressora={tem_impressora} | sistema={sistema}")
+
+    if tem_impressora:
+        try:
+            pdf_imprimir = _corrigir_mediabox(pdf_path)
+            log(f"[etiqueta] 📐 {order_number} | pdf={pdf_imprimir.name} | tamanho={pdf_imprimir.stat().st_size}B")
+            if sistema == "Darwin":
+                cmd = ["lp", "-d", nome_impressora, str(pdf_imprimir)] if nome_impressora else ["lp", str(pdf_imprimir)]
+                subprocess.run(cmd, timeout=30, check=True)
+                log(f"[etiqueta] 🖨️ {order_number} → {nome_impressora or 'impressora padrão'}")
+            elif sistema == "Windows":
+                _imprimir_windows(pdf_imprimir, nome_impressora)
+                log(f"[etiqueta] 🖨️ {order_number} → {nome_impressora or 'impressora padrão'}")
+            r = jsonify({"ok": True, "impresso": True, "impressora": nome_impressora})
             r.headers["Access-Control-Allow-Origin"] = "*"
             return r
+        except Exception as e:
+            log(f"[etiqueta] ⚠️ Erro ao imprimir: {e} — servindo PDF")
 
-    # Sem impressora configurada: serve o PDF para o browser abrir
-    conteudo = pdf_path.read_bytes()
-    resp = Response(conteudo, mimetype="application/pdf")
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    return resp
+    # Sem impressora: abre o PDF no sistema e retorna JSON para PCP confirmar
+    log(f"[etiqueta] 📋 {order_number} — abrindo PDF no sistema (sem impressora)")
+    try:
+        pdf_imprimir = _corrigir_mediabox(pdf_path)
+        if sistema == "Darwin":
+            subprocess.Popen(["open", str(pdf_imprimir)])
+        elif sistema == "Windows":
+            subprocess.Popen(["start", "", str(pdf_imprimir)], shell=True)
+    except Exception as e:
+        log(f"[etiqueta] ⚠️ Não foi possível abrir PDF: {e}")
+    r = jsonify({"ok": True, "impresso": False, "motivo": "sem_impressora",
+                 "pdf": f"http://127.0.0.1:5001/etiqueta/{order_number}?raw=1"})
+    r.headers["Access-Control-Allow-Origin"] = "*"
+    return r
 
 
 @app.route("/picklist-pdf", methods=["GET"])
@@ -1090,9 +2251,299 @@ def picklist_pdf():
     return resp
 
 
+# ── Sincroniza pedidos novos (capturados entre imports) no Supabase ──────────
+
+async def _sincronizar_pedidos_novos_supabase(page, order_numbers: list, config: dict):
+    """Insere no Supabase pedidos que estão em Para Imprimir mas não foram importados ainda.
+    Ocorre quando o background captura um pedido que chegou após o último import do dia.
+    """
+    import re as _re
+    try:
+        supa = create_client(*_supa())
+        # Descobre quais ainda não estão no Supabase
+        r = supa.table("pedidos").select("order_number").in_("order_number", order_numbers).execute()
+        existentes = {row["order_number"] for row in (r.data or [])}
+        faltando = [on for on in order_numbers if on not in existentes]
+        if not faltando:
+            return
+
+        log(f"[capturar] 📥 {len(faltando)} pedido(s) novos — importando para Supabase...")
+
+        PLAT = {"shopee": "Shopee", "shein": "Shein", "mercado": "Mercado Livre",
+                "tiktok": "TikTok", "kwai": "Kwai"}
+        token = config.get("token", "")
+        hoje  = __import__("datetime").date.today().isoformat()
+
+        # Busca detalhes de todos os Para Imprimir atuais via API (uma só chamada)
+        all_orders = await page.evaluate("""async () => {
+            let todos = [], page = 1;
+            while (true) {
+                const r = await fetch('/api/order/index', {
+                    method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+                    body:'timeType=0&searchType=0&sortName=1&sortValue=1&orderState=in_process&labelStatus=success&warehouseType=0&pageNum='+page+'&pageSize=50'
+                });
+                const j = await r.json();
+                const list = (j.data||{}).list||[];
+                todos = todos.concat(list);
+                if (page * 50 >= ((j.data||{}).total||0) || !list.length) break;
+                page++;
+            }
+            return todos;
+        }""")
+
+        novos_pedidos = []
+        novos_itens   = []
+        for order in all_orders:
+            on = (order.get("orderNumber") or "").strip()
+            if on not in faltando:
+                continue
+            items = order.get("orderItemList") or []
+            first = items[0] if items else {}
+            plat  = PLAT.get((order.get("platform") or "").lower(), order.get("platform") or "")
+            try:
+                valor = float(order.get("orderAmount") or 0) or None
+            except Exception:
+                valor = None
+            qtd = sum(int(i.get("productCount") or 1) for i in items) or 1
+            novos_pedidos.append({
+                "order_number": on,
+                "sku":          (first.get("variationSku") or first.get("productSku") or "").strip(),
+                "product_name": (first.get("productName") or "").strip(),
+                "image_url":    (first.get("productImg")  or "").strip(),
+                "quantidade":   qtd,
+                "plataforma":   plat,
+                "valor":        valor,
+                "data":         hoje,
+                "cliente":      token,
+                "label_url":    None,
+            })
+            for item in items:
+                novos_itens.append({
+                    "order_number": on,
+                    "sku":          (item.get("variationSku") or item.get("productSku") or "").strip(),
+                    "product_name": (item.get("productName") or "").strip(),
+                    "image_url":    (item.get("productImg")  or "").strip(),
+                    "quantidade":   int(item.get("productCount") or 1),
+                    "cliente":      token,
+                    "data":         hoje,
+                })
+
+        if novos_pedidos:
+            supa.table("pedidos").upsert(novos_pedidos, on_conflict="order_number").execute()
+        if novos_itens:
+            supa.table("pedido_itens").insert(novos_itens).execute()
+        log(f"[capturar] ✅ {len(novos_pedidos)} pedido(s) sincronizados com Supabase")
+    except Exception as e:
+        log(f"[capturar] ⚠️ Sync Supabase falhou: {e}")
+
+
+# ── Playwright: capturar etiquetas retroativas (pedidos já processados) ──────
+
+async def _capturar_retroativo_playwright(config: dict) -> None:
+    """Captura etiquetas de pedidos (ontem/hoje) processados manualmente, sem label_url no Supabase.
+    Navega por Para Imprimir e all-orders, pesquisa cada pedido e aciona Mais → Imprimir Etiqueta."""
+    import re as _re_r, urllib.request as _ur_r
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return
+    try:
+        from datetime import date as _date_r, timedelta as _td_r
+        supa_r = create_client(*_supa())
+        ontem_r = (_date_r.today() - _td_r(days=1)).isoformat()
+        res_r = supa_r.table("pedidos").select("order_number") \
+            .is_("label_url", "null") \
+            .gte("data", ontem_r) \
+            .execute()
+        sem_label = [
+            r["order_number"] for r in (res_r.data or [])
+            if r.get("order_number")
+            and not (PASTA_ETIQUETAS / f"etiqueta_{r['order_number']}.pdf").exists()
+            and r["order_number"] not in _capturar_skip
+        ]
+        if not sem_label:
+            return
+        log(f"[retro] 🔍 {len(sem_label)} pedido(s) sem etiqueta — capturando via all-orders...")
+    except Exception as e_q:
+        log(f"[retro] ⚠️ Supabase query: {e_q}")
+        return
+
+    _limpar_crash_chrome()
+    _cdn_r: dict = {}
+
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=str(PASTA_SESSAO),
+            headless=True,
+            args=["--window-size=1920,1080", "--disable-popup-blocking"],
+            viewport={"width": 1920, "height": 1080},
+        )
+        try:
+            page = context.pages[0] if context.pages else await context.new_page()
+            await page.set_viewport_size({"width": 1920, "height": 1080})
+
+            # Listener de CDN no contexto (captura URLs de qualquer popup aberto)
+            async def _cdn_listener_r(pg):
+                async def _on_resp_r(resp):
+                    u = resp.url
+                    if "print-label.upseller.cn" in u and ".pdf" in u.lower():
+                        _cdn_r[id(pg)] = u
+                pg.on("response", _on_resp_r)
+            context.on("page", _cdn_listener_r)
+
+            # Abas a tentar (em ordem de probabilidade)
+            abas_r = [
+                "https://app.upseller.com/pt/order/all-orders",
+                "https://app.upseller.com/pt/order/to-ship",
+                "https://app.upseller.com/pt/order/in-process",
+            ]
+
+            await page.goto(abas_r[0], wait_until="domcontentloaded", timeout=60_000)
+            await page.wait_for_timeout(3000)
+
+            if "/login" in page.url:
+                log("[retro] ⚠️ Sessão expirada — faça login")
+                return
+
+            await _fechar_popups_upseller(page)
+            capturados_r = 0
+            aba_atual = abas_r[0]
+
+            for on in sem_label[:30]:
+                if _parar.is_set():
+                    break
+                if (PASTA_ETIQUETAS / f"etiqueta_{on}.pdf").exists():
+                    continue
+
+                # Pesquisa o pedido em cada aba até encontrar
+                row_r = None
+                for aba in abas_r:
+                    if aba != aba_atual:
+                        await page.goto(aba, wait_until="domcontentloaded", timeout=30_000)
+                        await page.wait_for_timeout(2000)
+                        await _fechar_popups_upseller(page)
+                        aba_atual = aba
+
+                    # Tenta preencher o campo de busca
+                    for sel in ["input[placeholder*='Pedido']", "input[placeholder*='pedido']",
+                                ".ant-input-search input", "input[type='search']"]:
+                        s = page.locator(sel).first
+                        if await s.count() > 0:
+                            await s.click(click_count=3)
+                            await s.fill(on)
+                            await page.keyboard.press("Enter")
+                            await page.wait_for_timeout(1500)
+                            break
+
+                    row_r = page.locator("tbody tr").filter(has_text=on).first
+                    if await row_r.count() > 0:
+                        break
+
+                if not row_r or await row_r.count() == 0:
+                    log(f"[retro] ⚠️ {on} — não encontrado em nenhuma aba")
+                    _capturar_skip.add(on)
+                    continue
+
+                await row_r.hover()
+                await page.wait_for_timeout(500)
+
+                # Localiza o botão "Mais" da coluna de ação — usa o mais à direita na viewport
+                mais_btn = None
+                cands = page.locator("span, button").filter(has_text=_re_r.compile(r'^Mais'))
+                cnt = await cands.count()
+                max_x = -1
+                for i in range(cnt):
+                    btn = cands.nth(i)
+                    bb = await btn.bounding_box()
+                    if bb and bb['x'] > max_x:
+                        max_x = bb['x']
+                        mais_btn = btn
+
+                if not mais_btn:
+                    log(f"[retro] ⚠️ {on} — botão Mais não encontrado (cnt={cnt})")
+                    _capturar_skip.add(on)
+                    continue
+
+                pgs_r = set(id(pg) for pg in context.pages)
+                try:
+                    await mais_btn.click(force=True)
+                    await page.wait_for_timeout(600)
+
+                    clicou_r = False
+                    for txt_r in ["Imprimir Etiqueta", "Imprimir Etiq"]:
+                        item_r = page.locator("li, .ant-dropdown-menu-item").filter(has_text=txt_r).first
+                        if await item_r.count() > 0 and await item_r.is_visible():
+                            await item_r.click(force=True)
+                            clicou_r = True
+                            break
+                    if not clicou_r:
+                        # Log o que apareceu no dropdown
+                        itens_vis = page.locator("li.ant-dropdown-menu-item")
+                        txts = await itens_vis.all_inner_texts() if await itens_vis.count() > 0 else []
+                        log(f"[retro] ⚠️ {on} — Imprimir Etiqueta não encontrado (dropdown: {txts[:3]})")
+                        await page.keyboard.press("Escape")
+                        _capturar_skip.add(on)
+                        continue
+
+                    popup_r = None
+                    for _ in range(20):
+                        await page.wait_for_timeout(400)
+                        novas_r = [pg for pg in context.pages if id(pg) not in pgs_r]
+                        if novas_r:
+                            popup_r = novas_r[-1]
+                            break
+
+                    if popup_r:
+                        for _ in range(15):
+                            if id(popup_r) in _cdn_r:
+                                break
+                            await page.wait_for_timeout(300)
+                        cdn_url_r = _cdn_r.pop(id(popup_r), None)
+                        dir_url_r = popup_r.url if popup_r.url and popup_r.url != "about:blank" else None
+                        url_r = cdn_url_r or dir_url_r
+                        await popup_r.close()
+                        if url_r:
+                            pp_r = PASTA_ETIQUETAS / f"etiqueta_{on}.pdf"
+                            try:
+                                _ur_r.urlretrieve(url_r, str(pp_r))
+                                c_r = _corrigir_mediabox(pp_r)
+                                if c_r != pp_r and c_r.exists():
+                                    c_r.replace(pp_r)
+                                log(f"[retro] 📄 {on} — etiqueta capturada")
+                                capturados_r += 1
+                                try:
+                                    pub_r = _upload_etiqueta_supabase(pp_r, on)
+                                    lbl_r = pub_r or f"http://127.0.0.1:5001/etiqueta/{on}"
+                                    create_client(*_supa()).table("pedidos") \
+                                        .update({"label_url": lbl_r}).eq("order_number", on).execute()
+                                except Exception:
+                                    pass
+                            except Exception as e_dl:
+                                log(f"[retro] ⚠️ {on} download: {e_dl}")
+                        else:
+                            log(f"[retro] ⚠️ {on} — popup sem URL CDN")
+                            _capturar_skip.add(on)
+                    else:
+                        log(f"[retro] ⚠️ {on} — popup não abriu")
+                        _capturar_skip.add(on)
+
+                except Exception as e_r:
+                    log(f"[retro] ⚠️ {on}: {e_r}")
+                    _capturar_skip.add(on)
+                    await _fechar_popups_upseller(page)
+
+            if capturados_r > 0:
+                log(f"[retro] ✅ {capturados_r} etiqueta(s) retroativas capturadas")
+
+        except Exception as e_main:
+            log(f"[retro] ❌ {e_main}")
+        finally:
+            await context.close()
+
+
 # ── Playwright: capturar etiquetas em lote (pré-download) ────────────────────
 
-async def _capturar_etiquetas_playwright(config: dict) -> bool:
+async def _capturar_etiquetas_playwright(config: dict, aguardar_se_vazio: bool = True, background: bool = False) -> bool:
     import re, urllib.request
     try:
         from playwright.async_api import async_playwright
@@ -1100,16 +2551,64 @@ async def _capturar_etiquetas_playwright(config: dict) -> bool:
         log("[capturar] ❌ Playwright não instalado")
         return False
 
+    _limpar_crash_chrome()
+
+    # Corrige etiquetas A4 existentes na pasta (baixadas antes da correção automática)
+    try:
+        import re as _re2, zlib as _zlib2
+        corrigidos_lote = 0
+        for _pdf in PASTA_ETIQUETAS.glob("etiqueta_*.pdf"):
+            if "_c" in _pdf.stem:
+                continue
+            try:
+                _d = _pdf.read_bytes()
+                _m = re.search(rb'/MediaBox\s*\[([^\]]+)\]', _d)
+                if not _m:
+                    for _s in re.findall(rb'stream\r?\n(.*?)\r?\nendstream', _d, re.DOTALL):
+                        try:
+                            _dec = zlib.decompress(_s)
+                            _m = re.search(rb'/MediaBox\s*\[([^\]]+)\]', _dec)
+                            if _m: break
+                        except Exception: pass
+                if _m:
+                    _v = list(map(float, _m.group(1).split()))
+                    _w = _v[2] - _v[0]
+                    if _w > 368:  # maior que 130mm → precisa corrigir
+                        _corr = _corrigir_mediabox(_pdf)
+                        if _corr != _pdf and _corr.exists():
+                            _corr.replace(_pdf)
+                            corrigidos_lote += 1
+            except Exception:
+                pass
+        if corrigidos_lote > 0:
+            log(f"[capturar] ✂️ {corrigidos_lote} etiqueta(s) A4 corrigidas para 100×150mm")
+    except Exception:
+        pass
+
     log("[capturar] 🏷️ Verificando etiquetas para pré-download...")
 
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
             user_data_dir=str(PASTA_SESSAO),
-            headless=False,
+            headless=True,
             args=["--window-size=1280,900", "--disable-popup-blocking"],
         )
         try:
             page = context.pages[0] if context.pages else await context.new_page()
+
+            # Intercepta PDF do CDN UpSeller no popup — evita "Dados em processamento..."
+            # O popup faz GET https://print-label.upseller.cn/pdf/YYYY-MM-DD/hash.pdf (resp 200)
+            # Basta capturar essa URL e baixar diretamente.
+            _cdn_pdfs = {}  # id(popup_page) → cdn_url
+
+            async def _cdn_listener(pg):
+                async def _on_resp(resp):
+                    u = resp.url
+                    if "print-label.upseller.cn" in u and ".pdf" in u.lower():
+                        _cdn_pdfs[id(pg)] = u
+                pg.on("response", _on_resp)
+
+            context.on("page", _cdn_listener)
 
             await page.goto(
                 "https://app.upseller.com/pt/order/in-process",
@@ -1124,16 +2623,30 @@ async def _capturar_etiquetas_playwright(config: dict) -> bool:
 
             await _fechar_popups_upseller(page)
 
-            linhas = await page.locator("tbody tr").count()
+            # Retry: aguarda até 90s após NFe+Envio (pedidos aparecem em <30s normalmente)
+            #        ou retorna imediatamente se vazio (captura inicial ou background)
+            linhas = 0
+            max_tentativas = 3 if aguardar_se_vazio else 1
+            for tentativa in range(max_tentativas):
+                linhas = await page.locator("tbody tr").count()
+                if linhas > 0:
+                    break
+                if tentativa < max_tentativas - 1:
+                    log(f"[capturar] ⏳ Para Imprimir vazio — aguardando 30s ({tentativa+1}/{max_tentativas-1})...")
+                    await page.wait_for_timeout(30_000)
+                    await page.reload(wait_until="domcontentloaded")
+                    await page.wait_for_timeout(2000)
+                    await _fechar_popups_upseller(page)
+
             if linhas == 0:
-                log("[capturar] ℹ️ Nenhum pedido em Para Imprimir")
+                log("[capturar] ℹ️ Nenhum pedido em Para Imprimir após aguardar")
                 return True
 
             # Extrai números de pedido de todas as linhas
             all_texts = await page.locator("tbody tr").all_inner_texts()
             order_numbers = []
             for txt in all_texts:
-                m = re.search(r'UP[A-Z0-9]{8,}', txt)
+                m = re.search(r'UP[0-9][A-Z]{3}[0-9]{6}', txt)
                 if m and m.group() not in order_numbers:
                     order_numbers.append(m.group())
 
@@ -1141,124 +2654,292 @@ async def _capturar_etiquetas_playwright(config: dict) -> bool:
                 log("[capturar] ⚠️ Não foi possível extrair números de pedido da tabela")
                 return False
 
-            log(f"[capturar] 📋 {len(order_numbers)} pedido(s) para capturar")
-            capturados = 0
+            # Garante que todos os pedidos visíveis estão no Supabase
+            # (pedidos capturados pelo background entre imports ficam de fora)
+            await _sincronizar_pedidos_novos_supabase(page, order_numbers, config)
 
-            for order_number in order_numbers:
-                pdf_path = PASTA_ETIQUETAS / f"etiqueta_{order_number}.pdf"
-                if pdf_path.exists():
-                    log(f"[capturar] ✅ {order_number} já em cache")
+            # Separa já capturados (cache) dos que faltam
+            pendentes = [on for on in order_numbers
+                         if not (PASTA_ETIQUETAS / f"etiqueta_{on}.pdf").exists()
+                         and (not background or on not in _capturar_skip)]
+            capturados = len(order_numbers) - len(pendentes)
+            if capturados:
+                log(f"[capturar] ✅ {capturados} já em cache")
+
+            log(f"[capturar] 📋 {len(pendentes)} pedido(s) para capturar")
+
+            async def _salvar_pdf(on: str, url: str, cdn: bool):
+                nonlocal capturados
+                pp = PASTA_ETIQUETAS / f"etiqueta_{on}.pdf"
+                try:
+                    urllib.request.urlretrieve(url, str(pp))
+                    _garantir_pagina_unica(pp)  # descarta páginas extras de PDFs batch individuais
+                    c = _corrigir_mediabox(pp)
+                    if c != pp and c.exists():
+                        c.replace(pp)
+                    log(f"[capturar] 📄 {on} — PDF salvo ({'CDN' if cdn else 'URL'})")
                     capturados += 1
-                    continue
+                    if on in pendentes:
+                        pendentes.remove(on)
+                    try:
+                        url_pub = _upload_etiqueta_supabase(pp, on)
+                        label_url = url_pub or f"http://127.0.0.1:5001/etiqueta/{on}"
+                        create_client(*_supa()).table("pedidos").update({"label_url": label_url}) \
+                            .eq("order_number", on).execute()
+                    except Exception:
+                        pass
+                    return True
+                except Exception as e:
+                    log(f"[capturar] ⚠️ {on} — erro ao baixar: {e}")
+                    return False
 
-                # Volta para a lista (garante estado limpo entre pedidos)
+            async def _clicar_bulk():
+                bulk_btn = page.locator("button, span").filter(has_text="Imprimir Etiquetas").first
+                if not await bulk_btn.count():
+                    return False
+                await bulk_btn.click(force=True)
+                await page.wait_for_timeout(400)
+                for opcao in ["Imprimir Etiquetas", "Imprimir Etiqueta"]:
+                    item = page.locator("li, .ant-dropdown-menu-item").filter(has_text=opcao).first
+                    if await item.count() > 0 and await item.is_visible():
+                        await item.click(force=True)
+                        return True
+                return False
+
+            async def _desmarcar_todos():
+                await page.evaluate(
+                    "() => document.querySelectorAll('tbody .ant-checkbox-checked .ant-checkbox-input').forEach(c=>c.click())"
+                )
+                await page.wait_for_timeout(100)
+
+            # Loop: recarrega UMA vez por rodada, batch em todos visíveis
+            rodada_cap = 0
+            while pendentes and not _parar.is_set():
+                if background and rodando:
+                    log("[capturar] ⏸️ Executar iniciado — pausando captura automática")
+                    break
+
+                rodada_cap += 1
+                fez_algo = False
+
                 await page.goto(
                     "https://app.upseller.com/pt/order/in-process",
                     wait_until="domcontentloaded", timeout=60_000,
                 )
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(1500)
                 await _fechar_popups_upseller(page)
 
-                # Busca o pedido
-                search = None
-                for sel in ["input[placeholder*='Pedido']", "input[placeholder*='pedido']",
-                            ".ant-input-search input", ".ant-input"]:
-                    loc = page.locator(sel).first
-                    if await loc.count() > 0:
-                        search = loc
+                # Remove pendentes cujo PDF já existe
+                for on in list(pendentes):
+                    if (PASTA_ETIQUETAS / f"etiqueta_{on}.pdf").exists():
+                        pendentes.remove(on)
+                        capturados += 1
+                        fez_algo = True
+
+                # Identifica quais pendentes estão visíveis nesta carga
+                visiveis = []
+                for on in list(pendentes):
+                    if _parar.is_set() or (background and rodando):
                         break
-                if search is None:
-                    log(f"[capturar] ⚠️ {order_number} — campo de busca não encontrado")
-                    continue
+                    row_loc = page.locator("tbody tr").filter(has_text=on).first
+                    if await row_loc.count() > 0:
+                        visiveis.append(on)
 
-                await search.click(force=True)
-                await search.fill(order_number)
-                await page.keyboard.press("Enter")
-                await page.wait_for_timeout(2500)
+                if not visiveis:
+                    if fez_algo:
+                        continue
+                    break
 
-                row = page.locator("tr").filter(has_text=order_number).first
-                if await row.count() == 0:
-                    log(f"[capturar] ⚠️ {order_number} não encontrado na tabela")
-                    continue
-
-                # Tenta vários textos possíveis para o botão de impressão
-                imprimir = None
-                for texto in ["Imprimir Etiq", "Imprimir Etiqueta", "Imprimir"]:
-                    loc = row.locator("a, button, span").filter(has_text=texto).first
-                    if await loc.count() > 0:
-                        imprimir = loc
-                        break
-                # Fallback: qualquer link/botão na linha que contenha "Imprimir"
-                if imprimir is None:
-                    loc = page.locator("a, button").filter(has_text="Imprimir Etiq").first
-                    if await loc.count() > 0:
-                        imprimir = loc
-
-                if imprimir is None:
-                    screenshot = PASTA_RAIZ / f"debug_capturar_{order_number}.png"
-                    await page.screenshot(path=str(screenshot))
-                    textos_row = await row.inner_text()
-                    log(f"[capturar] ⚠️ {order_number} — botão não encontrado. Linha: {textos_row[:120]}")
-                    log(f"[capturar] 📸 Screenshot: {screenshot.name}")
-                    continue
-
-                # Seleciona o checkbox da linha antes de imprimir
-                checkbox = row.locator(".ant-checkbox-input, input[type='checkbox']").first
-                if await checkbox.count() > 0:
-                    await checkbox.click()
-                    await page.wait_for_timeout(800)
-                    log(f"[capturar] ☑️ {order_number} selecionado")
+                # ── MODO BATCH: seleciona todos, 1 clique bulk ────────────────
+                for on in visiveis:
+                    row_loc = page.locator("tbody tr").filter(has_text=on).first
+                    cb = row_loc.locator(".ant-checkbox-input, input[type='checkbox']").first
+                    if await cb.count() > 0:
+                        await cb.click()
+                        await page.wait_for_timeout(80)
+                await page.wait_for_timeout(200)
 
                 paginas_antes = set(id(pg) for pg in context.pages)
-                await imprimir.click()
-                await page.wait_for_timeout(1500)
+                batch_ok = await _clicar_bulk()
 
-                # "Imprimir Etiq..." abre um dropdown — seleciona a primeira opção de etiqueta
-                for opcao in ["Imprimir Etiquetas", "Imprimir Etiqueta", "Imprimir"]:
-                    item = page.locator("li, .ant-dropdown-menu-item").filter(has_text=opcao).first
-                    if await item.count() > 0 and await item.is_visible():
-                        log(f"[capturar] 📋 Dropdown: clicando '{opcao}'...")
-                        await item.click()
-                        await page.wait_for_timeout(1500)
+                if not batch_ok:
+                    await _desmarcar_todos()
+                    for on in visiveis:
+                        _capturar_skip.add(on)
+                        pendentes.remove(on)
+                    break
+
+                # Aguarda popups — espera N ou até 12s
+                novas_pgs = []
+                for _ in range(60):
+                    novas_pgs = [pg for pg in context.pages if id(pg) not in paginas_antes]
+                    if len(novas_pgs) >= len(visiveis):
                         break
+                    await page.wait_for_timeout(200)
 
-                popup = None
-                for _ in range(30):
-                    await page.wait_for_timeout(1000)
-                    novas = [pg for pg in context.pages if id(pg) not in paginas_antes]
-                    if novas:
-                        popup = novas[-1]
-                        break
+                if not novas_pgs:
+                    # Batch falhou — processa um por um nesta mesma rodada
+                    log(f"[capturar] ⚠️ Batch sem popup — modo individual ({len(visiveis)} pedidos)")
+                    await _desmarcar_todos()
+                    for on in visiveis:
+                        if _parar.is_set() or (background and rodando):
+                            break
+                        pp = PASTA_ETIQUETAS / f"etiqueta_{on}.pdf"
+                        if pp.exists():
+                            pendentes.remove(on)
+                            capturados += 1
+                            fez_algo = True
+                            continue
+                        # Fechar modal pendente antes de clicar no checkbox
+                        modal = page.locator("div[role='dialog'].ant-modal-wrap, .ant-modal-wrap")
+                        if await modal.count() > 0:
+                            await page.keyboard.press("Escape")
+                            await page.wait_for_timeout(500)
+                        row_loc = page.locator("tbody tr").filter(has_text=on).first
+                        cb = row_loc.locator(".ant-checkbox-input, input[type='checkbox']").first
+                        if await cb.count() > 0:
+                            await cb.click()
+                            await page.wait_for_timeout(200)
+                        pgs_antes_ind = set(id(pg) for pg in context.pages)
+                        if not await _clicar_bulk():
+                            _capturar_skip.add(on)
+                            pendentes.remove(on)
+                            continue
+                        popup = None
+                        for _ in range(25):
+                            await page.wait_for_timeout(400)
+                            novas_ind = [pg for pg in context.pages if id(pg) not in pgs_antes_ind]
+                            if novas_ind:
+                                popup = novas_ind[-1]
+                                break
+                        if not popup:
+                            log(f"[capturar] ⚠️ {on} — popup não abriu")
+                            await _desmarcar_todos()
+                            continue
+                        for _ in range(20):
+                            if id(popup) in _cdn_pdfs or (popup.url and popup.url != "about:blank"):
+                                break
+                            await page.wait_for_timeout(300)
+                        cdn_url    = _cdn_pdfs.pop(id(popup), None)
+                        direct_url = popup.url if popup.url and popup.url != "about:blank" else None
+                        url        = cdn_url or direct_url
+                        await popup.close()
+                        await _desmarcar_todos()
+                        if url:
+                            ok = await _salvar_pdf(on, url, bool(cdn_url))
+                            if ok:
+                                fez_algo = True
+                        else:
+                            log(f"[capturar] ⏳ {on} — sem CDN URL")
+                            pendentes.remove(on)
+                            _capturar_skip.add(on)
+                else:
+                    # Batch OK — dá mais 500ms para CDN capturar todas as URLs
+                    await page.wait_for_timeout(500)
+                    log(f"[capturar] ⚡ Batch: {len(novas_pgs)} popup(s) aberto(s)")
 
-                if not popup:
-                    sc_depois = PASTA_RAIZ / f"debug_capturar_{order_number}_after.png"
-                    await page.screenshot(path=str(sc_depois))
-                    log(f"[capturar] ⚠️ {order_number} — PDF não abriu. Screenshot: {sc_depois.name}")
-                    continue
+                    if len(novas_pgs) == 1 and len(visiveis) > 1:
+                        # UpSeller gerou 1 PDF combinado (batch multi-página) — split por pedido
+                        popup = novas_pgs[0]
+                        cdn_url    = _cdn_pdfs.pop(id(popup), None)
+                        direct_url = popup.url if popup.url and popup.url != "about:blank" else None
+                        url        = cdn_url or direct_url
+                        await popup.close()
+                        if url:
+                            tmp = PASTA_ETIQUETAS / "_batch_tmp.pdf"
+                            try:
+                                urllib.request.urlretrieve(url, str(tmp))
+                                n_pgs = _contar_paginas_pdf(tmp)
+                                log(f"[capturar] 📦 Batch PDF: {n_pgs} página(s) → {len(visiveis)} pedido(s)")
+                                salvos = _split_pdf_batch(tmp, visiveis)
+                                for on in salvos:
+                                    pp = PASTA_ETIQUETAS / f"etiqueta_{on}.pdf"
+                                    if pp.exists():
+                                        log(f"[capturar] 📄 {on} — PDF split do batch")
+                                        capturados += 1
+                                        if on in pendentes:
+                                            pendentes.remove(on)
+                                        fez_algo = True
+                                        try:
+                                            url_pub  = _upload_etiqueta_supabase(pp, on)
+                                            label_url = url_pub or f"http://127.0.0.1:5001/etiqueta/{on}"
+                                            create_client(*_supa()).table("pedidos") \
+                                                .update({"label_url": label_url}) \
+                                                .eq("order_number", on).execute()
+                                        except Exception:
+                                            pass
+                            except Exception as e:
+                                log(f"[capturar] ⚠️ Erro ao baixar batch PDF combinado: {e}")
+                            finally:
+                                try:
+                                    tmp.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                        else:
+                            log(f"[capturar] ⏳ Batch combinado — sem URL")
+                    else:
+                        for i, popup in enumerate(novas_pgs):
+                            on = visiveis[i] if i < len(visiveis) else None
+                            cdn_url    = _cdn_pdfs.pop(id(popup), None)
+                            direct_url = popup.url if popup.url and popup.url != "about:blank" else None
+                            url        = cdn_url or direct_url
+                            await popup.close()
+                            if not on:
+                                continue
+                            if url:
+                                ok = await _salvar_pdf(on, url, bool(cdn_url))
+                                if ok:
+                                    fez_algo = True
+                            else:
+                                log(f"[capturar] ⏳ {on} — sem CDN URL")
+                                if on in pendentes:
+                                    pendentes.remove(on)
+                                _capturar_skip.add(on)
+                    await _desmarcar_todos()
 
-                url = popup.url
-                await popup.close()
-                await _fechar_popups_upseller(page)  # fecha "Marcar como Impresso" sem clicar
-
-                if not url or url == "about:blank":
-                    log(f"[capturar] ⚠️ {order_number} — URL inválida")
-                    continue
-
-                try:
-                    urllib.request.urlretrieve(url, str(pdf_path))
-                    log(f"[capturar] 📄 {order_number} — PDF salvo")
-                    capturados += 1
-                    # Registra URL no Supabase (opcional — para fallback remoto)
-                    try:
-                        supa = create_client(SUPABASE_URL, SUPABASE_KEY)
-                        supa.table("pedidos").update({"label_url": url}) \
-                            .eq("order_number", order_number).execute()
-                    except Exception:
-                        pass
-                except Exception as e:
-                    log(f"[capturar] ⚠️ {order_number} — erro ao baixar: {e}")
+                if not fez_algo and not visiveis:
+                    break
 
             log(f"[capturar] ✅ {capturados}/{len(order_numbers)} etiqueta(s) prontas")
+
+            # ── Download etiquetas Shopee/ML via label_url no Supabase ──────────
+            try:
+                import urllib.request as _ur2
+                supa2 = create_client(*_supa())
+                # Busca pedidos com label_url que ainda não têm PDF local
+                offset2 = 0
+                baixados = 0
+                erros = 0
+                while True:
+                    lote = supa2.table("pedidos").select("order_number,label_url,plataforma") \
+                        .not_.is_("label_url", "null") \
+                        .range(offset2, offset2 + 199).execute()
+                    if not lote.data:
+                        break
+                    for row in lote.data:
+                        on = row.get("order_number", "")
+                        url_label = row.get("label_url", "")
+                        if not on or not url_label:
+                            continue
+                        pdf_p = PASTA_ETIQUETAS / f"etiqueta_{on}.pdf"
+                        if pdf_p.exists():
+                            continue  # já baixada
+                        try:
+                            _ur2.urlretrieve(url_label, str(pdf_p))
+                            _corr3 = _corrigir_mediabox(pdf_p)
+                            if _corr3 != pdf_p and _corr3.exists():
+                                _corr3.replace(pdf_p)
+                            baixados += 1
+                        except Exception:
+                            erros += 1
+                    if len(lote.data) < 200:
+                        break
+                    offset2 += 200
+                if baixados > 0 or erros > 0:
+                    log(f"[capturar] 📦 Shopee/ML: {baixados} etiqueta(s) baixadas, {erros} erro(s)")
+            except Exception as e:
+                log(f"[capturar] ⚠️ Shopee label_url download falhou: {e}")
+
             return True
 
         except Exception as e:
@@ -1323,18 +3004,18 @@ async def _marcar_impresso_playwright(config: dict, order_number: str) -> bool:
             if await imprimir.count() > 0:
                 paginas_antes = set(id(pg) for pg in context.pages)
                 await imprimir.click()
-                for _ in range(20):
-                    await page.wait_for_timeout(1000)
+                for _ in range(25):
+                    await page.wait_for_timeout(300)
                     novas = [pg for pg in context.pages if id(pg) not in paginas_antes]
                     if novas:
                         await novas[-1].close()
                         break
 
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(600)
             marcar = page.locator("button", has_text="Marcar como Impresso").first
             if await marcar.count() > 0 and await marcar.is_visible():
                 await marcar.click()
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(500)
                 log(f"[marcar] ✅ {order_number} → Para Retirada")
             return True
 
@@ -1405,12 +3086,17 @@ async def _emitir_etiqueta_playwright(config: dict, order_number: str) -> dict:
 
     # ── Caminho 2: label_url no Supabase → baixa direto sem abrir browser ────
     try:
-        supa = create_client(SUPABASE_URL, SUPABASE_KEY)
-        r = supa.table("pedidos").select("label_url").eq("order_number", order_number).single().execute()
-        url = r.data.get("label_url") if r.data else None
+        supa = create_client(*_supa())
+        # limit(1) em vez de .single() — pedidos tem múltiplas linhas por order_number (1 por SKU)
+        r = supa.table("pedidos").select("label_url").eq("order_number", order_number).limit(1).execute()
+        rows = r.data or []
+        url = rows[0].get("label_url") if rows else None
         if url:
             log(f"[etiqueta] ⚡ URL Supabase — baixando e imprimindo {order_number}...")
             _urllib.urlretrieve(url, str(pdf_path))
+            _corr2 = _corrigir_mediabox(pdf_path)
+            if _corr2 != pdf_path and _corr2.exists():
+                _corr2.replace(pdf_path)
             return _imprimir_pdf_local(pdf_path, order_number, config)
     except Exception:
         pass
@@ -1427,18 +3113,20 @@ async def _emitir_etiqueta_playwright(config: dict, order_number: str) -> dict:
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
             user_data_dir=str(PASTA_SESSAO),
-            headless=False,
-            args=["--window-size=1280,900"],
+            headless=True,
+            args=["--window-size=1920,1080"],
+            viewport={"width": 1920, "height": 1080},
         )
         try:
             page = context.pages[0] if context.pages else await context.new_page()
+            await page.set_viewport_size({"width": 1920, "height": 1080})
 
             await page.goto(
                 "https://app.upseller.com/pt/order/in-process",
                 wait_until="domcontentloaded",
                 timeout=60_000,
             )
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(1500)
 
             if "/login" in page.url:
                 log("[etiqueta] ⚠️ Sessão expirada. Abrindo para login...")
@@ -1508,25 +3196,44 @@ async def _emitir_etiqueta_playwright(config: dict, order_number: str) -> dict:
 
             await search.fill(order_number)
             await page.keyboard.press("Enter")
-            await page.wait_for_timeout(2500)
+            await page.wait_for_timeout(1500)
 
-            # Verifica cancelamento
-            if await page.locator("text=Cancelado").count() > 0 or await page.locator("text=Estornado").count() > 0:
-                status_txt = "Cancelado" if await page.locator("text=Cancelado").count() > 0 else "Estornado"
-                log(f"[etiqueta] ⛔ Pedido {order_number} está {status_txt}")
-                try:
-                    supa = create_client(SUPABASE_URL, SUPABASE_KEY)
-                    supa.table("pedidos").update({"status": status_txt}).eq("order_number", order_number).execute()
-                    log(f"[etiqueta] 🔄 Supabase atualizado: {order_number} → {status_txt}")
-                except Exception as e_upd:
-                    log(f"[etiqueta] ⚠️ Não foi possível atualizar Supabase: {e_upd}")
-                return {"ok": False, "cancelado": True, "erro": f"Pedido {status_txt.lower()} no UpSeller"}
-
-            # Verifica se pedido está na fila
+            # Verifica cancelamento APENAS na linha do pedido (evita falso positivo de outras linhas)
             row = page.locator("tr").filter(has_text=order_number).first
             if await row.count() == 0:
-                log(f"[etiqueta] ⚠️ {order_number} não está em Para Imprimir")
-                return {"ok": False, "erro": "Pedido não está na fila de impressão — verifique o status no UpSeller"}
+                log(f"[etiqueta] ⚠️ {order_number} não está em Para Imprimir — buscando em outras abas...")
+                for url_fallback in [
+                    "https://app.upseller.com/pt/order/pending",
+                    "https://app.upseller.com/pt/order/to-ship",
+                    "https://app.upseller.com/pt/order/all-orders",
+                ]:
+                    await page.goto(url_fallback, wait_until="domcontentloaded", timeout=30_000)
+                    await page.wait_for_timeout(2000)
+                    await _fechar_popups_upseller(page)
+                    # Tenta pesquisar pelo número
+                    for sel in ["input[placeholder*='Pedido']", "input[placeholder*='pedido']",
+                                "input[placeholder*='Buscar']", ".ant-input-search input", "input[type='search']"]:
+                        s = page.locator(sel).first
+                        if await s.count() > 0:
+                            await s.click()
+                            await s.fill(order_number)
+                            await page.keyboard.press("Enter")
+                            await page.wait_for_timeout(1500)
+                            break
+                    row = page.locator("tr").filter(has_text=order_number).first
+                    if await row.count() > 0:
+                        log(f"[etiqueta] ✅ {order_number} encontrado em {url_fallback.split('/')[-1]}")
+                        break
+                if await row.count() == 0:
+                    return {"ok": False, "erro": "Pedido não encontrado em nenhuma aba do UpSeller"}
+
+            # Verifica cancelamento só na linha encontrada
+            if await row.count() > 0:
+                row_txt = await row.inner_text()
+                if "Cancelado" in row_txt or "Estornado" in row_txt:
+                    status_txt = "Cancelado" if "Cancelado" in row_txt else "Estornado"
+                    log(f"[etiqueta] ⛔ Pedido {order_number} está {status_txt}")
+                    return {"ok": False, "cancelado": True, "erro": f"Pedido {status_txt.lower()} no UpSeller"}
 
             tem_impressora = _verificar_impressora()
             log(f"[etiqueta] {'🖨️ Impressora detectada' if tem_impressora else '📄 Sem impressora — gerando PDF'}...")
@@ -1536,13 +3243,19 @@ async def _emitir_etiqueta_playwright(config: dict, order_number: str) -> dict:
             if await imprimir.count() == 0:
                 imprimir = page.locator("a, button").filter(has_text="Imprimir Etiq").first
 
+            # Pedido em "Enviado": etiqueta só disponível em Para Imprimir
+            # No fluxo de 6h, pedidos estarão em Para Emitir e serão processados normalmente
+            if await imprimir.count() == 0:
+                log(f"[etiqueta] ℹ️ Pedido {order_number} não está em Para Imprimir — verifique o estado no UpSeller")
+                return {"ok": False, "erro": "Pedido não está em Para Imprimir — etiqueta disponível apenas durante processamento"}
+
             if await imprimir.count() == 0:
                 screenshot = PASTA_RAIZ / f"debug_etiqueta_{order_number}.png"
                 await page.screenshot(path=str(screenshot))
-                log(f"[etiqueta] ⚠️ Botão 'Imprimir Etiq' não encontrado — screenshot: {screenshot.name}")
+                log(f"[etiqueta] ⚠️ Botão de etiqueta não encontrado — screenshot: {screenshot.name}")
                 return {"ok": False, "erro": "Botão de impressão não encontrado"}
 
-            log("[etiqueta] ✅ Clicando 'Imprimir Etiq...' — aguardando PDF...")
+            log("[etiqueta] ✅ Clicando botão de etiqueta — aguardando PDF...")
             paginas_antes = set(id(pg) for pg in context.pages)
             await imprimir.click()
 
@@ -1595,7 +3308,7 @@ async def _reimprimir_etiqueta_playwright(config: dict, order_number: str) -> di
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
             user_data_dir=str(PASTA_SESSAO),
-            headless=False,
+            headless=True,
             args=["--window-size=1280,900"],
         )
         try:
@@ -1640,7 +3353,7 @@ async def _reimprimir_etiqueta_playwright(config: dict, order_number: str) -> di
             await search.click(timeout=15_000)
             await search.fill(order_number)
             await page.keyboard.press("Enter")
-            await page.wait_for_timeout(2500)
+            await page.wait_for_timeout(1500)
 
             # Abre o drawer
             link = page.locator(f"text=#{order_number}").first
@@ -1751,6 +3464,7 @@ async def _emitir_nfe_massa_playwright(config: dict) -> bool:
         log("[nfe] ❌ Playwright não instalado")
         return False
 
+    _limpar_crash_chrome()
     log("[nfe] 📋 Verificando pedidos para emitir NF-e...")
 
     async with async_playwright() as p:
@@ -1767,7 +3481,7 @@ async def _emitir_nfe_massa_playwright(config: dict) -> bool:
                 wait_until="domcontentloaded",
                 timeout=60_000,
             )
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(2000)
 
             if "/login" in page.url:
                 log("[nfe] ⚠️ Sessão expirada — faça login manualmente")
@@ -1775,30 +3489,248 @@ async def _emitir_nfe_massa_playwright(config: dict) -> bool:
 
             await _fechar_popups_upseller(page)
 
-            linhas = await page.locator("tbody tr").count()
-            if linhas == 0:
-                log("[nfe] ℹ️ Nenhum pedido para emitir NF-e")
-                return True
+            log("[nfe] 🔧 NFe engine v1.5.5")
+            rodada = 0
+            linhas_anterior = None
+            sem_progresso = 0
+            while True:
+                rodada += 1
+                await page.reload(wait_until="domcontentloaded")
+                await page.wait_for_timeout(1500)
+                await _fechar_popups_upseller(page)
 
-            log(f"[nfe] 📝 {linhas} pedido(s) — selecionando todos...")
-            await page.locator("th .ant-checkbox-input").first.click()
-            await page.wait_for_timeout(1500)
+                # Garante sub-aba "Para Emitir" — tenta CSS e JS como fallback
+                clicou_tab = False
+                for texto_tab in ["Para Emitir", "Para emitir"]:
+                    tab = page.locator(".ant-tabs-tab").filter(has_text=texto_tab).first
+                    if await tab.count() > 0:
+                        await tab.click()
+                        clicou_tab = True
+                    else:
+                        clicou_tab = await page.evaluate("""(txt) => {
+                            const els = Array.from(document.querySelectorAll('*')).filter(el =>
+                                el.innerText && el.innerText.trim().startsWith(txt)
+                                && el.offsetParent !== null && !['BODY','HTML','MAIN'].includes(el.tagName)
+                            );
+                            if (els.length) { els[0].click(); return true; }
+                            return false;
+                        }""", texto_tab)
+                    if clicou_tab:
+                        await page.wait_for_timeout(800)
+                        log(f"[nfe] 🔖 Sub-aba 'Para Emitir' ativa")
+                        break
+                if not clicou_tab:
+                    log("[nfe] ⚠️ Sub-aba não encontrada — usando visão padrão")
 
-            emitir_btn = page.locator("button", has_text="Emitir Nota Fiscal").first
-            await emitir_btn.click()
-            await page.wait_for_timeout(2000)
+                await _fechar_popups_upseller(page)
 
-            # Confirma modal SE aparecer (sem fechar_popups — isso fecharia o modal errado)
-            confirmar = page.get_by_role("button", name="Confirmar").first
-            if await confirmar.count() > 0 and await confirmar.is_visible():
-                await confirmar.click()
-                await page.wait_for_timeout(1000)
+                # Critério de parada: usa API para contar total real (corrige bug >100 linhas)
+                total_api = await page.evaluate("""async () => {
+                    try {
+                        const r = await fetch('/api/order/index', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                            body: 'timeType=0&searchType=0&sortName=1&sortValue=1&orderState=invoice_pending&invoiceStatus=to_issue&isVoided=0&pageNum=1&pageSize=1'
+                        });
+                        const j = await r.json();
+                        return (j.data || {}).total || 0;
+                    } catch(e) { return -1; }
+                }""")
 
-            # Aguarda 2 min fixos — pedidos bloqueados (buffering, revisão) nunca saem da fila
-            espera = min(linhas * 2, 120)  # 2s por pedido, máximo 2 minutos
-            log(f"[nfe] ⏳ Aguardando {espera}s para emissão em lote...")
-            await page.wait_for_timeout(espera * 1000)
-            log("[nfe] ✅ Emissão iniciada — UpSeller processa restantes em background")
+                if total_api == 0:
+                    log("[nfe] ✅ Para Emitir vazio (API)")
+                    break
+                if total_api < 0:
+                    # API falhou — fallback para contagem visual
+                    emitir_btn = page.locator("button", has_text="Emitir Nota Fiscal").first
+                    if await emitir_btn.count() == 0 or not await emitir_btn.is_visible():
+                        log("[nfe] ℹ️ Nenhum pedido pendente de NF-e")
+                        break
+                    total_api = await page.locator("tbody tr").count()
+
+                # Detecta loop travado (3 rodadas sem redução)
+                if linhas_anterior is not None and total_api >= linhas_anterior:
+                    sem_progresso += 1
+                    log(f"[nfe] ⚠️ Sem redução ({linhas_anterior}→{total_api}) — {sem_progresso}/3")
+                    if sem_progresso >= 3:
+                        log("[nfe] ⚠️ Sem progresso após 3 rodadas — verifique 'Falha na Emissão'")
+                        break
+                else:
+                    sem_progresso = 0
+                linhas_anterior = total_api
+                linhas = await page.locator("tbody tr").count()
+
+                log(f"[nfe] 📝 {total_api} pedido(s) total ({linhas} na página) — rodada {rodada}")
+                # JS click no checkbox de seleção global (evita overlay)
+                await page.evaluate("""() => {
+                    const cb = document.querySelector('th .ant-checkbox-input');
+                    if (cb) cb.click();
+                }""")
+                await page.wait_for_timeout(800)
+
+                # JS click no "Emitir Nota Fiscal" (evita timeout por overlay)
+                clicou_emitir = await page.evaluate("""() => {
+                    const btn = Array.from(document.querySelectorAll('button'))
+                        .find(b => b.innerText.includes('Emitir Nota Fiscal') && b.offsetParent !== null);
+                    if (btn) { btn.click(); return true; }
+                    return false;
+                }""")
+                if not clicou_emitir:
+                    log("[nfe] ⚠️ Botão 'Emitir Nota Fiscal' não encontrado via JS — tentando locator")
+                    await emitir_btn.click(timeout=10000)
+                await page.wait_for_timeout(1500)
+
+                # Detecta formulário de Tributação (abre quando NCM está faltando)
+                confirmou = False
+                await page.wait_for_timeout(500)
+
+                tem_tributacao = await page.evaluate("""() => {
+                    return Array.from(document.querySelectorAll('*'))
+                        .some(el => el.innerText && el.innerText.trim() === 'Tributação'
+                              && el.offsetParent !== null);
+                }""")
+
+                if tem_tributacao:
+                    log("[nfe] 📋 Formulário de Tributação — preenchendo NCM...")
+                    # Screenshot de diagnóstico do formulário
+                    sc_trib = PASTA_RAIZ / f"debug_tributacao_rodada{rodada}.png"
+                    try:
+                        await page.screenshot(path=str(sc_trib))
+                        log(f"[nfe] 📸 Screenshot: {sc_trib.name}")
+                    except Exception:
+                        pass
+                    ncm_map    = config.get("ncm_produtos", {})
+                    ncm_padrao = config.get("ncm_padrao", "6109.10.00")
+
+                    # Aguarda form renderizar completamente antes de extrair linhas
+                    await page.wait_for_timeout(1500)
+
+                    # Extrai nomes dos produtos sem usar locators (evita stale)
+                    nomes_prod = await page.evaluate("""() => {
+                        return Array.from(document.querySelectorAll('tbody tr'))
+                            .filter(tr => tr.querySelector('[class*="info_item_ncm"]'))
+                            .map(tr => {
+                                const td = tr.querySelector('td');
+                                const all = Array.from((td || tr).querySelectorAll('*'))
+                                    .filter(e => !e.children.length
+                                             && e.innerText
+                                             && e.innerText.trim().length > 1);
+                                return all.length ? all[0].innerText.trim() : '';
+                            });
+                    }""")
+                    log(f"[nfe] 🔎 {len(nomes_prod)} linha(s) com NCM faltando: {nomes_prod}")
+
+                    for idx, nome_prod in enumerate(nomes_prod):
+                        ncm_val = ncm_map.get(nome_prod, ncm_padrao)
+                        if not ncm_val:
+                            log(f"[nfe] ⚠️ NCM não resolvido para '{nome_prod}' — pulando linha")
+                            continue
+                        log(f"[nfe] 🏷️ '{nome_prod}' → NCM {ncm_val}")
+
+                        # Posição do campo NCM via page.evaluate com índice (sem locator stale)
+                        pos = await page.evaluate("""(idx) => {
+                            const rows = Array.from(document.querySelectorAll('tbody tr'))
+                                .filter(tr => tr.querySelector('[class*="info_item_ncm"]'));
+                            if (idx >= rows.length) return null;
+                            const sels = Array.from(rows[idx].querySelectorAll('.ant-select'))
+                                .filter(s => s.offsetParent !== null)
+                                .sort((a, b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x);
+                            for (const s of sels) {
+                                const v = s.querySelector('.ant-select-selection-selected-value');
+                                if (!v || !v.innerText.trim()) {
+                                    const r = s.getBoundingClientRect();
+                                    return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)};
+                                }
+                            }
+                            return null;
+                        }""", idx)
+
+                        if not pos:
+                            log(f"[nfe] ⚠️ Campo NCM não localizado para '{nome_prod}'")
+                            continue
+                        await page.mouse.click(pos['x'], pos['y'])
+                        await page.wait_for_timeout(400)
+                        await page.keyboard.type(ncm_val)
+                        await page.wait_for_timeout(1000)  # aguarda dropdown aparecer
+                        clicou_dd = await page.evaluate("""() => {
+                            const li = document.querySelector(
+                                '.ant-select-dropdown:not(.ant-select-dropdown-hidden) li'
+                            );
+                            if (li) { li.click(); return true; }
+                            return false;
+                        }""")
+                        if clicou_dd:
+                            log(f"[nfe] ✅ Dropdown NCM selecionado para '{nome_prod}'")
+                        else:
+                            await page.keyboard.press("Enter")
+                            log(f"[nfe] ⚠️ Dropdown não apareceu — pressionou Enter para '{nome_prod}'")
+                        await page.wait_for_timeout(500)
+
+                    # JS click no Emitir — zero locator, zero timeout
+                    confirmou = await page.evaluate("""() => {
+                        const btn = Array.from(document.querySelectorAll('button'))
+                            .find(b => b.innerText.trim() === 'Emitir');
+                        if (btn) { btn.click(); return true; }
+                        return false;
+                    }""")
+                    if confirmou:
+                        log("[nfe] ✅ Tributação submetida!")
+                    else:
+                        log("[nfe] ⚠️ Botão Emitir não encontrado na Tributação")
+                else:
+                    # Caso 1: dialog "Submetido" — UpSeller já iniciou a emissão
+                    submetido = await page.evaluate("""() => {
+                        return Array.from(document.querySelectorAll('*'))
+                            .some(el => el.innerText
+                                  && el.innerText.includes('Submetido a Estar Emitindo')
+                                  && el.offsetParent !== null);
+                    }""")
+                    if submetido:
+                        log("[nfe] ✅ Emissão submetida pelo UpSeller")
+                        await page.evaluate("""() => {
+                            const btn = Array.from(document.querySelectorAll('button'))
+                                .find(b => b.innerText.trim() === 'Fechar' && b.offsetParent !== null);
+                            if (btn) btn.click();
+                        }""")
+                        await page.wait_for_timeout(500)
+                        confirmou = True
+                    else:
+                        # Caso 2: modal de confirmação com botão Emitir/Confirmar
+                        clicou_conf = await page.evaluate("""() => {
+                            const nomes = ['Confirmar', 'OK', 'Sim', 'Emitir', 'Confirmar Emissão'];
+                            for (const nome of nomes) {
+                                const btn = Array.from(document.querySelectorAll('button'))
+                                    .find(b => b.innerText.trim() === nome && b.offsetParent !== null);
+                                if (btn) { btn.click(); return nome; }
+                            }
+                            return null;
+                        }""")
+                        if clicou_conf:
+                            log(f"[nfe] ✅ Confirmação '{clicou_conf}' via JS")
+                            confirmou = True
+
+                if not confirmou:
+                    log("[nfe] ℹ️ Sem confirmação necessária — emissão já em andamento")
+
+                espera_max = min(max(linhas * 2, 30), 120)
+                log(f"[nfe] ⏳ Aguardando lote {rodada} (até {espera_max}s)...")
+                for _i in range(espera_max // 5):
+                    await page.wait_for_timeout(5_000)
+                    t_novo = await page.evaluate("""async () => {
+                        try {
+                            const r = await fetch('/api/order/index', {
+                                method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+                                body:'timeType=0&searchType=0&sortName=1&sortValue=1&orderState=invoice_pending&invoiceStatus=to_issue&isVoided=0&pageNum=1&pageSize=1'
+                            });
+                            const j = await r.json();
+                            return (j.data||{}).total ?? -1;
+                        } catch(e) { return -1; }
+                    }""")
+                    if t_novo >= 0 and t_novo < total_api:
+                        log(f"[nfe] ⚡ Lote concluído em {(_i+1)*5}s ({total_api}→{t_novo})")
+                        break
+                log(f"[nfe] ✅ Lote {rodada} iniciado")
+
             return True
 
         except Exception as e:
@@ -1817,6 +3749,7 @@ async def _programar_envio_playwright(config: dict) -> bool:
         log("[envio] ❌ Playwright não instalado")
         return False
 
+    _limpar_crash_chrome()
     log("[envio] 🚚 Verificando pedidos para programar envio...")
 
     async with async_playwright() as p:
@@ -1841,41 +3774,206 @@ async def _programar_envio_playwright(config: dict) -> bool:
 
             await _fechar_popups_upseller(page)
 
-            linhas = await page.locator("tbody tr").count()
-            if linhas == 0:
-                log("[envio] ℹ️ Nenhum pedido para programar envio")
-                return True
+            PLATAFORMAS_UI = ["Mercado Libre", "Shopee", "Shein", "TikTok Shop"]
 
-            log(f"[envio] 📦 {linhas} pedido(s) — selecionando todos...")
-            await page.locator("th .ant-checkbox-input").first.click()
-            await page.wait_for_timeout(1500)
-
-            programar_btn = page.locator("button", has_text="Programar Envio").first
-            await programar_btn.click()
-            await page.wait_for_timeout(2000)
-
-            # Confirma modal "Processar esses pedidos para enviar?" (sem fechar_popups)
-            modal = page.locator(".ant-modal-content")
-            if await modal.count() > 0:
-                confirmar = modal.locator("button", has_text="Programar Envio").first
-                if await confirmar.count() > 0 and await confirmar.is_visible():
-                    await confirmar.click()
+            async def _aplicar_filtro_plat(plat_nome: str) -> bool:
+                try:
+                    plat_sel = page.locator('.ant-select').filter(has_text='Plataformas')
+                    if await plat_sel.count() == 0:
+                        return False
+                    await plat_sel.first.click()
+                    await page.wait_for_timeout(800)
+                    opcao = page.locator('.ant-select-dropdown-menu-item').filter(has_text=plat_nome)
+                    if await opcao.count() == 0:
+                        await page.keyboard.press('Escape')
+                        return False
+                    await opcao.first.click()
                     await page.wait_for_timeout(2000)
-
-            log("[envio] ⏳ Aguardando programação de envio...")
-            for i in range(60):  # até 10 minutos
-                await page.wait_for_timeout(10_000)
-                if i % 6 == 5:
-                    await page.reload(wait_until="domcontentloaded")
-                    await page.wait_for_timeout(2000)
-                restantes = await page.locator("tbody tr").count()
-                if restantes == 0:
-                    log("[envio] ✅ Todos os envios programados!")
                     return True
-                if i % 3 == 0:
-                    log(f"[envio] ⏳ {restantes} pedido(s) ainda processando...")
+                except Exception:
+                    return False
 
-            log("[envio] ⚠️ Timeout — continuando mesmo assim")
+            async def _get_total_pag() -> int:
+                val = await page.evaluate("""() => {
+                    const el = document.querySelector('.ant-pagination-total-text');
+                    if (el) { const m = el.innerText.match(/\\d+/); return m ? parseInt(m[0]) : null; }
+                    return null;
+                }""")
+                if val is not None:
+                    return val
+                return await page.locator("tbody tr").count()
+
+            for plat_nome in PLATAFORMAS_UI:
+                await page.reload(wait_until="domcontentloaded")
+                await page.wait_for_timeout(2000)
+                await _fechar_popups_upseller(page)
+
+                filtrado = await _aplicar_filtro_plat(plat_nome)
+                if not filtrado:
+                    log(f"[envio] ⚠️ Filtro '{plat_nome}' não disponível — pulando")
+                    continue
+
+                linhas = await page.locator("tbody tr").count()
+                if linhas == 0:
+                    log(f"[envio] ✅ {plat_nome}: sem pedidos pendentes")
+                    continue
+
+                programar_btn_chk = page.locator("button", has_text="Programar Envio").first
+                if await programar_btn_chk.count() == 0 or not await programar_btn_chk.is_visible():
+                    log(f"[envio] ✅ {plat_nome}: botão 'Programar Envio' não disponível")
+                    continue
+
+                total_inicial = await _get_total_pag()
+                log(f"[envio] 📊 {plat_nome}: {total_inicial} pedido(s) — iniciando agendamento")
+
+                rodada = 0
+                total_anterior = None
+                sem_progresso = 0
+
+                while True:
+                    rodada += 1
+
+                    if rodada > 1:
+                        await page.reload(wait_until="domcontentloaded")
+                        await page.wait_for_timeout(2000)
+                        await _fechar_popups_upseller(page)
+                        await _aplicar_filtro_plat(plat_nome)
+                        await page.wait_for_timeout(1000)
+
+                    linhas = await page.locator("tbody tr").count()
+                    if linhas == 0:
+                        log(f"[envio] ✅ {plat_nome}: todos agendados!")
+                        break
+
+                    programar_btn = page.locator("button", has_text="Programar Envio").first
+                    if await programar_btn.count() == 0 or not await programar_btn.is_visible():
+                        log(f"[envio] ✅ {plat_nome}: fila limpa!")
+                        break
+
+                    total = await _get_total_pag()
+                    log(f"[envio] 📊 {plat_nome}: {total} total ({linhas} na página) — rodada {rodada}")
+
+                    if total_anterior is not None and total >= total_anterior:
+                        sem_progresso += 1
+                        log(f"[envio] ⚠️ {plat_nome}: sem redução ({total_anterior}→{total}) — {sem_progresso}/3")
+                        if sem_progresso >= 3:
+                            log(f"[envio] ⚠️ {plat_nome}: sem progresso após 3 rodadas — próxima plataforma")
+                            break
+                    else:
+                        sem_progresso = 0
+                    total_anterior = total
+
+                    log(f"[envio] 📦 {plat_nome}: rodada {rodada} — selecionando todos...")
+
+                    # Clica checkbox select-all
+                    cb_selecionado = False
+                    for cb_sel in [
+                        "th .ant-checkbox-wrapper",
+                        "thead .ant-checkbox-wrapper",
+                        ".ant-table-thead .ant-checkbox-wrapper",
+                        "th .ant-checkbox-input",
+                        "thead .ant-checkbox-input",
+                    ]:
+                        cb_loc = page.locator(cb_sel).first
+                        if await cb_loc.count() > 0:
+                            await cb_loc.click(force=True)
+                            cb_selecionado = True
+                            log(f"[envio] ☑️ Checkbox selecionado via '{cb_sel}'")
+                            break
+                    if not cb_selecionado:
+                        log("[envio] ⚠️ Checkbox select-all não encontrado")
+                    await page.wait_for_timeout(1500)
+
+                    qtd_sel = await page.evaluate("""() => {
+                        return document.querySelectorAll('tbody .ant-checkbox-checked').length;
+                    }""")
+                    log(f"[envio] ✔️ {qtd_sel} pedidos selecionados")
+                    if qtd_sel == 0:
+                        log("[envio] ⚠️ Nenhum pedido selecionado — pulando rodada")
+                        sem_progresso += 1
+                        if sem_progresso >= 3:
+                            break
+                        continue
+
+                    # Clica "Programar Envio" com coordenadas reais
+                    pos_envio = await page.evaluate("""() => {
+                        const btn = Array.from(document.querySelectorAll('button'))
+                            .find(b => b.innerText.trim().includes('Programar Envio') && b.offsetParent !== null);
+                        if (!btn) return null;
+                        const r = btn.getBoundingClientRect();
+                        return {x: r.x + r.width/2, y: r.y + r.height/2};
+                    }""")
+                    if pos_envio:
+                        await page.mouse.click(pos_envio['x'], pos_envio['y'])
+                        log(f"[envio] 🖱️ Clicou 'Programar Envio' em ({pos_envio['x']:.0f},{pos_envio['y']:.0f})")
+                    else:
+                        await programar_btn.click()
+                        log("[envio] 🖱️ Clicou 'Programar Envio' (fallback)")
+                    await page.wait_for_timeout(3000)
+
+                    # Confirma modal/popover se aparecer
+                    pos_modal_btn = await page.evaluate("""() => {
+                        const textos = ['Programar', 'Confirmar', 'Confirm', 'OK', 'Ok', 'Sim', 'Yes'];
+                        const seletores = [
+                            '.ant-modal-content button',
+                            '.ant-popover-inner button',
+                            '.ant-popconfirm button',
+                            '.ant-dropdown-menu-item',
+                        ];
+                        for (const sel of seletores) {
+                            const btns = Array.from(document.querySelectorAll(sel));
+                            for (const txt of textos) {
+                                const btn = btns.find(b => b.innerText.trim().includes(txt) && b.offsetParent !== null);
+                                if (btn) {
+                                    const r = btn.getBoundingClientRect();
+                                    return {x: r.x + r.width/2, y: r.y + r.height/2, txt: btn.innerText.trim().substring(0,30)};
+                                }
+                            }
+                        }
+                        return null;
+                    }""")
+                    if pos_modal_btn:
+                        await page.mouse.click(pos_modal_btn['x'], pos_modal_btn['y'])
+                        log(f"[envio] ✅ Confirmação clicada '{pos_modal_btn['txt']}'")
+                        await page.wait_for_timeout(2000)
+                    else:
+                        log(f"[envio] ℹ️ {plat_nome}: sem modal de confirmação — processando direto")
+
+                    # Aguarda redução
+                    total_antes = total
+                    log(f"[envio] ⏳ {plat_nome}: aguardando processamento... (total: {total_antes})")
+                    progresso = False
+                    for i in range(18):
+                        await page.wait_for_timeout(5_000)
+                        if i == 10:
+                            await page.reload(wait_until="domcontentloaded")
+                            await page.wait_for_timeout(1500)
+                            await _fechar_popups_upseller(page)
+                            await _aplicar_filtro_plat(plat_nome)
+                            await page.wait_for_timeout(1000)
+                        restantes = await page.locator("tbody tr").count()
+                        total_agora = await page.evaluate("""() => {
+                            const el = document.querySelector('.ant-pagination-total-text');
+                            if (el) { const m = el.innerText.match(/\\d+/); return m ? parseInt(m[0]) : null; }
+                            return null;
+                        }""")
+                        if total_agora is not None and total_agora < total_antes:
+                            log(f"[envio] ⏳ {plat_nome}: {total_agora} restando (era {total_antes})")
+                            progresso = True
+                            if total_agora == 0:
+                                break
+                        elif restantes < linhas:
+                            log(f"[envio] ⏳ {plat_nome}: {restantes} rows restando")
+                            progresso = True
+                            if restantes == 0:
+                                break
+
+                    if not progresso:
+                        log(f"[envio] ℹ️ {plat_nome}: sem redução após 90s — próxima plataforma")
+
+                    log(f"[envio] ✅ {plat_nome}: lote {rodada} processado")
+
+            log("[envio] ✅ Todas as plataformas processadas!")
             return True
 
         except Exception as e:
@@ -2040,13 +4138,49 @@ def extrair(config: dict, data_alvo: date):
     multi = sum(1 for p in pedidos if p.get("quantidade", 1) > 1)
     log(f"Pedidos encontrados: {len(pedidos)} ({multi} com 2+ itens, {len(itens_list)} itens no total)")
 
+    # ── 1. Baixa etiquetas do Excel ANTES de salvar o JSON ───────────────────
+    # label_url no Excel é a URL externa real — baixa para a pasta e MANTÉM a URL original
+    import urllib.request as _urllib
+    com_url = [(p["order_number"], p["label_url"]) for p in pedidos if p.get("label_url")]
+    if com_url:
+        log(f"📥 Baixando {len(com_url)} etiqueta(s) do Excel...")
+        baixados = 0
+        for order_num, url in com_url:
+            if "127.0.0.1:5001" in url or "localhost:5001" in url:
+                continue  # URL já aponta pro robô (registro antigo) — pula
+            pdf_path = PASTA_ETIQUETAS / f"etiqueta_{order_num}.pdf"
+            if not pdf_path.exists():
+                try:
+                    _urllib.urlretrieve(url, str(pdf_path))
+                    _corr = _corrigir_mediabox(pdf_path)
+                    if _corr != pdf_path and _corr.exists():
+                        _corr.replace(pdf_path)
+                    baixados += 1
+                except Exception:
+                    pass
+        if baixados:
+            log(f"✅ {baixados} etiqueta(s) salvas em cache")
+
+    # ── 2. JSON para o PCP: label_url aponta para o robô local ───────────────
+    # Constrói cópia dos dados para o JSON sem modificar a lista `pedidos`
+    # (que vai para o Supabase com a URL original — usada como fallback em /etiqueta/)
+    import copy as _copy
+    pedidos_json = _copy.deepcopy(pedidos)
+    for p in pedidos_json:
+        on = p["order_number"]
+        if p.get("label_url") and "127.0.0.1:5001" not in p["label_url"]:
+            if (PASTA_ETIQUETAS / f"etiqueta_{on}.pdf").exists():
+                p["label_url"] = f"http://127.0.0.1:5001/etiqueta/{on}"
+
+    # ── 3. Salva JSON (PCP lê daqui) ─────────────────────────────────────────
     arq = PASTA_DADOS / f"lista_{data_arquivo}_{token[:8]}.json"
-    arq.write_text(json.dumps(pedidos, ensure_ascii=False, indent=2), encoding="utf-8")
+    arq.write_text(json.dumps(pedidos_json, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"JSON salvo: {arq.name}")
 
+    # ── 4. Envia para Supabase com URL ORIGINAL (não a URL do robô) ──────────
     log("Enviando para Supabase...")
     try:
-        supa   = create_client(SUPABASE_URL, SUPABASE_KEY)
+        supa   = create_client(*_supa())
         linhas = [{
             "order_number": p["order_number"],
             "sku":          p["sku"],
@@ -2057,7 +4191,7 @@ def extrair(config: dict, data_alvo: date):
             "quantidade":   p.get("quantidade", 1),
             "plataforma":   p.get("plataforma"),
             "valor":        p.get("valor"),
-            "label_url":    p.get("label_url"),
+            "label_url":    p.get("label_url"),  # URL original — /etiqueta/ usa como fallback
         } for p in pedidos]
 
         if linhas:
@@ -2100,24 +4234,6 @@ def extrair(config: dict, data_alvo: date):
     except Exception as e:
         log(f"Erro Supabase (pedido_itens): {e}")
 
-    # Baixa PDFs das etiquetas que já têm URL no Excel (sem precisar do Playwright)
-    import urllib.request as _urllib
-    com_url = [(p["order_number"], p["label_url"]) for p in pedidos if p.get("label_url")]
-    if com_url:
-        log(f"📥 Baixando {len(com_url)} etiqueta(s) do Excel...")
-        baixados = 0
-        for order_num, url in com_url:
-            pdf_path = PASTA_ETIQUETAS / f"etiqueta_{order_num}.pdf"
-            if pdf_path.exists():
-                continue
-            try:
-                _urllib.urlretrieve(url, str(pdf_path))
-                baixados += 1
-            except Exception:
-                pass
-        if baixados:
-            log(f"✅ {baixados} etiqueta(s) salvas em cache")
-
     atualizar_ultima_execucao(token)
     log(f"✅ Concluído! {len(pedidos)} pedidos | {data_display}")
 
@@ -2126,6 +4242,304 @@ def extrair(config: dict, data_alvo: date):
         log(f"🗑 Arquivo Excel removido.")
     except Exception:
         pass
+
+
+# ── Importação via API interna do UpSeller ────────────────────────────────────
+
+async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
+    """
+    Importa pedidos diretamente da API interna do UpSeller (sem Excel).
+    Busca Para Imprimir (in_process) e Para Emitir (invoice_pending).
+    """
+    import copy as _copy, urllib.request as _urllib
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        log("[api] ❌ Playwright não instalado")
+        return False
+
+    token = config["token"]
+    PASTA_DADOS.mkdir(exist_ok=True)
+    _limpar_crash_chrome()
+
+    todos_raw = []
+
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=str(PASTA_SESSAO),
+            headless=True,
+            args=["--window-size=1280,900"],
+        )
+        try:
+            page = context.pages[0] if context.pages else await context.new_page()
+
+            await page.goto(
+                "https://app.upseller.com/pt/order/in-process",
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+            await page.wait_for_timeout(2000)
+
+            if "/login" in page.url:
+                log("[api] ⚠️ Sessão expirada — faça login manualmente")
+                return False
+
+            SECOES = [
+                ("in_process",      "labelStatus=success&warehouseType=0", "Para Imprimir", False),
+                ("invoice_pending", "invoiceStatus=to_issue&isVoided=0",   "Para Emitir",   False),
+                ("to_ship",         "",                                     "Para Enviar",   False),
+            ]
+
+            for state, extra, label_secao, filtrar_por_data in SECOES:
+                page_num = 1
+                total_secao = None
+                contado = 0
+                while True:
+                    body_str = (
+                        f"timeType=0&searchType=0&searchValue=&sortName=1&sortValue=1"
+                        f"&orderState={state}&isVoided=0"
+                        + (f"&{extra}" if extra else "")
+                        + f"&pageNum={page_num}&pageSize=50"
+                    )
+                    result = await page.evaluate(f"""async () => {{
+                        const r = await fetch('/api/order/index', {{
+                            method: 'POST',
+                            headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+                            body: '{body_str}'
+                        }});
+                        return await r.json();
+                    }}""")
+
+                    data = result.get("data", {})
+                    lista = data.get("list", [])
+                    total = data.get("total", 0)
+
+                    if total_secao is None:
+                        total_secao = total
+
+                    # Para Enviar: só pedidos com NF-e emitida hoje
+                    if filtrar_por_data:
+                        lista = [
+                            o for o in lista
+                            if (o.get("invoiceTime") or "").startswith(data_arquivo)
+                        ]
+
+                    if total_secao is not None and page_num == 1 and not filtrar_por_data:
+                        log(f"[api] {label_secao}: {total} pedido(s)")
+
+                    for order in lista:
+                        order["_state"] = state
+
+                    contado += len(lista)
+                    todos_raw.extend(lista)
+
+                    if page_num * 50 >= total_secao or not data.get("list"):
+                        break
+                    page_num += 1
+
+                if filtrar_por_data:
+                    log(f"[api] {label_secao} (hoje): {contado} pedido(s)")
+
+        except Exception as e:
+            log(f"[api] ❌ Erro ao consultar API: {e}")
+            return False
+        finally:
+            await context.close()
+
+    if not todos_raw:
+        log("[api] ℹ️ Nenhum pedido pendente no momento")
+        # Salva JSON vazio para PCP não ficar com dados antigos
+        arq = PASTA_DADOS / f"lista_{data_arquivo}_{token[:8]}.json"
+        arq.write_text("[]", encoding="utf-8")
+        return True
+
+    # Mapeamento plataforma API → nome exibição
+    PLAT = {
+        "shopee":  "Shopee",
+        "shein":   "Shein",
+        "mercado": "Mercado Livre",
+        "tiktok":  "TikTok",
+        "kwai":    "Kwai",
+    }
+
+    pedidos_dict: dict = {}
+    itens_list:   list = []
+
+    for order in todos_raw:
+        order_num = (order.get("orderNumber") or "").strip()
+        if not order_num:
+            continue
+
+        plataforma = PLAT.get((order.get("platform") or "").lower(), order.get("platform") or "")
+        try:
+            valor = float(order.get("orderAmount") or 0) or None
+        except Exception:
+            valor = None
+
+        items = order.get("orderItemList") or []
+
+        for item in items:
+            sku  = (item.get("variationSku") or item.get("productSku") or "").strip()
+            nome = (item.get("productName") or "").strip()
+            img  = (item.get("productImg")  or "").strip()
+            qtd  = int(item.get("productCount") or 1)
+            itens_list.append({
+                "order_number": order_num,
+                "sku":          sku,
+                "product_name": nome,
+                "image_url":    img,
+                "quantidade":   qtd,
+                "cliente":      token,
+                "data":         data_arquivo,
+            })
+
+        first     = items[0] if items else {}
+        qtd_total = sum(int(i.get("productCount") or 1) for i in items) or 1
+
+        # Tenta capturar label_url da API (Shopee/TikTok/Shein retornam URL própria)
+        api_label_url = None
+        for campo in ("labelUrl", "printUrl", "waybillUrl", "expressLabel", "packageLabel"):
+            v = (order.get(campo) or "").strip()
+            if v and v.startswith("http"):
+                api_label_url = v
+                break
+
+        # Data real do pedido: usa payTime > createTime > data_arquivo
+        data_pedido = data_arquivo
+        for campo_dt in ("payTime", "createTime", "orderTime"):
+            v = (order.get(campo_dt) or "")[:10]
+            if len(v) == 10 and v[4] == "-":
+                data_pedido = v
+                break
+
+        if order_num not in pedidos_dict:
+            pedidos_dict[order_num] = {
+                "order_number": order_num,
+                "sku":          (first.get("variationSku") or first.get("productSku") or "").strip(),
+                "product_name": (first.get("productName") or "").strip(),
+                "image_url":    (first.get("productImg")  or "").strip(),
+                "data":         data_pedido,
+                "quantidade":   qtd_total,
+                "plataforma":   plataforma,
+                "valor":        valor,
+                "label_url":    api_label_url,
+            }
+        else:
+            pedidos_dict[order_num]["quantidade"] += qtd_total
+            if api_label_url and not pedidos_dict[order_num].get("label_url"):
+                pedidos_dict[order_num]["label_url"] = api_label_url
+
+    pedidos = list(pedidos_dict.values())
+    multi   = sum(1 for p in pedidos if p.get("quantidade", 1) > 1)
+    log(f"Pedidos: {len(pedidos)} ({multi} com 2+ itens, {len(itens_list)} itens)")
+
+    # Recupera label_urls salvas no Supabase de execuções anteriores
+    try:
+        supa_lbl = create_client(*_supa())
+        nums = list(pedidos_dict.keys())
+        for i in range(0, len(nums), 100):
+            lote = nums[i:i + 100]
+            r = supa_lbl.table("pedidos").select("order_number,label_url").in_("order_number", lote).execute()
+            for row in (r.data or []):
+                on  = row["order_number"]
+                url = row.get("label_url")
+                if url and on in pedidos_dict:
+                    pedidos_dict[on]["label_url"] = url
+    except Exception as e:
+        log(f"[api] ⚠️ Não foi possível recuperar label_urls do Supabase: {e}")
+
+    # Baixa PDFs com URL original disponível (não a URL do robô)
+    com_url = [
+        (p["order_number"], p["label_url"]) for p in pedidos
+        if p.get("label_url")
+        and "127.0.0.1:5001"  not in p["label_url"]
+        and "localhost:5001" not in p["label_url"]
+    ]
+    if com_url:
+        log(f"📥 Baixando {len(com_url)} etiqueta(s)...")
+        baixados = 0
+        for order_num, url in com_url:
+            pdf_path = PASTA_ETIQUETAS / f"etiqueta_{order_num}.pdf"
+            if not pdf_path.exists():
+                try:
+                    _urllib.urlretrieve(url, str(pdf_path))
+                    _corr = _corrigir_mediabox(pdf_path)
+                    if _corr != pdf_path and _corr.exists():
+                        _corr.replace(pdf_path)
+                    baixados += 1
+                except Exception:
+                    pass
+        if baixados:
+            log(f"✅ {baixados} etiqueta(s) salvas em cache")
+
+    # JSON para PCP: usa URL do robô local onde PDF já existe
+    pedidos_json = _copy.deepcopy(pedidos)
+    for p in pedidos_json:
+        on   = p["order_number"]
+        lurl = p.get("label_url")
+        if lurl and "127.0.0.1:5001" not in lurl and (PASTA_ETIQUETAS / f"etiqueta_{on}.pdf").exists():
+            p["label_url"] = f"http://127.0.0.1:5001/etiqueta/{on}"
+
+    arq = PASTA_DADOS / f"lista_{data_arquivo}_{token[:8]}.json"
+    arq.write_text(json.dumps(pedidos_json, ensure_ascii=False, indent=2), encoding="utf-8")
+    log(f"JSON salvo: {arq.name}")
+
+    # Envia para Supabase (mantém label_url original — fallback em /etiqueta/)
+    log("Enviando para Supabase...")
+    try:
+        supa = create_client(*_supa())
+        linhas = [{
+            "order_number": p["order_number"],
+            "sku":          p["sku"],
+            "product_name": p["product_name"],
+            "image_url":    p["image_url"],
+            "data":         p.get("data") or data_arquivo,
+            "cliente":      token,
+            "quantidade":   p.get("quantidade", 1),
+            "plataforma":   p.get("plataforma"),
+            "valor":        p.get("valor"),
+            "label_url":    p.get("label_url"),
+        } for p in pedidos]
+
+        if linhas:
+            colunas_opcionais = {"plataforma", "valor", "label_url"}
+            excluir: set = set()
+            tentativa = linhas
+            while True:
+                try:
+                    supa.table("pedidos").upsert(tentativa, on_conflict="order_number").execute()
+                    if excluir:
+                        log(f"✅ {len(tentativa)} pedidos enviados (sem {sorted(excluir)})")
+                    else:
+                        log(f"✅ {len(tentativa)} pedidos enviados ao Supabase!")
+                    break
+                except Exception as e_col:
+                    col_faltando = next((c for c in colunas_opcionais - excluir if c in str(e_col)), None)
+                    if col_faltando:
+                        excluir.add(col_faltando)
+                        tentativa = [{k: v for k, v in l.items() if k not in excluir} for l in linhas]
+                        log(f"⚠️ Coluna '{col_faltando}' ausente — tentando sem ela...")
+                    else:
+                        raise
+        else:
+            log("Nenhum pedido para enviar")
+    except Exception as e:
+        log(f"Erro Supabase (pedidos): {e}")
+
+    try:
+        if itens_list:
+            order_numbers = list(pedidos_dict.keys())
+            supa.table("pedido_itens").delete().in_("order_number", order_numbers).execute()
+            batch = 200
+            for i in range(0, len(itens_list), batch):
+                supa.table("pedido_itens").insert(itens_list[i:i + batch]).execute()
+            log(f"✅ {len(itens_list)} itens enviados a pedido_itens!")
+    except Exception as e:
+        log(f"Erro Supabase (pedido_itens): {e}")
+
+    atualizar_ultima_execucao(token)
+    log(f"✅ Concluído! {len(pedidos)} pedidos | {data_arquivo}")
+    return True
 
 
 # ── Agendador ─────────────────────────────────────────────────────────────────
@@ -2215,7 +4629,42 @@ def _limpar_etiquetas_antigas(dias: int = 7):
         log(f"🗑️ {removidos} etiqueta(s) com mais de {dias} dias removidas")
 
 
+def _loop_captura_etiquetas():
+    """Captura etiquetas do UpSeller a cada 60s, com retroativo a cada 5 min."""
+    INTERVALO = 60  # 1 minuto
+    time.sleep(60)  # aguarda 1 min para o robô inicializar antes da primeira captura
+    while True:
+        try:
+            if CONFIG_FILE.exists() and not rodando and not _pos_import_ativo:
+                config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                if config.get("token"):
+                    log("━━ Captura automática de etiquetas (1min) ━━")
+                    _executar_captura(config, aguardar=False, background=True)
+        except Exception as e:
+            log(f"[captura-auto] ⚠️ {e}")
+        time.sleep(INTERVALO)
+
+
 if __name__ == "__main__":
+    import socket as _socket
+
+    # Verifica se já existe uma instância rodando na porta 5001
+    _porta_livre = True
+    try:
+        _s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        _s.settimeout(0.5)
+        _s.connect(("127.0.0.1", 5001))
+        _s.close()
+        _porta_livre = False  # conseguiu conectar → já tem instância rodando
+    except Exception:
+        _porta_livre = True   # porta livre → somos a única instância
+
+    if not _porta_livre:
+        # Já há uma instância do robô rodando — abre o browser e encerra
+        print("Robô já está rodando — abrindo interface...")
+        webbrowser.open("http://127.0.0.1:5001")
+        sys.exit(0)
+
     PASTA_ETIQUETAS.mkdir(exist_ok=True)
     PASTA_PICKLISTS.mkdir(exist_ok=True)
     _limpar_etiquetas_antigas()
@@ -2228,8 +4677,9 @@ if __name__ == "__main__":
         )
 
     threading.Thread(target=_loop_agendador, daemon=True).start()
-    if sys.stdout.isatty():  # só abre browser quando rodado manualmente no terminal
-        threading.Timer(1.0, lambda: webbrowser.open("http://127.0.0.1:5001")).start()
+    threading.Thread(target=_loop_captura_etiquetas, daemon=True).start()
+    # Abre browser sempre (auto-start via pythonw não tem terminal)
+    threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:5001")).start()
     print("=" * 48)
     print("  AdnSys Robo UpSeller")
     print("  Acesse: http://127.0.0.1:5001")

@@ -1,4 +1,4 @@
 {
-  "version": "1.1.9",
-  "descricao": "Limpeza de etiquetas com mais de 7 dias ao iniciar"
+  "version": "1.5.77",
+  "descricao": "fix batch PDF: split por pedido (1 arquivo por página) — evita múltiplas etiquetas de pedidos diferentes ao bipar"
 }

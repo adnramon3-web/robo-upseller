@@ -121,6 +121,18 @@
     .btn-setup{border:1.5px solid var(--roxo);background:none;color:var(--roxo);}
     .btn-setup:hover{background:rgba(106,27,154,0.07);}
     .btn-setup.ok{border-color:#B0BEC5;color:#78909C;}
+    .robot-controls{display:flex;gap:8px;margin-top:10px;}
+    .robot-controls .btn-ctrl{flex:1;height:38px;border-radius:8px;font-size:12px;font-weight:600;
+        cursor:pointer;transition:background .2s;border:1.5px solid;}
+    .btn-parar{border-color:#E53935;background:none;color:#E53935;}
+    .btn-parar:hover:not(:disabled){background:rgba(229,57,53,0.07);}
+    .btn-parar:disabled{opacity:.35;cursor:not-allowed;}
+    .btn-reiniciar{border-color:var(--laranja);background:none;color:var(--laranja);}
+    .btn-reiniciar:hover:not(:disabled){background:rgba(230,81,0,0.07);}
+    .btn-reiniciar:disabled{opacity:.35;cursor:not-allowed;}
+    .btn-atualizar{border-color:var(--verde);background:none;color:var(--verde);}
+    .btn-atualizar:hover:not(:disabled){background:rgba(56,142,60,0.07);}
+    .btn-atualizar:disabled{opacity:.35;cursor:not-allowed;}
 
     /* PROGRESS */
     .progress-bar{height:4px;background:#E3E8F0;border-radius:4px;overflow:hidden;
@@ -171,7 +183,7 @@
     <div class="nav-brand-icon">🤖</div>
     <div>
       <div class="nav-brand-text">AdnSys Robo UpSeller</div>
-      <div class="nav-brand-sub">Automação de pedidos</div>
+      <div class="nav-brand-sub">Automação de pedidos &nbsp;·&nbsp; <span id="nav-versao">v—</span></div>
     </div>
   </div>
   <div class="status-pill nok" id="status-pill">
@@ -225,6 +237,18 @@
             placeholder="Ex: ELGIN-i9 (deixe vazio para abrir PDF no browser)"
             value="{{ config.get('nome_impressora','') }}"/>
           <small style="color:#90A4AE;font-size:11px">Deixe vazio para usar a impressora padrão do sistema automaticamente</small>
+        </div>
+        <div class="form-group" style="display:flex;align-items:center;gap:10px;margin-top:8px;">
+          <label class="toggle">
+            <input type="checkbox" id="auto_imprimir_etiquetas"
+              {% if config.get('auto_imprimir_etiquetas') %}checked{% endif %}
+              onchange="salvarAutoImprimir()"/>
+            <span class="toggle-slider"></span>
+          </label>
+          <div>
+            <div style="font-size:13px;font-weight:600;color:#37474F">Imprimir etiquetas Shopee/ML/Shein automaticamente</div>
+            <div style="font-size:11px;color:#90A4AE">Imprime ao baixar — sem precisar do PCP para essas plataformas</div>
+          </div>
         </div>
       </div>
     </div>
@@ -288,6 +312,65 @@
   <!-- SALVAR -->
   <button class="btn-save" id="btn-save" onclick="salvar()" style="margin-bottom:20px;">💾 Salvar Configuração</button>
 
+  <!-- BANCO DE DADOS (Supabase privado) -->
+  <div class="card">
+    <div class="card-header"><span>🗄️</span><h2>Banco de Dados</h2></div>
+    <div class="card-body">
+      <p style="font-size:12px;color:#78909C;margin-bottom:14px;">
+        Por padrão o robô usa o banco compartilhado AdnSys. Para usar seu próprio banco Supabase, preencha abaixo.
+      </p>
+      <div class="form-row">
+        <div class="form-group">
+          <label>URL do Supabase (opcional)</label>
+          <input type="text" id="supabase_url" placeholder="https://xxxx.supabase.co"
+            value="{{ config.get('supabase_url','') }}"/>
+        </div>
+        <div class="form-group">
+          <label>Chave anon/public (opcional)</label>
+          <input type="text" id="supabase_key" placeholder="sb_publishable_..."
+            value="{{ config.get('supabase_key','') }}"/>
+        </div>
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;">
+        <button class="btn-sec" style="flex:1;min-width:140px;" onclick="testarSupabase()">🔌 Testar Conexão</button>
+        <button class="btn-sec" style="flex:1;min-width:140px;background:#E8F5E9;color:#2E7D32;" onclick="migrarSupabase()">📦 Migrar Dados</button>
+      </div>
+      <div style="border-top:1px solid #EEF2F7;margin:16px 0 12px;"></div>
+      <p style="font-size:12px;color:#78909C;margin-bottom:10px;">
+        Importar pedidos dos últimos dias (útil para incluir pedidos anteriores ao robô):
+      </p>
+      <div style="display:flex;gap:10px;align-items:center;">
+        <input type="number" id="backfill-dias" value="2" min="1" max="30"
+          style="width:70px;height:38px;border:1.5px solid #E3E8F0;border-radius:8px;padding:0 10px;font-size:14px;"/>
+        <span style="font-size:13px;color:#546E7A;">dias atrás</span>
+        <button class="btn-sec" style="flex:1;" onclick="backfillRetroativo()">🔄 Importar Histórico</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- INSTALAÇÃO -->
+  <div class="card">
+    <div class="card-header"><span>🔧</span><h2>Instalação e Manutenção</h2></div>
+    <div class="card-body">
+      <p style="font-size:12px;color:#78909C;margin-bottom:14px;">
+        Configure o robô pela primeira vez ou resolva problemas de autenticação.
+      </p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;">
+        <button class="btn-sec btn-auth" id="btn-auth" onclick="autenticarUpseller()" style="flex:1;min-width:160px;">
+          🔐 Autenticar UpSeller
+        </button>
+        <button class="btn-sec btn-setup" id="btn-setup" onclick="configurarInicializacao()" style="flex:1;min-width:160px;">
+          ⚙️ Inicialização Automática
+        </button>
+      </div>
+      <div style="border-top:1px solid #EEF2F7;margin:14px 0 10px;"></div>
+      <div style="display:flex;gap:10px;">
+        <button class="btn-ctrl btn-reiniciar" id="btn-reiniciar" onclick="reiniciarRobo()" style="flex:1;">🔄 Reiniciar Robô</button>
+        <button class="btn-ctrl btn-atualizar" id="btn-atualizar" onclick="atualizarRobo()" style="flex:1;">⬆️ Atualizar Versão</button>
+      </div>
+    </div>
+  </div>
+
   <!-- EXECUÇÃO MANUAL -->
   <div class="card">
     <div class="card-header"><span>▶️</span><h2>Execução Manual</h2></div>
@@ -320,9 +403,10 @@
             style="background:linear-gradient(135deg,#6A1B9A,#9C27B0);color:#fff;">▶ Executar</button>
         </div>
       </div>
-      <button class="btn-sec btn-auth" id="btn-auth" onclick="autenticarUpseller()">🔐 Autenticar UpSeller</button>
       <button class="btn-sec btn-capturar" id="btn-capturar" onclick="capturarEtiquetas()">🏷️ Capturar Etiquetas</button>
-      <button class="btn-sec btn-setup" id="btn-setup" onclick="configurarInicializacao()">⚙️ Inicialização Automática</button>
+      <div class="robot-controls">
+        <button class="btn-ctrl btn-parar" id="btn-parar" onclick="pararRobo()" disabled>⏹️ Parar</button>
+      </div>
     </div>
   </div>
 
@@ -331,6 +415,7 @@
     <div class="card-body">
       <div class="log-header">
         <h2>📋 Log de execução</h2>
+        <button class="btn-limpar" onclick="copiarLog()" id="btn-copiar-log">Copiar</button>
         <button class="btn-limpar" onclick="limparLog()">Limpar</button>
       </div>
       <div class="log-area" id="log-area">
@@ -462,6 +547,13 @@
       btnAuth.className = 'btn-sec btn-auth';
       btnAuth.textContent = '🔐 Autenticar UpSeller';
     }
+
+    if (data.versao) {
+      const el = document.getElementById('nav-versao');
+      if (el) el.textContent = 'v' + data.versao;
+    }
+
+    _setBotoes(data.rodando);
   }
 
   function toggleSenha() {
@@ -486,7 +578,8 @@
         upseller_senha:  document.getElementById('senha').value,
         horarios:        _horarios,
         etapas:          _etapas,
-        nome_impressora: document.getElementById('nome_impressora').value,
+        nome_impressora:         document.getElementById('nome_impressora').value,
+        auto_imprimir_etiquetas: document.getElementById('auto_imprimir_etiquetas').checked,
       })
     });
     const data = await resp.json();
@@ -508,6 +601,34 @@
       const el = document.getElementById(id);
       if (el) el.disabled = disabled;
     });
+    // Parar: habilitado enquanto rodando, desabilitado quando parado
+    const parar = document.getElementById('btn-parar');
+    if (parar) parar.disabled = !disabled;
+  }
+
+  async function pararRobo() {
+    const btn = document.getElementById('btn-parar');
+    btn.disabled = true;
+    btn.textContent = '⏹️ Parando...';
+    await fetch('/parar', { method: 'POST' });
+  }
+
+  async function reiniciarRobo() {
+    if (!confirm('Reiniciar o robô? A execução atual será interrompida.')) return;
+    const btn = document.getElementById('btn-reiniciar');
+    btn.disabled = true;
+    btn.textContent = '🔄 Reiniciando...';
+    try { await fetch('/reiniciar', { method: 'POST' }); } catch(e){}
+    setTimeout(() => location.reload(), 3500);
+  }
+
+  async function atualizarRobo() {
+    const btn = document.getElementById('btn-atualizar');
+    btn.disabled = true;
+    btn.textContent = '⬆️ Verificando...';
+    try { await fetch('/atualizar', { method: 'POST' }); } catch(e){}
+    // Se houver atualização, o servidor vai reiniciar — recarrega após 6s
+    setTimeout(() => { btn.disabled = false; btn.textContent = '⬆️ Atualizar'; location.reload(); }, 6000);
   }
 
   async function executar(modo) {
@@ -576,6 +697,37 @@
 
   function limparLog() { document.getElementById('log-area').innerHTML = ''; }
 
+  async function salvarAutoImprimir() {
+    const val = document.getElementById('auto_imprimir_etiquetas').checked;
+    await fetch('/salvar-config-parcial', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ auto_imprimir_etiquetas: val })
+    });
+  }
+
+  function copiarLog() {
+    const linhas = document.getElementById('log-area').innerText;
+    const btn = document.getElementById('btn-copiar-log');
+    const orig = btn.textContent;
+    const ok = () => { btn.textContent = 'Copiado!'; setTimeout(() => btn.textContent = orig, 1500); };
+    const fail = () => {
+      // Fallback: cria textarea temporário e execCommand
+      const ta = document.createElement('textarea');
+      ta.value = linhas;
+      ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); ok(); } catch(e) { btn.textContent = 'Erro'; setTimeout(() => btn.textContent = orig, 1500); }
+      document.body.removeChild(ta);
+    };
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(linhas).then(ok).catch(fail);
+    } else {
+      fail();
+    }
+  }
+
   // ── Autenticar ───────────────────────────────────────────────────────────
   async function autenticarUpseller() {
     const btn = document.getElementById('btn-auth');
@@ -630,6 +782,42 @@
   function copiarCmd() {
     navigator.clipboard.writeText(document.getElementById('pmset-cmd').textContent)
       .then(() => { const el = document.getElementById('pmset-cmd'); el.style.color='#FCD34D'; setTimeout(()=>el.style.color='',1000); });
+  }
+
+  // ── Supabase privado ──────────────────────────────────────────────────────
+  async function testarSupabase() {
+    const url = document.getElementById('supabase_url').value.trim();
+    const key = document.getElementById('supabase_key').value.trim();
+    if (!url || !key) { adicionarLog('⚠️ Preencha a URL e a chave do Supabase', 'erro'); return; }
+    adicionarLog('🔌 Testando conexão...', 'info');
+    const r = await fetch('/testar-supabase', { method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({supabase_url:url, supabase_key:key}) });
+    const d = await r.json();
+    adicionarLog(d.ok ? d.msg : `❌ ${d.erro}`, d.ok ? 'ok' : 'erro');
+  }
+
+  async function migrarSupabase() {
+    const url = document.getElementById('supabase_url').value.trim();
+    const key = document.getElementById('supabase_key').value.trim();
+    if (!url || !key) { adicionarLog('⚠️ Preencha a URL e a chave antes de migrar', 'erro'); return; }
+    if (!confirm('Isso irá copiar todos os pedidos para o seu Supabase e ativar o banco privado. Continuar?')) return;
+    adicionarLog('📦 Migrando dados... acompanhe o log abaixo', 'info');
+    const r = await fetch('/migrar-supabase', { method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({supabase_url:url, supabase_key:key}) });
+    const d = await r.json();
+    adicionarLog(d.ok ? d.msg : `❌ ${d.erro}`, d.ok ? 'ok' : 'erro');
+    // Salva no config após confirmar migração
+    if (d.ok) await fetch('/salvar-config-parcial', { method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({supabase_url:url, supabase_key:key}) });
+  }
+
+  async function backfillRetroativo() {
+    const dias = parseInt(document.getElementById('backfill-dias').value) || 2;
+    adicionarLog(`🔄 Importando pedidos dos últimos ${dias} dias...`, 'info');
+    const r = await fetch('/importar-retroativo', { method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({dias}) });
+    const d = await r.json();
+    adicionarLog(d.ok ? d.msg : `❌ ${d.erro}`, d.ok ? 'ok' : 'erro');
   }
 </script>
 </body>
