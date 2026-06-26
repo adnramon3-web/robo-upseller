@@ -52,6 +52,13 @@ _template_dir = PASTA_RAIZ / "templates"
 app = Flask(__name__, template_folder=str(_template_dir))
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 
+@app.after_request
+def _add_cors_global(response):
+    response.headers["Access-Control-Allow-Origin"]  = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    return response
+
 _ignorar_paths = {"/", "/status", "/log", "/log-stream", "/favicon.ico"}
 
 @app.before_request
