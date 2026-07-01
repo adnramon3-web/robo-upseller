@@ -1,4 +1,4 @@
 {
-  "version": "1.5.90",
-  "descricao": "margem: stdlib puro (re+zlib), sem pypdf — injeta cm nos content streams"
+  "version": "1.5.91",
+  "descricao": "margem padrao reduzida 8mm -> 4mm (ficou grande demais)"
 }

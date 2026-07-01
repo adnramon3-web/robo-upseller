@@ -2618,8 +2618,8 @@ def servir_etiqueta(order_number):
     )
     log(f"[etiqueta] 📄 {order_number} | impressora={impressora_usar or '(padrão)'} | tem_impressora={tem_impressora} | sistema={sistema}")
 
-    margem_topo_mm = float(config.get("margem_topo_mm", 8) or 0)
-    margem_esq_mm  = float(config.get("margem_esq_mm",  8) or 0)
+    margem_topo_mm = float(config.get("margem_topo_mm", 4) or 0)
+    margem_esq_mm  = float(config.get("margem_esq_mm",  4) or 0)
 
     if tem_impressora:
         try:
