@@ -2041,6 +2041,39 @@ def _corrigir_mediabox(pdf_path: "Path") -> "Path":
         return pdf_path
 
 
+def _adicionar_margem_topo(pdf_path: "Path", mm: float) -> "Path":
+    """Expande o MediaBox no topo em `mm` milímetros.
+    O conteúdo não muda de posição — o espaço em branco extra no topo faz o
+    SumatraPDF (fit) deslocar o conteúdo para baixo ao imprimir."""
+    if mm <= 0:
+        return pdf_path
+    try:
+        from pypdf import PdfReader, PdfWriter
+        from pypdf.generic import ArrayObject, FloatObject
+        out = pdf_path.with_stem(pdf_path.stem + "_m")
+        if out.exists():
+            return out
+        pt = mm * 72 / 25.4  # mm → points
+        reader = PdfReader(str(pdf_path))
+        writer = PdfWriter()
+        page = reader.pages[0]
+        mb = page.mediabox
+        page.mediabox = ArrayObject([
+            FloatObject(float(mb.left)),
+            FloatObject(float(mb.bottom)),
+            FloatObject(float(mb.right)),
+            FloatObject(float(mb.top) + pt),
+        ])
+        writer.add_page(page)
+        with open(str(out), "wb") as f:
+            writer.write(f)
+        log(f"[etiqueta] 📐 margem topo {mm}mm adicionada → {out.name}")
+        return out
+    except Exception as e:
+        log(f"[etiqueta] ⚠️ _adicionar_margem_topo: {e}")
+        return pdf_path
+
+
 def _obter_sumatra() -> "Path | None":
     """Retorna path do SumatraPDF.exe — baixa portátil se não encontrar."""
     import shutil
@@ -2355,9 +2388,12 @@ def servir_etiqueta(order_number):
     )
     log(f"[etiqueta] 📄 {order_number} | impressora={impressora_usar or '(padrão)'} | tem_impressora={tem_impressora} | sistema={sistema}")
 
+    margem_topo_mm = float(config.get("margem_topo_mm", 3) or 0)
+
     if tem_impressora:
         try:
             pdf_imprimir = _corrigir_mediabox(pdf_path)
+            pdf_imprimir = _adicionar_margem_topo(pdf_imprimir, margem_topo_mm)
             log(f"[etiqueta] 📐 {order_number} | pdf={pdf_imprimir.name} | tamanho={pdf_imprimir.stat().st_size}B")
             if sistema == "Darwin":
                 cmd = ["lp", "-d", impressora_usar, str(pdf_imprimir)] if impressora_usar else ["lp", str(pdf_imprimir)]

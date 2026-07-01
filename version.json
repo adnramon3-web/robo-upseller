@@ -1,4 +1,4 @@
 {
-  "version": "1.5.79",
-  "descricao": "fix impressao dupla: robo responde -> PCP nao abre browser; timeout 12s; SumatraPDF pre-download no startup; log detalhado de erros"
+  "version": "1.5.80",
+  "descricao": "margem topo configuravel (default 3mm) para compensar corte no inicio da etiqueta termica"
 }
