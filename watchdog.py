@@ -222,6 +222,21 @@ def wd_atualizar():
                 urllib.request.urlretrieve(f"{BASE}/{arq}", str(dest))
             except Exception:
                 pass
+        # Instala/atualiza dependências após download
+        req_file = PASTA_RAIZ / "requirements.txt"
+        if req_file.exists():
+            try:
+                urllib.request.urlretrieve(f"{BASE}/requirements.txt", str(req_file))
+            except Exception:
+                pass
+            try:
+                import subprocess
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "-r", str(req_file), "-q"],
+                    timeout=120, capture_output=True
+                )
+            except Exception:
+                pass
         time.sleep(1)
         _iniciar_robo()
 

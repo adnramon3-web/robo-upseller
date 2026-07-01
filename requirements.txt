@@ -4,3 +4,4 @@ playwright>=1.40
 openpyxl>=3.1
 pyinstaller>=6.0
 python-dotenv>=1.0
+pypdf>=3.0

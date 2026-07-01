@@ -1,4 +1,4 @@
 {
-  "version": "1.5.88",
-  "descricao": "etiqueta: margem centralizada em todos os lados — corrige rotacao 90 Shein/Shopee"
+  "version": "1.5.89",
+  "descricao": "fix root cause: pypdf ausente no requirements — margem nunca foi aplicada"
 }

@@ -2044,7 +2044,13 @@ def _adicionar_margem_topo(pdf_path: "Path", topo_mm: float, esq_mm: float = 0.0
     if topo_mm <= 0 and esq_mm <= 0:
         return pdf_path
     try:
-        from pypdf import PdfReader, PdfWriter, Transformation
+        try:
+            from pypdf import PdfReader, PdfWriter, Transformation
+        except ImportError:
+            import subprocess as _sp
+            _sp.run([sys.executable, "-m", "pip", "install", "pypdf>=3.0", "-q"],
+                    timeout=90, capture_output=True)
+            from pypdf import PdfReader, PdfWriter, Transformation
         t_tag = str(topo_mm).replace(".", "_")
         e_tag = str(esq_mm).replace(".", "_")
         out = pdf_path.with_stem(pdf_path.stem + f"_mc{t_tag}x{e_tag}")
