@@ -2037,35 +2037,40 @@ def _corrigir_mediabox(pdf_path: "Path") -> "Path":
 
 
 def _adicionar_margem_topo(pdf_path: "Path", topo_mm: float, esq_mm: float = 0.0) -> "Path":
-    """Cria uma nova página maior e coloca o conteúdo original deslocado para dentro,
-    compensando o corte físico da impressora Elgin.
-    - topo_mm: espaço extra no topo  → conteúdo desce na impressão
-    - esq_mm : espaço extra à esquerda → conteúdo vai para a direita
-    Os valores ficam no nome do cache; mudar config invalida automaticamente."""
+    """Escala o conteúdo para dentro da página centralizando, criando margem branca
+    real em todos os lados. Funciona independente do /Rotate do PDF (Shein/Shopee
+    têm rotação de 90° que invertia a direção das tentativas anteriores).
+    Toda a informação é preservada — apenas ligeiramente menor."""
     if topo_mm <= 0 and esq_mm <= 0:
         return pdf_path
     try:
         from pypdf import PdfReader, PdfWriter, Transformation
         t_tag = str(topo_mm).replace(".", "_")
         e_tag = str(esq_mm).replace(".", "_")
-        out = pdf_path.with_stem(pdf_path.stem + f"_mg{t_tag}x{e_tag}")
+        out = pdf_path.with_stem(pdf_path.stem + f"_mc{t_tag}x{e_tag}")
         if out.exists():
             return out
-        pt_topo = topo_mm * 72 / 25.4
-        pt_esq  = esq_mm  * 72 / 25.4
+        pt_margin = max(topo_mm, esq_mm) * 72 / 25.4  # margem uniforme em todos os lados
         reader = PdfReader(str(pdf_path))
         orig   = reader.pages[0]
         w = float(orig.mediabox.width)
         h = float(orig.mediabox.height)
-        writer   = PdfWriter()
-        # Página em branco maior; conteúdo deslocado pt_esq para a direita
-        # O espaço extra no topo fica vazio — SumatraPDF (fit) encolhe tudo e
-        # o conteúdo aparece mais abaixo/direita no papel físico
-        new_page = writer.add_blank_page(w + pt_esq, h + pt_topo)
-        new_page.merge_transformed_page(orig, Transformation().translate(tx=pt_esq, ty=0))
+        # Escala para caber com margem em todos os 4 lados
+        scale = min((w - 2 * pt_margin) / w, (h - 2 * pt_margin) / h)
+        scale = max(0.5, min(0.99, scale))
+        # Centraliza o conteúdo escalado dentro da página original
+        tx = w * (1 - scale) / 2
+        ty = h * (1 - scale) / 2
+        orig.add_transformation(
+            Transformation().scale(scale, scale).translate(tx=tx, ty=ty)
+        )
+        if "/CropBox" in orig:
+            del orig["/CropBox"]
+        writer = PdfWriter()
+        writer.add_page(orig)
         with open(str(out), "wb") as f:
             writer.write(f)
-        log(f"[etiqueta] 📐 margem topo={topo_mm}mm esq={esq_mm}mm → {out.name}")
+        log(f"[etiqueta] 📐 margem={pt_margin/2.835:.1f}mm escala={scale:.3f} tx={tx:.1f} ty={ty:.1f} → {out.name}")
         return out
     except Exception as e:
         log(f"[etiqueta] ⚠️ _adicionar_margem_topo: {e}")
