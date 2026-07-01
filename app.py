@@ -23,7 +23,8 @@ from supabase import create_client
 
 # ── Configurações ─────────────────────────────────────────────────────────────
 SUPABASE_URL = "https://qaqlaqlxxeilouvbwgiv.supabase.co"
-SUPABASE_KEY = "sb_publishable_D0C2IC4Cxmtmu2crnFYXxw_JggkMuNS"
+SUPABASE_KEY         = "sb_publishable_D0C2IC4Cxmtmu2crnFYXxw_JggkMuNS"
+SUPABASE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFhcWxhcWx4eGVpbG91dmJ3Z2l2Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NzAyNTQ1MSwiZXhwIjoyMDkyNjAxNDUxfQ.X8wGOgOsxxoUlCAh5XYdpPtzhMyUnKykiyFYxlfu2mo"
 
 def _supa() -> tuple[str, str]:
     """Retorna (url, key) — usa Supabase privado do cliente se configurado."""
@@ -72,6 +73,7 @@ def _log_req():
 log_queue        = queue.Queue()
 rodando          = False
 _pos_import_ativo = False             # captura/NF-e/envio rodando após import (não bloqueia PCP)
+_etapa_atual     = ""                 # etapa visível no PCP
 _parar           = threading.Event()  # sinaliza parada solicitada pelo usuário
 _captura_lock    = threading.Lock()   # evita duas capturas simultâneas
 _capturar_skip   = set()              # pedidos com URL inválida nesta sessão (background ignora)
@@ -313,16 +315,17 @@ async def _backfill_historico(config: dict, dias: int):
 
         if on not in pedidos_dict:
             pedidos_dict[on] = {
-                "order_number": on,
-                "sku":          (first.get("variationSku") or first.get("productSku") or "").strip(),
-                "product_name": (first.get("productName") or "").strip(),
-                "image_url":    (first.get("productImg")  or "").strip(),
-                "data":         data_pedido,
-                "quantidade":   qtd_total,
-                "plataforma":   plataforma,
-                "valor":        valor,
-                "cliente":      token,
-                "label_url":    api_label_url,
+                "order_number":      on,
+                "numero_plataforma": (order.get("orderId") or order.get("extendedId") or "").strip() or None,
+                "sku":               (first.get("variationSku") or first.get("productSku") or "").strip(),
+                "product_name":      (first.get("productName") or "").strip(),
+                "image_url":         (first.get("productImg")  or "").strip(),
+                "data":              data_pedido,
+                "quantidade":        qtd_total,
+                "plataforma":        plataforma,
+                "valor":             valor,
+                "cliente":           token,
+                "label_url":         api_label_url,
             }
 
     # Filtra só os que não estão no Supabase
@@ -344,7 +347,7 @@ async def _backfill_historico(config: dict, dias: int):
     # Insere em lotes com tratamento de erro por coluna
     inseridos = 0
     erros = 0
-    COLUNAS_OPCIONAIS = {"plataforma", "valor", "label_url"}
+    COLUNAS_OPCIONAIS = {"plataforma", "valor", "label_url", "numero_plataforma"}
     for i in range(0, len(faltando), 50):
         lote_orig = faltando[i:i + 50]
         excluir: set = set()
@@ -413,19 +416,21 @@ def migrar_supabase():
             # 1. Cria tabelas via RPC (SQL direto) —————————————————————————
             SQL_SETUP = """
 CREATE TABLE IF NOT EXISTS pedidos (
-    id          BIGSERIAL PRIMARY KEY,
-    order_number TEXT UNIQUE NOT NULL,
-    sku         TEXT,
-    product_name TEXT,
-    image_url   TEXT,
-    data        DATE,
-    criado_em   TIMESTAMPTZ DEFAULT NOW(),
-    cliente     TEXT,
-    quantidade  INTEGER DEFAULT 1,
-    plataforma  TEXT,
-    valor       NUMERIC,
-    label_url   TEXT
+    id               BIGSERIAL PRIMARY KEY,
+    order_number     TEXT UNIQUE NOT NULL,
+    numero_plataforma TEXT,
+    sku              TEXT,
+    product_name     TEXT,
+    image_url        TEXT,
+    data             DATE,
+    criado_em        TIMESTAMPTZ DEFAULT NOW(),
+    cliente          TEXT,
+    quantidade       INTEGER DEFAULT 1,
+    plataforma       TEXT,
+    valor            NUMERIC,
+    label_url        TEXT
 );
+ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS numero_plataforma TEXT;
 
 CREATE TABLE IF NOT EXISTS pedido_itens (
     id           BIGSERIAL PRIMARY KEY,
@@ -539,6 +544,20 @@ def executar():
             args=(config, data_inicio, data_fim),
             daemon=True
         ).start()
+    elif modo == "datas":
+        datas = request.json.get("datas", [])
+        if not datas:
+            return _cors(jsonify({"ok": False, "erro": "Nenhuma data informada"}))
+        def _rodar_multiplas(cfg, lista_datas):
+            for ds in lista_datas:
+                try:
+                    alvo = date.fromisoformat(ds)
+                except ValueError:
+                    continue
+                ini = datetime.combine(alvo, datetime.min.time())
+                fim = datetime.combine(alvo, datetime.max.time()).replace(microsecond=0)
+                _rodar_em_thread(cfg, ini, fim)
+        threading.Thread(target=_rodar_multiplas, args=(config, datas), daemon=True).start()
     else:  # hoje
         data_inicio = agora.replace(hour=0, minute=0, second=0, microsecond=0)
         data_fim    = agora.replace(microsecond=0)
@@ -923,7 +942,8 @@ def status():
         "proxima":        proxima,
         "nome_impressora": config.get("nome_impressora", ""),
         "auto_imprimir":  config.get("auto_imprimir", False),
-        "rodando":     rodando,
+        "rodando":     rodando or _pos_import_ativo,
+        "etapa":       _etapa_atual,
         "sessao_ok":   sessao_ok,
         "versao":      versao,
     })
@@ -1126,17 +1146,44 @@ def _upload_etiqueta_supabase(pdf_path: Path, order_number: str) -> str | None:
     """Faz upload do PDF para Supabase Storage e retorna a URL pública permanente.
     Retorna None em caso de falha — o fallback local continua funcionando.
     """
+    for tentativa in range(2):
+        try:
+            supa = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+            caminho = f"etiquetas/etiqueta_{order_number}.pdf"
+            supa.storage.from_("robo-upseller").upload(
+                caminho,
+                pdf_path.read_bytes(),
+                {"content-type": "application/pdf", "upsert": "true"},
+            )
+            return f"{SUPABASE_STORAGE_URL}/{caminho}"
+        except Exception as e:
+            if tentativa == 1:
+                log(f"[storage] ⚠️ Upload {order_number} falhou: {e}")
+    return None
+
+
+def _limpar_etiquetas_storage(dias: int = 7):
+    """Apaga do Supabase Storage etiquetas com mais de N dias."""
     try:
-        supa = create_client(*_supa())
-        caminho = f"etiquetas/etiqueta_{order_number}.pdf"
-        supa.storage.from_("robo-upseller").upload(
-            caminho,
-            pdf_path.read_bytes(),
-            {"content-type": "application/pdf", "upsert": "true"},
-        )
-        return f"{SUPABASE_STORAGE_URL}/{caminho}"
-    except Exception:
-        return None
+        from datetime import timezone
+        supa = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        arquivos = supa.storage.from_("robo-upseller").list("etiquetas", {"limit": 1000})
+        limite = datetime.now(timezone.utc) - timedelta(days=dias)
+        apagar = []
+        for f in arquivos:
+            criado_str = f.get("created_at") or f.get("updated_at") or ""
+            if not criado_str:
+                continue
+            criado = datetime.fromisoformat(criado_str.replace("Z", "+00:00"))
+            if criado < limite:
+                apagar.append(f"etiquetas/{f['name']}")
+        if apagar:
+            supa.storage.from_("robo-upseller").remove(apagar)
+            log(f"[storage] 🗑️ {len(apagar)} etiqueta(s) antigas removidas do Storage (>{dias} dias)")
+        else:
+            log(f"[storage] ✅ Nenhuma etiqueta com mais de {dias} dias")
+    except Exception as e:
+        log(f"[storage] ⚠️ Erro na limpeza: {e}")
 
 
 def _atualizar_supabase_com_pdfs_locais(token: str):
@@ -1154,8 +1201,9 @@ def _atualizar_supabase_com_pdfs_locais(token: str):
             # Tenta URL pública Supabase Storage; fallback para localhost se upload falhar
             url_publica = _upload_etiqueta_supabase(pdf, on)
             label_url = url_publica or f"http://127.0.0.1:5001/etiqueta/{on}"
+            # Sempre atualiza — sem condição .is_null para não perder PDFs que já existem
             supa.table("pedidos").update({"label_url": label_url}) \
-                .eq("order_number", on).is_("label_url", "null").execute()
+                .eq("order_number", on).execute()
             atualizados += 1
         if atualizados:
             log(f"[import] 🔗 Supabase: {atualizados} etiqueta(s) sincronizadas")
@@ -1189,11 +1237,11 @@ def _atualizar_json_com_urls_robot(token: str):
 def _pos_import(config: dict):
     """Etapas executadas após qualquer import, respeitando os toggles em config['etapas'].
     Ordem: captura etiquetas prontas → picklist → NF-e → Envio → captura novas"""
-    global _picklist_hoje
+    global _picklist_hoje, _etapa_atual
     etapas = config.get("etapas", {})
 
     # 1. Sincroniza PDFs em disco com Supabase e captura o que já está em Para Imprimir
-    #    (feito ANTES da picklist para que o PCP já veja etiquetas disponíveis)
+    _etapa_atual = "Capturando etiquetas..."
     _atualizar_supabase_com_pdfs_locais(config.get("token", ""))
     log("━━ Capturando etiquetas já prontas ━━")
     _executar_captura(config, aguardar=False)
@@ -1203,11 +1251,12 @@ def _pos_import(config: dict):
         log("⏹️ Execução cancelada pelo usuário")
         return
 
-    # 2. Picklist — gerada DEPOIS da captura inicial para incluir etiquetas já disponíveis
+    # 2. Picklist
     if etapas.get("picklist", True):
         chave_pick = f"{date.today()}_pick"
         if chave_pick not in _picklist_hoje:
             _picklist_hoje.add(chave_pick)
+            _etapa_atual = "Gerando picklist..."
             log("━━ Imprimindo picklist ━━")
             asyncio.run(_imprimir_picklist_playwright(config))
         else:
@@ -1217,8 +1266,9 @@ def _pos_import(config: dict):
         log("⏹️ Execução cancelada pelo usuário")
         return
 
-    # 3. Emite NF-e em loop até Para Emitir esvaziar
+    # 3. Emite NF-e
     if etapas.get("nfe", True):
+        _etapa_atual = "Emitindo NF-e..."
         log("━━ Emitindo NF-e em massa ━━")
         asyncio.run(_emitir_nfe_massa_playwright(config))
 
@@ -1226,8 +1276,9 @@ def _pos_import(config: dict):
         log("⏹️ Execução cancelada pelo usuário")
         return
 
-    # 4. Programa envio em loop até Para Enviar esvaziar
+    # 4. Programa envio
     if etapas.get("envio", True):
+        _etapa_atual = "Programando envio..."
         log("━━ Programando envio ━━")
         asyncio.run(_programar_envio_playwright(config))
 
@@ -1235,16 +1286,18 @@ def _pos_import(config: dict):
         log("⏹️ Execução cancelada pelo usuário")
         return
 
-    # 5. Captura etiquetas que chegaram após NF-e+Envio (aguarda até 60s se Para Imprimir vazio)
+    # 5. Captura etiquetas novas pós NF-e+Envio
+    _etapa_atual = "Capturando etiquetas novas..."
     log("━━ Capturando etiquetas novas ━━")
     _executar_captura(config, aguardar=True)
     _atualizar_json_com_urls_robot(config.get("token", ""))
 
 
 def _rodar_em_thread(config: dict, data_inicio: datetime, data_fim: datetime):
-    global rodando, _pos_import_ativo
+    global rodando, _pos_import_ativo, _etapa_atual
     rodando = True
     _pos_import_ativo = True
+    _etapa_atual = "Importando pedidos..."
     _parar.clear()
     _capturar_skip.clear()
     # Aguarda o background capturar fechar o Chrome antes de abrir o Excel
@@ -1270,7 +1323,14 @@ def _rodar_em_thread(config: dict, data_inicio: datetime, data_fim: datetime):
                 if sucesso:
                     extrair(config, data_fim.date())
 
+        # Limpeza de etiquetas antigas no Storage (só na rodada das 6h)
+        from datetime import time as _time
+        if datetime.now().time() < _time(7, 0):
+            _etapa_atual = "Limpando etiquetas antigas..."
+            _limpar_etiquetas_storage(dias=7)
+
         # Pedidos que já têm PDF em disco: marca label_url no Supabase antes de liberar o PCP
+        _etapa_atual = "Sincronizando etiquetas..."
         _atualizar_supabase_com_pdfs_locais(config.get("token", ""))
 
         # Import concluído — PCP já pode carregar pedidos e imprimir etiquetas disponíveis
@@ -1281,9 +1341,11 @@ def _rodar_em_thread(config: dict, data_inicio: datetime, data_fim: datetime):
         _pos_import(config)
     except Exception as e:
         log(f"❌ Erro inesperado: {e}")
+        _etapa_atual = ""
     finally:
         rodando = False
         _pos_import_ativo = False
+        _etapa_atual = ""
 
 
 def _rodar_em_thread_duplo(config: dict,
@@ -2007,10 +2069,10 @@ def _imprimir_windows(pdf_path: "Path", impressora: str) -> bool:
     if sumatra:
         if impressora:
             cmd = [str(sumatra), "-print-to", impressora,
-                   "-print-settings", "shrink,color", str(pdf_path)]
+                   "-print-settings", "fit,color", str(pdf_path)]
         else:
             cmd = [str(sumatra), "-print-to-default",
-                   "-print-settings", "shrink,color", str(pdf_path)]
+                   "-print-settings", "fit,color", str(pdf_path)]
         try:
             subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW, timeout=60)
             return True
@@ -2031,25 +2093,61 @@ def _imprimir_windows(pdf_path: "Path", impressora: str) -> bool:
 # ── Verificação de impressora ─────────────────────────────────────────────────
 
 def _verificar_impressora() -> bool:
-    """Retorna True se houver impressora padrão configurada no sistema."""
+    """Retorna True se houver impressora configurada no sistema."""
     try:
         if platform.system() == "Darwin":
+            # Verifica impressora padrão
             r = subprocess.run(["lpstat", "-d"], capture_output=True, text=True, timeout=5)
-            # lpstat -d retorna "destino padrão do sistema: NomeDaImpressora"
-            # Se não há impressora: "nenhum destino padrão..." ou "no system default..."
             output = r.stdout.strip()
-            sem_impressora = ("nenhum" in output.lower() or "no system default" in output.lower() or not output)
-            return r.returncode == 0 and not sem_impressora
+            sem_default = ("nenhum" in output.lower() or "no system default" in output.lower() or not output)
+            if r.returncode == 0 and not sem_default:
+                return True
+            # Fallback: qualquer impressora configurada no sistema (mesmo sem ser padrão)
+            r2 = subprocess.run(["lpstat", "-a"], capture_output=True, text=True, timeout=5)
+            return r2.returncode == 0 and bool(r2.stdout.strip())
         elif platform.system() == "Windows":
-            r = subprocess.run(
+            # PowerShell — mais confiável que wmic no Windows 10/11
+            try:
+                ps = "(Get-Printer | Where-Object {$_.PrinterStatus -ne 'Offline'} | Measure-Object).Count"
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                    capture_output=True, text=True, timeout=10,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                if r.returncode == 0 and r.stdout.strip().isdigit() and int(r.stdout.strip()) > 0:
+                    return True
+            except Exception:
+                pass
+            # Fallback: wmic (Windows 10 ou anterior)
+            r2 = subprocess.run(
                 ["wmic", "printer", "where", "Default=TRUE", "get", "Name"],
                 capture_output=True, text=True, timeout=5,
             )
-            lines = [l.strip() for l in r.stdout.splitlines() if l.strip() and l.strip() != "Name"]
+            lines = [l.strip() for l in r2.stdout.splitlines() if l.strip() and l.strip() != "Name"]
             return len(lines) > 0
     except Exception:
         pass
     return False
+
+
+def _nome_impressora_padrao() -> str:
+    """Retorna o nome da primeira impressora disponível no sistema (para usar com lp -d)."""
+    try:
+        if platform.system() == "Darwin":
+            r = subprocess.run(["lpstat", "-d"], capture_output=True, text=True, timeout=5)
+            output = r.stdout.strip()
+            if output and "nenhum" not in output.lower() and "no system default" not in output.lower():
+                # "destino padrão do sistema: NomeDaImpressora"
+                partes = output.split(":")
+                if len(partes) > 1:
+                    return partes[-1].strip()
+            # Pega a primeira impressora listada
+            r2 = subprocess.run(["lpstat", "-a"], capture_output=True, text=True, timeout=5)
+            if r2.stdout.strip():
+                return r2.stdout.strip().split()[0]
+    except Exception:
+        pass
+    return ""
 
 
 # ── Playwright: imprimir picklist ────────────────────────────────────────────
@@ -2249,25 +2347,34 @@ def servir_etiqueta(order_number):
 
     # Tenta imprimir direto; se não conseguir, serve o PDF para o browser
     sistema = platform.system()
-    tem_impressora = _verificar_impressora()
-    log(f"[etiqueta] 📄 {order_number} | impressora={nome_impressora or '(padrão)'} | tem_impressora={tem_impressora} | sistema={sistema}")
+    # Se nome_impressora configurado manualmente, assume que existe sem detecção automática
+    tem_impressora = bool(nome_impressora) or _verificar_impressora()
+    # Resolve o nome da impressora a usar (configurado > padrão do sistema)
+    impressora_usar = nome_impressora or (
+        _nome_impressora_padrao() if sistema == "Darwin" else ""
+    )
+    log(f"[etiqueta] 📄 {order_number} | impressora={impressora_usar or '(padrão)'} | tem_impressora={tem_impressora} | sistema={sistema}")
 
     if tem_impressora:
         try:
             pdf_imprimir = _corrigir_mediabox(pdf_path)
             log(f"[etiqueta] 📐 {order_number} | pdf={pdf_imprimir.name} | tamanho={pdf_imprimir.stat().st_size}B")
             if sistema == "Darwin":
-                cmd = ["lp", "-d", nome_impressora, str(pdf_imprimir)] if nome_impressora else ["lp", str(pdf_imprimir)]
-                subprocess.run(cmd, timeout=30, check=True)
-                log(f"[etiqueta] 🖨️ {order_number} → {nome_impressora or 'impressora padrão'}")
+                cmd = ["lp", "-d", impressora_usar, str(pdf_imprimir)] if impressora_usar else ["lp", str(pdf_imprimir)]
+                log(f"[etiqueta] 🔄 {order_number} → lp cmd: {' '.join(cmd)}")
+                result = subprocess.run(cmd, timeout=30, capture_output=True, text=True)
+                if result.returncode != 0:
+                    raise RuntimeError(f"lp falhou (code {result.returncode}): {result.stderr.strip()}")
+                log(f"[etiqueta] 🖨️ {order_number} → {impressora_usar or 'impressora padrão'}")
             elif sistema == "Windows":
-                _imprimir_windows(pdf_imprimir, nome_impressora)
-                log(f"[etiqueta] 🖨️ {order_number} → {nome_impressora or 'impressora padrão'}")
-            r = jsonify({"ok": True, "impresso": True, "impressora": nome_impressora})
+                log(f"[etiqueta] 🔄 {order_number} → SumatraPDF → {impressora_usar or 'padrão'}")
+                _imprimir_windows(pdf_imprimir, impressora_usar)
+                log(f"[etiqueta] 🖨️ {order_number} → {impressora_usar or 'impressora padrão'}")
+            r = jsonify({"ok": True, "impresso": True, "impressora": impressora_usar})
             r.headers["Access-Control-Allow-Origin"] = "*"
             return r
         except Exception as e:
-            log(f"[etiqueta] ⚠️ Erro ao imprimir: {e} — servindo PDF")
+            log(f"[etiqueta] ⚠️ Erro ao imprimir: {e!r} — abrindo PDF no viewer")
 
     # Sem impressora: abre o PDF no sistema e retorna JSON para PCP confirmar
     log(f"[etiqueta] 📋 {order_number} — abrindo PDF no sistema (sem impressora)")
@@ -2317,10 +2424,20 @@ async def _sincronizar_pedidos_novos_supabase(page, order_numbers: list, config:
         r = supa.table("pedidos").select("order_number").in_("order_number", order_numbers).execute()
         existentes = {row["order_number"] for row in (r.data or [])}
         faltando = [on for on in order_numbers if on not in existentes]
-        if not faltando:
+
+        # Existentes sem numero_plataforma (para backfill)
+        sem_num: set = set()
+        if existentes:
+            r2 = supa.table("pedidos").select("order_number").in_("order_number", list(existentes)).is_("numero_plataforma", "null").execute()
+            sem_num = {row["order_number"] for row in (r2.data or [])}
+
+        if not faltando and not sem_num:
             return
 
-        log(f"[capturar] 📥 {len(faltando)} pedido(s) novos — importando para Supabase...")
+        if faltando:
+            log(f"[capturar] 📥 {len(faltando)} pedido(s) novos — importando para Supabase...")
+        if sem_num:
+            log(f"[capturar] 🔢 {len(sem_num)} pedido(s) sem numero_plataforma — atualizando...")
 
         PLAT = {"shopee": "Shopee", "shein": "Shein", "mercado": "Mercado Livre",
                 "tiktok": "TikTok", "kwai": "Kwai"}
@@ -2344,47 +2461,58 @@ async def _sincronizar_pedidos_novos_supabase(page, order_numbers: list, config:
             return todos;
         }""")
 
-        novos_pedidos = []
-        novos_itens   = []
+        novos_pedidos  = []
+        novos_itens    = []
+        atualizar_num  = []
         for order in all_orders:
             on = (order.get("orderNumber") or "").strip()
-            if on not in faltando:
-                continue
-            items = order.get("orderItemList") or []
-            first = items[0] if items else {}
-            plat  = PLAT.get((order.get("platform") or "").lower(), order.get("platform") or "")
-            try:
-                valor = float(order.get("orderAmount") or 0) or None
-            except Exception:
-                valor = None
-            qtd = sum(int(i.get("productCount") or 1) for i in items) or 1
-            novos_pedidos.append({
-                "order_number": on,
-                "sku":          (first.get("variationSku") or first.get("productSku") or "").strip(),
-                "product_name": (first.get("productName") or "").strip(),
-                "image_url":    (first.get("productImg")  or "").strip(),
-                "quantidade":   qtd,
-                "plataforma":   plat,
-                "valor":        valor,
-                "data":         hoje,
-                "cliente":      token,
-                "label_url":    None,
-            })
-            for item in items:
-                novos_itens.append({
-                    "order_number": on,
-                    "sku":          (item.get("variationSku") or item.get("productSku") or "").strip(),
-                    "product_name": (item.get("productName") or "").strip(),
-                    "image_url":    (item.get("productImg")  or "").strip(),
-                    "quantidade":   int(item.get("productCount") or 1),
-                    "cliente":      token,
-                    "data":         hoje,
+            num_plat = str(order.get("orderId") or order.get("extendedId") or "") or None
+            if on in faltando:
+                items = order.get("orderItemList") or []
+                first = items[0] if items else {}
+                plat  = PLAT.get((order.get("platform") or "").lower(), order.get("platform") or "")
+                try:
+                    valor = float(order.get("orderAmount") or 0) or None
+                except Exception:
+                    valor = None
+                qtd = sum(int(i.get("productCount") or 1) for i in items) or 1
+                novos_pedidos.append({
+                    "order_number":      on,
+                    "numero_plataforma": num_plat,
+                    "sku":               (first.get("variationSku") or first.get("productSku") or "").strip(),
+                    "product_name":      (first.get("productName") or "").strip(),
+                    "image_url":         (first.get("productImg")  or "").strip(),
+                    "quantidade":        qtd,
+                    "plataforma":        plat,
+                    "valor":             valor,
+                    "data":              hoje,
+                    "cliente":           token,
+                    "label_url":         None,
                 })
+                for item in items:
+                    novos_itens.append({
+                        "order_number": on,
+                        "sku":          (item.get("variationSku") or item.get("productSku") or "").strip(),
+                        "product_name": (item.get("productName") or "").strip(),
+                        "image_url":    (item.get("productImg")  or "").strip(),
+                        "quantidade":   int(item.get("productCount") or 1),
+                        "cliente":      token,
+                        "data":         hoje,
+                    })
+            elif on in sem_num and num_plat:
+                atualizar_num.append({"order_number": on, "numero_plataforma": num_plat})
 
         if novos_pedidos:
             supa.table("pedidos").upsert(novos_pedidos, on_conflict="order_number").execute()
         if novos_itens:
             supa.table("pedido_itens").insert(novos_itens).execute()
+        if atualizar_num:
+            for row in atualizar_num:
+                try:
+                    supa.table("pedidos").update({"numero_plataforma": row["numero_plataforma"]}).eq("order_number", row["order_number"]).execute()
+                except Exception:
+                    pass
+            log(f"[capturar] ✅ {len(atualizar_num)} numero_plataforma preenchido(s)")
         log(f"[capturar] ✅ {len(novos_pedidos)} pedido(s) sincronizados com Supabase")
     except Exception as e:
         log(f"[capturar] ⚠️ Sync Supabase falhou: {e}")
@@ -2460,9 +2588,193 @@ async def _capturar_retroativo_playwright(config: dict) -> None:
 
             await _fechar_popups_upseller(page)
             capturados_r = 0
-            aba_atual = abas_r[0]
 
-            for on in sem_label[:30]:
+            # ── Fase 2 (PRIMEIRO): batch via Para Retirada / all-orders ──────────
+            # Mais rápido: 20 pedidos por lote em vez de 1 por vez
+            LOTE_B = 20
+            cap_b = 0
+            pendentes_b = list(sem_label)
+
+            abas_batch = [
+                ("to-pickup",  "https://app.upseller.com/pt/order/to-pickup"),
+                ("pickup",     "https://app.upseller.com/pt/order/pickup"),
+                ("all-orders", "https://app.upseller.com/pt/order/all-orders"),
+            ]
+
+            for nome_aba_b, url_aba_b in abas_batch:
+                if not pendentes_b or _parar.is_set():
+                    break
+                try:
+                    await page.goto(url_aba_b, wait_until="domcontentloaded", timeout=30_000)
+                    await page.wait_for_timeout(2000)
+                    await _fechar_popups_upseller(page)
+                except Exception:
+                    continue
+
+                inp_b = page.locator(
+                    "input[placeholder*='Pedido'], input[placeholder*='vírgulas'], input[placeholder*='Número']"
+                ).first
+                if not await inp_b.count() or await page.locator("tbody tr").count() == 0:
+                    continue
+
+                for i_b in range(0, len(pendentes_b), LOTE_B):
+                    if _parar.is_set():
+                        break
+                    lote_b = [
+                        on for on in pendentes_b[i_b:i_b + LOTE_B]
+                        if not (PASTA_ETIQUETAS / f"etiqueta_{on}.pdf").exists()
+                    ]
+                    if not lote_b:
+                        continue
+
+                    await page.goto(url_aba_b, wait_until="domcontentloaded", timeout=30_000)
+                    await page.wait_for_timeout(1500)
+                    await _fechar_popups_upseller(page)
+
+                    inp_b = page.locator(
+                        "input[placeholder*='Pedido'], input[placeholder*='vírgulas'], input[placeholder*='Número']"
+                    ).first
+                    if not await inp_b.count():
+                        break
+                    await inp_b.click()
+                    await inp_b.fill(",".join(lote_b))
+                    await inp_b.press("Enter")
+                    await page.wait_for_timeout(2000)
+
+                    visiveis_b = [
+                        on for on in lote_b
+                        if await page.locator("tbody tr").filter(has_text=on).count() > 0
+                    ]
+                    if not visiveis_b:
+                        continue
+
+                    log(f"[retro] 📋 {nome_aba_b}: {len(visiveis_b)} pedido(s) — batch...")
+
+                    for on in visiveis_b:
+                        cb_b = page.locator("tbody tr").filter(has_text=on).first \
+                            .locator(".ant-checkbox-input, input[type='checkbox']").first
+                        if await cb_b.count() > 0:
+                            await cb_b.click()
+                            await page.wait_for_timeout(60)
+                    await page.wait_for_timeout(200)
+
+                    pgs_b = set(id(pg) for pg in context.pages)
+                    clicou_b = False
+                    for txt_bulk_b in ["Imprimir em Massa", "Imprimir Etiquetas"]:
+                        btn_bulk_b = page.locator("button, span").filter(has_text=txt_bulk_b).first
+                        if await btn_bulk_b.count() > 0 and await btn_bulk_b.is_visible():
+                            await btn_bulk_b.click(force=True)
+                            await page.wait_for_timeout(400)
+                            for sub_txt_b in ["Imprimir Etiquetas", "Imprimir Etiqueta"]:
+                                sub_b = page.locator("li, .ant-dropdown-menu-item").filter(has_text=sub_txt_b).first
+                                if await sub_b.count() > 0 and await sub_b.is_visible():
+                                    await sub_b.click(force=True)
+                                    clicou_b = True
+                                    break
+                            if not clicou_b:
+                                await page.keyboard.press("Escape")
+                            break
+
+                    if not clicou_b:
+                        await page.evaluate(
+                            "() => document.querySelectorAll('tbody .ant-checkbox-checked "
+                            ".ant-checkbox-input').forEach(c=>c.click())"
+                        )
+                        continue
+
+                    novas_b = []
+                    for _ in range(50):
+                        novas_b = [pg for pg in context.pages if id(pg) not in pgs_b]
+                        if novas_b:
+                            break
+                        await page.wait_for_timeout(200)
+
+                    if not novas_b:
+                        log(f"[retro] ⚠️ {nome_aba_b}: batch sem popup")
+                        continue
+
+                    if len(novas_b) == 1 and len(visiveis_b) > 1:
+                        popup_b = novas_b[0]
+                        for _ in range(20):
+                            if id(popup_b) in _cdn_r or (popup_b.url and popup_b.url != "about:blank"):
+                                break
+                            await page.wait_for_timeout(300)
+                        cdn_b = _cdn_r.pop(id(popup_b), None)
+                        dir_b = popup_b.url if popup_b.url and popup_b.url != "about:blank" else None
+                        url_batch_b = cdn_b or dir_b
+                        await popup_b.close()
+                        if url_batch_b:
+                            tmp_b = PASTA_ETIQUETAS / f"_retro_batch_{i_b}.pdf"
+                            try:
+                                _ur_r.urlretrieve(url_batch_b, str(tmp_b))
+                                salvos_b = _split_pdf_batch(tmp_b, visiveis_b)
+                                for on_s in salvos_b:
+                                    pp_s = PASTA_ETIQUETAS / f"etiqueta_{on_s}.pdf"
+                                    if pp_s.exists():
+                                        log(f"[retro] 📄 {on_s} — batch {nome_aba_b}")
+                                        cap_b += 1
+                                        if on_s in pendentes_b:
+                                            pendentes_b.remove(on_s)
+                                        try:
+                                            pub_s = _upload_etiqueta_supabase(pp_s, on_s)
+                                            lbl_s = pub_s or f"http://127.0.0.1:5001/etiqueta/{on_s}"
+                                            create_client(*_supa()).table("pedidos") \
+                                                .update({"label_url": lbl_s}).eq("order_number", on_s).execute()
+                                        except Exception:
+                                            pass
+                            except Exception as e_split_b:
+                                log(f"[retro] ⚠️ split {nome_aba_b}: {e_split_b}")
+                            finally:
+                                try:
+                                    tmp_b.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                    else:
+                        for popup_b, on_b in zip(novas_b, visiveis_b):
+                            for _ in range(15):
+                                if id(popup_b) in _cdn_r or (popup_b.url and popup_b.url != "about:blank"):
+                                    break
+                                await page.wait_for_timeout(300)
+                            cdn_bi = _cdn_r.pop(id(popup_b), None)
+                            dir_bi = popup_b.url if popup_b.url and popup_b.url != "about:blank" else None
+                            url_bi = cdn_bi or dir_bi
+                            await popup_b.close()
+                            if url_bi:
+                                pp_bi = PASTA_ETIQUETAS / f"etiqueta_{on_b}.pdf"
+                                try:
+                                    _ur_r.urlretrieve(url_bi, str(pp_bi))
+                                    c_bi = _corrigir_mediabox(pp_bi)
+                                    if c_bi != pp_bi and c_bi.exists():
+                                        c_bi.replace(pp_bi)
+                                    log(f"[retro] 📄 {on_b} — individual {nome_aba_b}")
+                                    cap_b += 1
+                                    if on_b in pendentes_b:
+                                        pendentes_b.remove(on_b)
+                                    try:
+                                        pub_bi = _upload_etiqueta_supabase(pp_bi, on_b)
+                                        lbl_bi = pub_bi or f"http://127.0.0.1:5001/etiqueta/{on_b}"
+                                        create_client(*_supa()).table("pedidos") \
+                                            .update({"label_url": lbl_bi}).eq("order_number", on_b).execute()
+                                    except Exception:
+                                        pass
+                                except Exception as e_bi:
+                                    log(f"[retro] ⚠️ {on_b}: {e_bi}")
+
+            if cap_b > 0:
+                log(f"[retro] ✅ {cap_b} etiqueta(s) capturadas via batch")
+
+            # ── Fase 1: individual via dropdown (para os que restaram do batch) ──
+            # Atualiza lista com os que ainda faltam após o batch
+            sem_label_r1 = [
+                on for on in sem_label
+                if not (PASTA_ETIQUETAS / f"etiqueta_{on}.pdf").exists()
+                and on not in _capturar_skip
+            ]
+            aba_atual = abas_r[0]
+            if sem_label_r1:
+                log(f"[retro] 🔍 {len(sem_label_r1)} restantes — tentando dropdown individual...")
+
+            for on in sem_label_r1[:30]:
                 if _parar.is_set():
                     break
                 if (PASTA_ETIQUETAS / f"etiqueta_{on}.pdf").exists():
@@ -2497,28 +2809,27 @@ async def _capturar_retroativo_playwright(config: dict) -> None:
                     _capturar_skip.add(on)
                     continue
 
-                await row_r.hover()
-                await page.wait_for_timeout(500)
-
-                # Localiza o botão "Mais" da coluna de ação — usa o mais à direita na viewport
-                mais_btn = None
-                cands = page.locator("span, button").filter(has_text=_re_r.compile(r'^Mais'))
-                cnt = await cands.count()
-                max_x = -1
-                for i in range(cnt):
-                    btn = cands.nth(i)
-                    bb = await btn.bounding_box()
-                    if bb and bb['x'] > max_x:
-                        max_x = bb['x']
-                        mais_btn = btn
-
-                if not mais_btn:
-                    log(f"[retro] ⚠️ {on} — botão Mais não encontrado (cnt={cnt})")
-                    _capturar_skip.add(on)
-                    continue
-
                 pgs_r = set(id(pg) for pg in context.pages)
                 try:
+                    await row_r.hover(timeout=10_000)
+                    await page.wait_for_timeout(500)
+
+                    # Localiza o botão "Mais" da coluna de ação — usa o mais à direita na viewport
+                    mais_btn = None
+                    cands = page.locator("span, button").filter(has_text=_re_r.compile(r'^Mais'))
+                    cnt = await cands.count()
+                    max_x = -1
+                    for i in range(cnt):
+                        btn = cands.nth(i)
+                        bb = await btn.bounding_box()
+                        if bb and bb['x'] > max_x:
+                            max_x = bb['x']
+                            mais_btn = btn
+
+                    if not mais_btn:
+                        log(f"[retro] ⚠️ {on} — botão Mais não encontrado (cnt={cnt})")
+                        _capturar_skip.add(on)
+                        continue
                     await mais_btn.click(force=True)
                     await page.wait_for_timeout(600)
 
@@ -2530,11 +2841,126 @@ async def _capturar_retroativo_playwright(config: dict) -> None:
                             clicou_r = True
                             break
                     if not clicou_r:
-                        # Log o que apareceu no dropdown
                         itens_vis = page.locator("li.ant-dropdown-menu-item")
                         txts = await itens_vis.all_inner_texts() if await itens_vis.count() > 0 else []
-                        log(f"[retro] ⚠️ {on} — Imprimir Etiqueta não encontrado (dropdown: {txts[:3]})")
+                        log(f"[retro] ⚠️ {on} — dropdown: {txts[:3]} — tentando detalhe do pedido...")
                         await page.keyboard.press("Escape")
+                        await page.wait_for_timeout(400)
+
+                        # Fallback: abre o detalhe do pedido clicando no número/link
+                        # O painel de detalhe pode ter botão de imprimir diferente do dropdown
+                        pgs_det = set(id(pg) for pg in context.pages)
+                        abriu_detalhe = False
+                        try:
+                            # Clica no link com o número do pedido para abrir o painel lateral
+                            link_det = page.locator(f"a:has-text('{on}'), td:has-text('{on}') a").first
+                            if not await link_det.count():
+                                link_det = row_r.locator("a").nth(1)  # segunda ancora (1a pode ser checkbox)
+                            if await link_det.count():
+                                await link_det.click(force=True)
+                                # Aguarda painel lateral (.ant-drawer ou .ant-modal) aparecer
+                                try:
+                                    await page.wait_for_selector(".ant-drawer-open, .ant-modal-wrap:visible", timeout=4000)
+                                except Exception:
+                                    pass
+                                await page.wait_for_timeout(1000)
+                                abriu_detalhe = True
+                        except Exception:
+                            pass
+
+                        if abriu_detalhe:
+                            # Loga conteúdo do painel lateral para diagnóstico
+                            painel = page.locator(".ant-drawer-open, .ant-modal-wrap:visible, .ant-drawer-content").first
+                            if await painel.count() == 0:
+                                painel = page
+                            # Loga todos os botões
+                            btns_vis = painel.locator("button, .ant-btn, a[class*='btn'], li.ant-dropdown-menu-item").filter(has_not_text="")
+                            btns_txts = []
+                            for _bi in range(min(await btns_vis.count(), 15)):
+                                try:
+                                    _bt = await btns_vis.nth(_bi).inner_text()
+                                    if _bt.strip():
+                                        btns_txts.append(_bt.strip()[:25])
+                                except Exception:
+                                    pass
+                            # Loga título/header do painel para confirmar o que está aberto
+                            titulo_painel = ""
+                            for sel_tit in [".ant-drawer-title", ".ant-modal-title", "h1, h2, h3, h4"]:
+                                el_tit = painel.locator(sel_tit).first
+                                if await el_tit.count() > 0:
+                                    titulo_painel = (await el_tit.inner_text())[:40]
+                                    break
+                            log(f"[retro] 🔎 {on} painel='{titulo_painel}' botões={btns_txts[:8]}")
+
+                            # Tenta "Mais Ações" no painel (pode ter "Imprimir Etiqueta" no dropdown)
+                            mais_acoes = painel.locator("button, .ant-btn, span").filter(has_text="Mais Ações").first
+                            if await mais_acoes.count() > 0 and await mais_acoes.is_visible():
+                                await mais_acoes.click(force=True)
+                                await page.wait_for_timeout(600)
+                                itens_ma = page.locator("li.ant-dropdown-menu-item, .ant-menu-item")
+                                txts_ma = []
+                                for _mi in range(min(await itens_ma.count(), 8)):
+                                    try:
+                                        _mt = await itens_ma.nth(_mi).inner_text()
+                                        if _mt.strip():
+                                            txts_ma.append(_mt.strip()[:25])
+                                    except Exception:
+                                        pass
+                                log(f"[retro] 🔎 {on} Mais Ações={txts_ma}")
+                                await page.keyboard.press("Escape")
+                                await page.wait_for_timeout(300)
+
+                            # Procura botão de imprimir dentro do painel
+                            clicou_det = False
+                            for txt_det in ["Imprimir Etiqueta", "Imprimir Etiq", "Print Label", "Etiqueta", "Imprimir"]:
+                                btn_det = painel.locator("button, a, span").filter(has_text=txt_det).last
+                                if await btn_det.count() > 0 and await btn_det.is_visible():
+                                    await btn_det.click(force=True)
+                                    await page.wait_for_timeout(1500)
+                                    clicou_det = True
+                                    break
+
+                            if clicou_det:
+                                # Verifica se abriu popup com PDF
+                                novas_det = [pg for pg in context.pages if id(pg) not in pgs_det]
+                                if novas_det:
+                                    popup_det = novas_det[-1]
+                                    for _ in range(15):
+                                        if id(popup_det) in _cdn_r or (popup_det.url and popup_det.url != "about:blank"):
+                                            break
+                                        await page.wait_for_timeout(300)
+                                    cdn_det = _cdn_r.pop(id(popup_det), None)
+                                    dir_det = popup_det.url if popup_det.url and popup_det.url != "about:blank" else None
+                                    url_det = cdn_det or dir_det
+                                    await popup_det.close()
+                                    if url_det:
+                                        pp_det = PASTA_ETIQUETAS / f"etiqueta_{on}.pdf"
+                                        try:
+                                            _ur_r.urlretrieve(url_det, str(pp_det))
+                                            c_det = _corrigir_mediabox(pp_det)
+                                            if c_det != pp_det and c_det.exists():
+                                                c_det.replace(pp_det)
+                                            log(f"[retro] 📄 {on} — etiqueta capturada via detalhe")
+                                            capturados_r += 1
+                                            try:
+                                                pub_det = _upload_etiqueta_supabase(pp_det, on)
+                                                lbl_det = pub_det or f"http://127.0.0.1:5001/etiqueta/{on}"
+                                                create_client(*_supa()).table("pedidos") \
+                                                    .update({"label_url": lbl_det}).eq("order_number", on).execute()
+                                            except Exception:
+                                                pass
+                                            # Fecha detalhe e volta para lista
+                                            await _fechar_popups_upseller(page)
+                                            continue
+                                        except Exception as e_det:
+                                            log(f"[retro] ⚠️ {on} detalhe download: {e_det}")
+
+                            # Fecha painel de detalhe e força re-navegação no próximo pedido
+                            await _fechar_popups_upseller(page)
+                            await page.keyboard.press("Escape")
+                            await page.wait_for_timeout(500)
+                            aba_atual = ""
+
                         _capturar_skip.add(on)
                         continue
 
@@ -2584,9 +3010,25 @@ async def _capturar_retroativo_playwright(config: dict) -> None:
                     log(f"[retro] ⚠️ {on}: {e_r}")
                     _capturar_skip.add(on)
                     await _fechar_popups_upseller(page)
+                    aba_atual = ""  # força re-navegação no próximo pedido
 
             if capturados_r > 0:
                 log(f"[retro] ✅ {capturados_r} etiqueta(s) retroativas capturadas")
+
+            # ── Fase 3: re-verifica o que ainda falta após Fase 2 + Fase 1 ──────
+            try:
+                res_r2 = create_client(*_supa()).table("pedidos").select("order_number") \
+                    .is_("label_url", "null").gte("data", ontem_r).execute()
+                faltam_r2 = [
+                    r["order_number"] for r in (res_r2.data or [])
+                    if r.get("order_number")
+                    and not (PASTA_ETIQUETAS / f"etiqueta_{r['order_number']}.pdf").exists()
+                ]
+            except Exception:
+                faltam_r2 = []
+
+            if faltam_r2:
+                log(f"[retro] ℹ️ {len(faltam_r2)} pedido(s) ainda aguardando etiqueta da plataforma")
 
         except Exception as e_main:
             log(f"[retro] ❌ {e_main}")
@@ -2695,13 +3137,33 @@ async def _capturar_etiquetas_playwright(config: dict, aguardar_se_vazio: bool =
                 log("[capturar] ℹ️ Nenhum pedido em Para Imprimir após aguardar")
                 return True
 
-            # Extrai números de pedido de todas as linhas
+            # Busca TODOS os números via API (sem limite de paginação do browser)
+            api_orders = await page.evaluate("""async () => {
+                let todos = [], pg = 1;
+                while (true) {
+                    const r = await fetch('/api/order/index', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                        body: 'timeType=0&searchType=0&sortName=1&sortValue=1&orderState=in_process&pageNum=' + pg + '&pageSize=200'
+                    });
+                    const j = await r.json();
+                    const total = (j.data || {}).total || 0;
+                    const list = (j.data || {}).list || [];
+                    todos = todos.concat(list.map(o => o.orderNumber || '').filter(Boolean));
+                    if (!list.length || todos.length >= total) break;
+                    pg++;
+                }
+                return todos;
+            }""")
+
+            # Extrai também da tabela visível (garante que inclui pedidos visíveis mesmo se API diferir)
             all_texts = await page.locator("tbody tr").all_inner_texts()
-            order_numbers = []
+            order_numbers = list(api_orders) if api_orders else []
             for txt in all_texts:
                 m = re.search(r'UP[0-9][A-Z]{3}[0-9]{6}', txt)
                 if m and m.group() not in order_numbers:
                     order_numbers.append(m.group())
+            log(f"[capturar] 📋 API: {len(api_orders)} pedido(s) em Para Imprimir")
 
             if not order_numbers:
                 log("[capturar] ⚠️ Não foi possível extrair números de pedido da tabela")
@@ -2765,8 +3227,34 @@ async def _capturar_etiquetas_playwright(config: dict, aguardar_se_vazio: bool =
                 )
                 await page.wait_for_timeout(100)
 
-            # Loop: recarrega UMA vez por rodada, batch em todos visíveis
+            async def _filtrar_por_numeros(pg, numeros: list):
+                """Filtra a tabela de Para Imprimir pelos números de pedido (campo de busca)."""
+                try:
+                    inp = pg.locator("input[placeholder*='Pedido'], input[placeholder*='vírgulas']").first
+                    if not await inp.count():
+                        return False
+                    await inp.click()
+                    await inp.fill(",".join(numeros))
+                    await inp.press("Enter")
+                    await pg.wait_for_timeout(1500)
+                    return True
+                except Exception:
+                    return False
+
+            async def _limpar_filtro_numeros(pg):
+                try:
+                    # Limpa o campo de busca e volta para a lista completa
+                    inp = pg.locator("input[placeholder*='Pedido'], input[placeholder*='vírgulas']").first
+                    if await inp.count():
+                        await inp.fill("")
+                        await inp.press("Enter")
+                        await pg.wait_for_timeout(800)
+                except Exception:
+                    pass
+
+            # Loop: itera em lotes de pendentes filtrando pelo campo de busca
             rodada_cap = 0
+            BATCH = 50  # UpSeller aceita ~50 números no campo de busca
             while pendentes and not _parar.is_set():
                 if background and rodando:
                     log("[capturar] ⏸️ Executar iniciado — pausando captura automática")
@@ -2774,6 +3262,8 @@ async def _capturar_etiquetas_playwright(config: dict, aguardar_se_vazio: bool =
 
                 rodada_cap += 1
                 fez_algo = False
+
+                lote = pendentes[:BATCH]
 
                 await page.goto(
                     "https://app.upseller.com/pt/order/in-process",
@@ -2788,6 +3278,11 @@ async def _capturar_etiquetas_playwright(config: dict, aguardar_se_vazio: bool =
                         pendentes.remove(on)
                         capturados += 1
                         fez_algo = True
+
+                # Filtra tabela pelos pendentes do lote atual
+                filtrou = await _filtrar_por_numeros(page, lote)
+                if filtrou:
+                    log(f"[capturar] 🔍 Filtrando {len(lote)} pedidos pendentes...")
 
                 # Identifica quais pendentes estão visíveis nesta carga
                 visiveis = []
@@ -3286,6 +3781,10 @@ async def _emitir_etiqueta_playwright(config: dict, order_number: str) -> dict:
                 if "Cancelado" in row_txt or "Estornado" in row_txt:
                     status_txt = "Cancelado" if "Cancelado" in row_txt else "Estornado"
                     log(f"[etiqueta] ⛔ Pedido {order_number} está {status_txt}")
+                    try:
+                        create_client(*_supa()).table("pedidos").update({"status": "cancelado"}).eq("order_number", order_number).execute()
+                    except Exception:
+                        pass
                     return {"ok": False, "cancelado": True, "erro": f"Pedido {status_txt.lower()} no UpSeller"}
 
             tem_impressora = _verificar_impressora()
@@ -3918,27 +4417,45 @@ async def _programar_envio_playwright(config: dict) -> bool:
 
                     log(f"[envio] 📦 {plat_nome}: rodada {rodada} — selecionando todos...")
 
-                    # Clica checkbox select-all
-                    cb_selecionado = False
-                    for cb_sel in [
-                        "th .ant-checkbox-wrapper",
-                        "thead .ant-checkbox-wrapper",
-                        ".ant-table-thead .ant-checkbox-wrapper",
-                        "th .ant-checkbox-input",
-                        "thead .ant-checkbox-input",
-                    ]:
-                        cb_loc = page.locator(cb_sel).first
-                        if await cb_loc.count() > 0:
-                            await cb_loc.click(force=True)
-                            cb_selecionado = True
-                            log(f"[envio] ☑️ Checkbox selecionado via '{cb_sel}'")
-                            break
-                    if not cb_selecionado:
-                        log("[envio] ⚠️ Checkbox select-all não encontrado")
+                    # Clica checkbox select-all via JS (mesmo método do NF-e que funciona)
+                    cb_selecionado = await page.evaluate("""() => {
+                        const sels = [
+                            'th .ant-checkbox-input',
+                            'thead .ant-checkbox-input',
+                            '.ant-table-thead .ant-checkbox-input',
+                            'th input[type="checkbox"]',
+                            'thead input[type="checkbox"]',
+                        ];
+                        for (const s of sels) {
+                            const cb = document.querySelector(s);
+                            if (cb) { cb.click(); return s; }
+                        }
+                        return null;
+                    }""")
+                    if cb_selecionado:
+                        log(f"[envio] ☑️ Checkbox selecionado via JS '{cb_selecionado}'")
+                    else:
+                        log("[envio] ⚠️ Checkbox select-all não encontrado — tentando locator")
+                        for cb_sel in ["th .ant-checkbox-wrapper", "thead .ant-checkbox-wrapper"]:
+                            cb_loc = page.locator(cb_sel).first
+                            if await cb_loc.count() > 0:
+                                await cb_loc.click(force=True)
+                                log(f"[envio] ☑️ Checkbox selecionado via locator '{cb_sel}'")
+                                break
                     await page.wait_for_timeout(1500)
 
                     qtd_sel = await page.evaluate("""() => {
-                        return document.querySelectorAll('tbody .ant-checkbox-checked').length;
+                        const checks = [
+                            'tbody .ant-checkbox-checked',
+                            'tr.ant-table-row-selected',
+                            'tbody input[type="checkbox"]:checked',
+                            'tbody .ant-checkbox-input:checked',
+                        ];
+                        for (const s of checks) {
+                            const n = document.querySelectorAll(s).length;
+                            if (n > 0) return n;
+                        }
+                        return 0;
                     }""")
                     log(f"[envio] ✔️ {qtd_sel} pedidos selecionados")
                     if qtd_sel == 0:
@@ -4248,28 +4765,52 @@ def extrair(config: dict, data_alvo: date):
         } for p in pedidos]
 
         if linhas:
-            colunas_opcionais = {"plataforma", "valor", "label_url"}
-            excluir: set = set()
-            tentativa = linhas
-            while True:
-                try:
-                    supa.table("pedidos").upsert(tentativa, on_conflict="order_number").execute()
-                    if excluir:
-                        log(f"✅ {len(tentativa)} pedidos enviados (sem {sorted(excluir)})")
-                        log(f"💡 Adicione no Supabase SQL → ALTER TABLE pedidos " +
-                            " ".join(f"ADD COLUMN IF NOT EXISTS {c} {'TEXT' if c != 'valor' else 'NUMERIC(12,2)'},"
-                                     for c in sorted(excluir)).rstrip(",") + ";")
-                    else:
-                        log(f"✅ {len(tentativa)} pedidos enviados ao Supabase!")
-                    break
-                except Exception as e_col:
-                    col_faltando = next((c for c in colunas_opcionais - excluir if c in str(e_col)), None)
-                    if col_faltando:
-                        excluir.add(col_faltando)
-                        tentativa = [{k: v for k, v in l.items() if k not in excluir} for l in linhas]
-                        log(f"⚠️ Coluna '{col_faltando}' ausente — tentando sem ela...")
-                    else:
-                        raise
+            # Separa novos (inserir com data) de existentes (atualizar sem sobrescrever data)
+            # Faz em lotes de 50 para evitar limite de URL do Supabase
+            ons = [l["order_number"] for l in linhas]
+            existentes_set: set = set()
+            for i in range(0, len(ons), 50):
+                ex_res = supa.table("pedidos").select("order_number").in_("order_number", ons[i:i+50]).execute()
+                existentes_set.update(r["order_number"] for r in (ex_res.data or []))
+            novos    = [l for l in linhas if l["order_number"] not in existentes_set]
+            updates  = [{k: v for k, v in l.items() if k != "data"}
+                        for l in linhas if l["order_number"] in existentes_set]
+
+            colunas_opcionais = {"plataforma", "valor", "label_url", "numero_plataforma"}
+
+            def _upsert_com_fallback(lote_orig, label):
+                excluir: set = set()
+                tentativa = lote_orig
+                while True:
+                    try:
+                        supa.table("pedidos").upsert(tentativa, on_conflict="order_number").execute()
+                        log(f"✅ {len(tentativa)} pedidos {label} ao Supabase!")
+                        return
+                    except Exception as e_col:
+                        col_faltando = next((c for c in colunas_opcionais - excluir if c in str(e_col)), None)
+                        if col_faltando:
+                            excluir.add(col_faltando)
+                            tentativa = [{k: v for k, v in l.items() if k not in excluir} for l in lote_orig]
+                            log(f"⚠️ Coluna '{col_faltando}' ausente — tentando sem ela...")
+                        else:
+                            raise
+
+            def _update_existentes(lote):
+                for linha in lote:
+                    on = linha.get("order_number")
+                    if not on:
+                        continue
+                    campos = {k: v for k, v in linha.items() if k != "order_number"}
+                    try:
+                        supa.table("pedidos").update(campos).eq("order_number", on).execute()
+                    except Exception as e_upd:
+                        log(f"⚠️ Erro ao atualizar {on}: {e_upd}")
+                log(f"✅ {len(lote)} pedidos atualizados (data preservada)")
+
+            if novos:
+                _upsert_com_fallback(novos, "inseridos")
+            if updates:
+                _update_existentes(updates)
         else:
             log("Nenhum pedido para enviar")
 
@@ -4393,6 +4934,35 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                 if filtrar_por_data:
                     log(f"[api] {label_secao} (hoje): {contado} pedido(s)")
 
+            # Detecta pedidos cancelados (voided) no UpSeller e atualiza Supabase
+            try:
+                nums_ativos = {(o.get("orderNumber") or "").strip() for o in todos_raw}
+                pg_v = 1
+                cancelados_api: list = []
+                while True:
+                    r_v = await page.evaluate(f"""async () => {{
+                        const r = await fetch('/api/order/index', {{
+                            method:'POST', headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+                            body:'timeType=0&isVoided=1&searchType=0&sortName=1&sortValue=1&pageNum={pg_v}&pageSize=50'
+                        }});
+                        return await r.json();
+                    }}""")
+                    lista_v = (r_v.get("data") or {}).get("list") or []
+                    total_v = (r_v.get("data") or {}).get("total") or 0
+                    cancelados_api.extend((o.get("orderNumber") or "").strip() for o in lista_v)
+                    if pg_v * 50 >= total_v or not lista_v:
+                        break
+                    pg_v += 1
+                cancelados_api_set = {n for n in cancelados_api if n}
+                if cancelados_api_set:
+                    supa_c = create_client(*_supa())
+                    for i in range(0, len(cancelados_api), 50):
+                        lote_c = list(cancelados_api_set)[i:i+50]
+                        supa_c.table("pedidos").update({"status": "cancelado"}).in_("order_number", lote_c).eq("status", "ativo").execute()
+                    log(f"[api] ⛔ {len(cancelados_api_set)} pedido(s) voided verificado(s) no UpSeller")
+            except Exception as e_v:
+                log(f"[api] ⚠️ Verificação de cancelados falhou: {e_v}")
+
         except Exception as e:
             log(f"[api] ❌ Erro ao consultar API: {e}")
             return False
@@ -4467,15 +5037,16 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
 
         if order_num not in pedidos_dict:
             pedidos_dict[order_num] = {
-                "order_number": order_num,
-                "sku":          (first.get("variationSku") or first.get("productSku") or "").strip(),
-                "product_name": (first.get("productName") or "").strip(),
-                "image_url":    (first.get("productImg")  or "").strip(),
-                "data":         data_pedido,
-                "quantidade":   qtd_total,
-                "plataforma":   plataforma,
-                "valor":        valor,
-                "label_url":    api_label_url,
+                "order_number":      order_num,
+                "numero_plataforma": str(order.get("orderId") or order.get("extendedId") or "") or None,
+                "sku":               (first.get("variationSku") or first.get("productSku") or "").strip(),
+                "product_name":      (first.get("productName") or "").strip(),
+                "image_url":         (first.get("productImg")  or "").strip(),
+                "data":              data_pedido,
+                "quantidade":        qtd_total,
+                "plataforma":        plataforma,
+                "valor":             valor,
+                "label_url":         api_label_url,
             }
         else:
             pedidos_dict[order_num]["quantidade"] += qtd_total
@@ -4542,38 +5113,65 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
     try:
         supa = create_client(*_supa())
         linhas = [{
-            "order_number": p["order_number"],
-            "sku":          p["sku"],
-            "product_name": p["product_name"],
-            "image_url":    p["image_url"],
-            "data":         p.get("data") or data_arquivo,
-            "cliente":      token,
-            "quantidade":   p.get("quantidade", 1),
-            "plataforma":   p.get("plataforma"),
-            "valor":        p.get("valor"),
-            "label_url":    p.get("label_url"),
+            "order_number":      p["order_number"],
+            "numero_plataforma": p.get("numero_plataforma"),
+            "sku":               p["sku"],
+            "product_name":      p["product_name"],
+            "image_url":         p["image_url"],
+            "data":              p.get("data") or data_arquivo,
+            "cliente":           token,
+            "quantidade":        p.get("quantidade", 1),
+            "plataforma":        p.get("plataforma"),
+            "valor":             p.get("valor"),
+            "label_url":         p.get("label_url"),
         } for p in pedidos]
 
         if linhas:
-            colunas_opcionais = {"plataforma", "valor", "label_url"}
-            excluir: set = set()
-            tentativa = linhas
-            while True:
-                try:
-                    supa.table("pedidos").upsert(tentativa, on_conflict="order_number").execute()
-                    if excluir:
-                        log(f"✅ {len(tentativa)} pedidos enviados (sem {sorted(excluir)})")
-                    else:
-                        log(f"✅ {len(tentativa)} pedidos enviados ao Supabase!")
-                    break
-                except Exception as e_col:
-                    col_faltando = next((c for c in colunas_opcionais - excluir if c in str(e_col)), None)
-                    if col_faltando:
-                        excluir.add(col_faltando)
-                        tentativa = [{k: v for k, v in l.items() if k not in excluir} for l in linhas]
-                        log(f"⚠️ Coluna '{col_faltando}' ausente — tentando sem ela...")
-                    else:
-                        raise
+            # Preserva data de pedidos já existentes — nunca sobrescreve
+            ons2 = [l["order_number"] for l in linhas]
+            existentes2: set = set()
+            for i in range(0, len(ons2), 50):
+                ex2 = supa.table("pedidos").select("order_number").in_("order_number", ons2[i:i+50]).execute()
+                existentes2.update(r["order_number"] for r in (ex2.data or []))
+            novos2   = [l for l in linhas if l["order_number"] not in existentes2]
+            updates2 = [{k: v for k, v in l.items() if k != "data"}
+                        for l in linhas if l["order_number"] in existentes2]
+
+            colunas_opcionais = {"plataforma", "valor", "label_url", "numero_plataforma"}
+
+            def _upsert_fb2(lote_orig, label):
+                excluir: set = set()
+                tentativa = lote_orig
+                while True:
+                    try:
+                        supa.table("pedidos").upsert(tentativa, on_conflict="order_number").execute()
+                        log(f"✅ {len(tentativa)} pedidos {label} ao Supabase!")
+                        return
+                    except Exception as e_col:
+                        col_faltando = next((c for c in colunas_opcionais - excluir if c in str(e_col)), None)
+                        if col_faltando:
+                            excluir.add(col_faltando)
+                            tentativa = [{k: v for k, v in l.items() if k not in excluir} for l in lote_orig]
+                            log(f"⚠️ Coluna '{col_faltando}' ausente — tentando sem ela...")
+                        else:
+                            raise
+
+            def _update_existentes2(lote):
+                for linha in lote:
+                    on = linha.get("order_number")
+                    if not on:
+                        continue
+                    campos = {k: v for k, v in linha.items() if k != "order_number"}
+                    try:
+                        supa.table("pedidos").update(campos).eq("order_number", on).execute()
+                    except Exception as e_upd:
+                        log(f"⚠️ Erro ao atualizar {on}: {e_upd}")
+                log(f"✅ {len(lote)} pedidos atualizados (data preservada)")
+
+            if novos2:
+                _upsert_fb2(novos2, "inseridos")
+            if updates2:
+                _update_existentes2(updates2)
         else:
             log("Nenhum pedido para enviar")
     except Exception as e:
@@ -4731,6 +5329,9 @@ if __name__ == "__main__":
 
     threading.Thread(target=_loop_agendador, daemon=True).start()
     threading.Thread(target=_loop_captura_etiquetas, daemon=True).start()
+    # Pré-baixa SumatraPDF no Windows para a primeira impressão ser imediata
+    if platform.system() == "Windows":
+        threading.Thread(target=_obter_sumatra, daemon=True).start()
     # Abre browser sempre (auto-start via pythonw não tem terminal)
     threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:5001")).start()
     print("=" * 48)

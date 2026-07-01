@@ -1,4 +1,4 @@
 {
-  "version": "1.5.78",
-  "descricao": "resumo de etiquetas no Agendamento + modal explicativo ao bipar pedido TikTok sem etiqueta"
+  "version": "1.5.79",
+  "descricao": "fix impressao dupla: robo responde -> PCP nao abre browser; timeout 12s; SumatraPDF pre-download no startup; log detalhado de erros"
 }
