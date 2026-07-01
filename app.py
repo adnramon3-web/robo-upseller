@@ -1251,16 +1251,11 @@ def _pos_import(config: dict):
         log("⏹️ Execução cancelada pelo usuário")
         return
 
-    # 2. Picklist
+    # 2. Picklist (gerada do Supabase — dedup via picklist_impresso_em)
     if etapas.get("picklist", True):
-        chave_pick = f"{date.today()}_pick"
-        if chave_pick not in _picklist_hoje:
-            _picklist_hoje.add(chave_pick)
-            _etapa_atual = "Gerando picklist..."
-            log("━━ Imprimindo picklist ━━")
-            asyncio.run(_imprimir_picklist_playwright(config))
-        else:
-            log("━━ Picklist já impressa hoje — pulando ━━")
+        _etapa_atual = "Gerando picklist..."
+        log("━━ Gerando picklist ━━")
+        _imprimir_picklist_supabase(config)
 
     if _parar.is_set():
         log("⏹️ Execução cancelada pelo usuário")
@@ -1399,8 +1394,8 @@ def _imprimir_picklist_thread(config: dict):
         log("━━ Picklist aguardando import terminar... ━━")
         while rodando:
             time.sleep(10)
-    log("━━ Imprimindo picklist automático ━━")
-    asyncio.run(_imprimir_picklist_playwright(config))
+    log("━━ Gerando picklist automático ━━")
+    _imprimir_picklist_supabase(config)
 
 
 # ── Playwright: download automático do Excel ──────────────────────────────────
@@ -2183,7 +2178,169 @@ def _nome_impressora_padrao() -> str:
     return ""
 
 
-# ── Playwright: imprimir picklist ────────────────────────────────────────────
+# ── Picklist gerada do Supabase (sem Playwright) ─────────────────────────────
+
+def _gerar_picklist_pdf(pedidos: list) -> "Path":
+    """Gera PDF de picklist usando reportlab a partir dos dados do Supabase."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.units import mm
+
+    PASTA_PICKLISTS.mkdir(exist_ok=True)
+    nome = f"picklist_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    out  = PASTA_PICKLISTS / nome
+
+    doc = SimpleDocTemplate(str(out), pagesize=A4,
+                            leftMargin=15*mm, rightMargin=15*mm,
+                            topMargin=12*mm, bottomMargin=12*mm)
+
+    styles = getSampleStyleSheet()
+    titulo_style = ParagraphStyle("titulo", parent=styles["Title"],
+                                  fontSize=13, spaceAfter=4*mm)
+    elementos = []
+    elementos.append(Paragraph(
+        f"<b>PICKLIST</b> — {datetime.now().strftime('%d/%m/%Y %H:%M')} "
+        f"— {len(pedidos)} pedido(s)",
+        titulo_style,
+    ))
+    elementos.append(Spacer(1, 3*mm))
+
+    AZUL  = colors.HexColor("#1a3d5c")
+    AMAR  = colors.HexColor("#fff3cd")
+    CINZA = colors.HexColor("#f5f5f5")
+
+    cabecalho = ["Nº Pedido", "Produto", "SKU", "Qtd"]
+    linhas    = [cabecalho]
+    for p in pedidos:
+        qtd = int(p.get("quantidade") or 1)
+        linhas.append([
+            p.get("order_number", ""),
+            (p.get("product_name") or "")[:50],
+            p.get("sku", ""),
+            f"{qtd}x" if qtd > 1 else "1",
+        ])
+
+    col_w = [45*mm, 88*mm, 32*mm, 15*mm]
+    tabela = Table(linhas, colWidths=col_w, repeatRows=1)
+
+    ts = TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, 0), AZUL),
+        ("TEXTCOLOR",    (0, 0), (-1, 0), colors.white),
+        ("FONTNAME",     (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE",     (0, 0), (-1, 0), 10),
+        ("FONTSIZE",     (0, 1), (-1, -1), 9),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, CINZA]),
+        ("GRID",         (0, 0), (-1, -1), 0.4, colors.grey),
+        ("ALIGN",        (3, 0), (3, -1), "CENTER"),
+        ("VALIGN",       (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING",   (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 4),
+    ])
+    for i, p in enumerate(pedidos, start=1):
+        if int(p.get("quantidade") or 1) > 1:
+            ts.add("BACKGROUND", (0, i), (-1, i), AMAR)
+            ts.add("FONTNAME",   (0, i), (-1, i), "Helvetica-Bold")
+    tabela.setStyle(ts)
+    elementos.append(tabela)
+
+    doc.build(elementos)
+    log(f"[picklist] 📄 PDF gerado: {out.name} ({len(pedidos)} pedidos)")
+    return out
+
+
+def _imprimir_picklist_supabase(config: dict) -> bool:
+    """Gera e imprime a picklist da rodada atual a partir dos dados do Supabase.
+    Só inclui pedidos com picklist_impresso_em IS NULL → sem duplicidade entre rodadas."""
+    try:
+        supa  = create_client(*_supa())
+        token = config.get("token", "")
+        r = (supa.table("pedidos")
+             .select("order_number,product_name,sku,quantidade")
+             .eq("status", "ativo")
+             .eq("cliente", token)
+             .is_("picklist_impresso_em", "null")
+             .order("data", desc=False)
+             .execute())
+        pedidos = r.data or []
+    except Exception as e:
+        log(f"[picklist] ⚠️ Erro ao consultar Supabase: {e}")
+        return False
+
+    if not pedidos:
+        log("[picklist] ℹ️ Nenhum pedido novo — picklist não gerada")
+        return True
+
+    log(f"[picklist] 📋 {len(pedidos)} pedido(s) para picklist")
+
+    try:
+        pdf_pick = _gerar_picklist_pdf(pedidos)
+    except Exception as e:
+        log(f"[picklist] ❌ Erro ao gerar PDF: {e}")
+        return False
+
+    # Imprime se houver impressora; caso contrário fica disponível via /picklist-pdf
+    sistema        = platform.system()
+    nome_impressora = config.get("nome_impressora", "").strip()
+    tem_impressora  = bool(nome_impressora) or _verificar_impressora()
+    impressora_usar = nome_impressora or (_nome_impressora_padrao() if sistema == "Darwin" else "")
+
+    if tem_impressora:
+        try:
+            if sistema == "Darwin":
+                cmd = (["lp", "-d", impressora_usar, str(pdf_pick)]
+                       if impressora_usar else ["lp", str(pdf_pick)])
+                subprocess.run(cmd, timeout=30, check=True)
+                log(f"[picklist] 🖨️ Enviado para {impressora_usar or 'impressora padrão'}")
+            elif sistema == "Windows":
+                _imprimir_windows(pdf_pick, impressora_usar)
+                log(f"[picklist] 🖨️ Enviado para {impressora_usar or 'impressora padrão'}")
+        except Exception as e:
+            log(f"[picklist] ⚠️ Erro ao imprimir: {e} — PDF disponível no PCP")
+    else:
+        log("[picklist] 📋 Sem impressora — PDF disponível via PCP (/picklist-pdf)")
+
+    # Marca todos os pedidos desta rodada como incluídos na picklist
+    try:
+        agora    = datetime.utcnow().isoformat()
+        order_ns = [p["order_number"] for p in pedidos]
+        for i in range(0, len(order_ns), 50):
+            (supa.table("pedidos")
+             .update({"picklist_impresso_em": agora})
+             .in_("order_number", order_ns[i:i+50])
+             .execute())
+        log(f"[picklist] ✅ {len(pedidos)} pedidos marcados — {agora[:16]}")
+    except Exception as e:
+        log(f"[picklist] ⚠️ Erro ao marcar Supabase: {e}")
+
+    return True
+
+
+def _gerar_pdf_multicopia(pdf_path: "Path", n: int) -> "Path":
+    """Cria um PDF com N cópias da mesma página (para pedidos multi-unidade)."""
+    if n <= 1:
+        return pdf_path
+    out = pdf_path.with_stem(pdf_path.stem + f"_x{n}")
+    if out.exists():
+        return out
+    try:
+        from pypdf import PdfReader, PdfWriter
+        reader = PdfReader(str(pdf_path))
+        writer = PdfWriter()
+        pagina = reader.pages[0]
+        for _ in range(n):
+            writer.add_page(pagina)
+        with open(str(out), "wb") as f:
+            writer.write(f)
+        log(f"[etiqueta] 🗂️ {n}x cópias geradas → {out.name}")
+        return out
+    except Exception as e:
+        log(f"[etiqueta] ⚠️ _gerar_pdf_multicopia: {e}")
+        return pdf_path
+
+
+# ── Playwright: imprimir picklist (mantido como fallback) ─────────────────────
 
 async def _imprimir_picklist_playwright(config: dict):
     try:
@@ -2342,24 +2499,30 @@ def servir_etiqueta(order_number):
     config = json.loads(CONFIG_FILE.read_text(encoding="utf-8")) if CONFIG_FILE.exists() else {}
     nome_impressora = config.get("nome_impressora", "").strip()
 
+    quantidade_pedido = 1  # atualizado por _obter_pdf se Supabase responder
+
     def _obter_pdf() -> bool:
+        nonlocal quantidade_pedido
         if pdf_path.exists():
-            _garantir_pagina_unica(pdf_path)  # corrige PDFs batch multi-página
-            return True
+            _garantir_pagina_unica(pdf_path)
         try:
             supa = create_client(*_supa())
-            # limit(1) em vez de .single() — pedidos tem múltiplas linhas por order_number (1 por SKU)
-            r = supa.table("pedidos").select("label_url").eq("order_number", order_number).limit(1).execute()
+            r = (supa.table("pedidos")
+                 .select("label_url,quantidade")
+                 .eq("order_number", order_number)
+                 .limit(1).execute())
             rows = r.data or []
-            url = rows[0].get("label_url") if rows else None
-            # Ignora URLs que apontam para o próprio robô (evita loop infinito)
-            if url and "127.0.0.1:5001" not in url and "localhost:5001" not in url:
-                _ul.urlretrieve(url, str(pdf_path))
-                _garantir_pagina_unica(pdf_path)
-                return True
+            if rows:
+                quantidade_pedido = int(rows[0].get("quantidade") or 1)
+                url = rows[0].get("label_url")
+                if not pdf_path.exists() and url \
+                        and "127.0.0.1:5001" not in url \
+                        and "localhost:5001" not in url:
+                    _ul.urlretrieve(url, str(pdf_path))
+                    _garantir_pagina_unica(pdf_path)
         except Exception:
             pass
-        return False
+        return pdf_path.exists()
 
     if not _obter_pdf():
         r = jsonify({"erro": "Etiqueta não disponível — execute o robô primeiro"})
@@ -2394,6 +2557,10 @@ def servir_etiqueta(order_number):
         try:
             pdf_imprimir = _corrigir_mediabox(pdf_path)
             pdf_imprimir = _adicionar_margem_topo(pdf_imprimir, margem_topo_mm)
+            # Multi-unidade: gera PDF com N páginas antes de mandar para impressora
+            if quantidade_pedido > 1:
+                pdf_imprimir = _gerar_pdf_multicopia(pdf_imprimir, quantidade_pedido)
+                log(f"[etiqueta] 🗂️ {order_number} — {quantidade_pedido} unidades → {quantidade_pedido} etiquetas")
             log(f"[etiqueta] 📐 {order_number} | pdf={pdf_imprimir.name} | tamanho={pdf_imprimir.stat().st_size}B")
             if sistema == "Darwin":
                 cmd = ["lp", "-d", impressora_usar, str(pdf_imprimir)] if impressora_usar else ["lp", str(pdf_imprimir)]
@@ -2406,7 +2573,8 @@ def servir_etiqueta(order_number):
                 log(f"[etiqueta] 🔄 {order_number} → SumatraPDF → {impressora_usar or 'padrão'}")
                 _imprimir_windows(pdf_imprimir, impressora_usar)
                 log(f"[etiqueta] 🖨️ {order_number} → {impressora_usar or 'impressora padrão'}")
-            r = jsonify({"ok": True, "impresso": True, "impressora": impressora_usar})
+            r = jsonify({"ok": True, "impresso": True, "impressora": impressora_usar,
+                         "copias": quantidade_pedido})
             r.headers["Access-Control-Allow-Origin"] = "*"
             return r
         except Exception as e:

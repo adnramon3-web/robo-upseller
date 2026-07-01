@@ -1,4 +1,4 @@
 {
-  "version": "1.5.80",
-  "descricao": "margem topo configuravel (default 3mm) para compensar corte no inicio da etiqueta termica"
+  "version": "1.5.81",
+  "descricao": "picklist por rodada do Supabase (sem Playwright); multi-copia de etiqueta para pedidos com quantidade > 1"
 }
