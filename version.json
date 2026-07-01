@@ -1,4 +1,4 @@
 {
-  "version": "1.5.83",
-  "descricao": "picklist gerada e impressa pelo PCP (sem robo); robo expoe /marcar-picklist-impresso para registrar no Supabase"
+  "version": "1.5.84",
+  "descricao": "margem topo etiqueta: default 5mm -> 8mm (ajuste corte Elgin)"
 }
