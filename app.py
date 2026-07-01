@@ -2038,14 +2038,17 @@ def _corrigir_mediabox(pdf_path: "Path") -> "Path":
 
 def _adicionar_margem_topo(pdf_path: "Path", mm: float) -> "Path":
     """Expande o MediaBox no topo em `mm` milímetros.
-    O conteúdo não muda de posição — o espaço em branco extra no topo faz o
-    SumatraPDF (fit) deslocar o conteúdo para baixo ao imprimir."""
+    O conteúdo não muda de posição — o espaço extra no topo faz o SumatraPDF
+    (fit) deslocar o conteúdo para baixo, compensando o corte físico da impressora.
+    O valor de mm é incluído no nome do arquivo de cache — se o config mudar,
+    um novo arquivo é gerado automaticamente."""
     if mm <= 0:
         return pdf_path
     try:
         from pypdf import PdfReader, PdfWriter
         from pypdf.generic import ArrayObject, FloatObject
-        out = pdf_path.with_stem(pdf_path.stem + "_m")
+        mm_tag = str(mm).replace(".", "_")
+        out = pdf_path.with_stem(pdf_path.stem + f"_m{mm_tag}")
         if out.exists():
             return out
         pt = mm * 72 / 25.4  # mm → points
@@ -2062,7 +2065,7 @@ def _adicionar_margem_topo(pdf_path: "Path", mm: float) -> "Path":
         writer.add_page(page)
         with open(str(out), "wb") as f:
             writer.write(f)
-        log(f"[etiqueta] 📐 margem topo {mm}mm adicionada → {out.name}")
+        log(f"[etiqueta] 📐 margem topo {mm}mm → {out.name}")
         return out
     except Exception as e:
         log(f"[etiqueta] ⚠️ _adicionar_margem_topo: {e}")
@@ -2180,73 +2183,67 @@ def _nome_impressora_padrao() -> str:
 
 # ── Picklist gerada do Supabase (sem Playwright) ─────────────────────────────
 
-def _gerar_picklist_pdf(pedidos: list) -> "Path":
-    """Gera PDF de picklist usando reportlab a partir dos dados do Supabase."""
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib import colors
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-    from reportlab.lib.units import mm
+def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0) -> "Path":
+    """Gera PDF de picklist em papel térmico 10x5cm — uma etiqueta por pedido."""
+    from reportlab.pdfgen import canvas as rl_canvas
+    from reportlab.lib.units import mm as rl_mm
+    from reportlab.lib import colors as rl_colors
 
     PASTA_PICKLISTS.mkdir(exist_ok=True)
     nome = f"picklist_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
     out  = PASTA_PICKLISTS / nome
 
-    doc = SimpleDocTemplate(str(out), pagesize=A4,
-                            leftMargin=15*mm, rightMargin=15*mm,
-                            topMargin=12*mm, bottomMargin=12*mm)
+    LW = 100 * rl_mm   # 100 mm
+    LH = 50  * rl_mm   # 50 mm
+    # margem topo já embutida no layout (mesmo offset que as etiquetas)
+    offset_y = margem_topo_mm * rl_mm
+    # topo disponível para conteúdo (de cima para baixo em coordenadas PDF)
+    topo = LH - offset_y - 2 * rl_mm  # começa 2mm abaixo do offset
 
-    styles = getSampleStyleSheet()
-    titulo_style = ParagraphStyle("titulo", parent=styles["Title"],
-                                  fontSize=13, spaceAfter=4*mm)
-    elementos = []
-    elementos.append(Paragraph(
-        f"<b>PICKLIST</b> — {datetime.now().strftime('%d/%m/%Y %H:%M')} "
-        f"— {len(pedidos)} pedido(s)",
-        titulo_style,
-    ))
-    elementos.append(Spacer(1, 3*mm))
+    ts = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-    AZUL  = colors.HexColor("#1a3d5c")
-    AMAR  = colors.HexColor("#fff3cd")
-    CINZA = colors.HexColor("#f5f5f5")
-
-    cabecalho = ["Nº Pedido", "Produto", "SKU", "Qtd"]
-    linhas    = [cabecalho]
+    c = rl_canvas.Canvas(str(out), pagesize=(LW, LH))
     for p in pedidos:
         qtd = int(p.get("quantidade") or 1)
-        linhas.append([
-            p.get("order_number", ""),
-            (p.get("product_name") or "")[:50],
-            p.get("sku", ""),
-            f"{qtd}x" if qtd > 1 else "1",
-        ])
+        on  = p.get("order_number", "")
+        produto = (p.get("product_name") or "")[:38]
+        sku     = p.get("sku", "")
 
-    col_w = [45*mm, 88*mm, 32*mm, 15*mm]
-    tabela = Table(linhas, colWidths=col_w, repeatRows=1)
+        # Cabeçalho: "PICKLIST  DD/MM HH:MM  (N ped)"
+        c.setFont("Helvetica", 5.5)
+        c.setFillColor(rl_colors.grey)
+        c.drawString(4 * rl_mm, topo, f"PICKLIST  {ts}")
 
-    ts = TableStyle([
-        ("BACKGROUND",   (0, 0), (-1, 0), AZUL),
-        ("TEXTCOLOR",    (0, 0), (-1, 0), colors.white),
-        ("FONTNAME",     (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE",     (0, 0), (-1, 0), 10),
-        ("FONTSIZE",     (0, 1), (-1, -1), 9),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, CINZA]),
-        ("GRID",         (0, 0), (-1, -1), 0.4, colors.grey),
-        ("ALIGN",        (3, 0), (3, -1), "CENTER"),
-        ("VALIGN",       (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING",   (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING",(0, 0), (-1, -1), 4),
-    ])
-    for i, p in enumerate(pedidos, start=1):
-        if int(p.get("quantidade") or 1) > 1:
-            ts.add("BACKGROUND", (0, i), (-1, i), AMAR)
-            ts.add("FONTNAME",   (0, i), (-1, i), "Helvetica-Bold")
-    tabela.setStyle(ts)
-    elementos.append(tabela)
+        # Número do pedido — destaque
+        c.setFont("Helvetica-Bold", 12)
+        c.setFillColor(rl_colors.black)
+        c.drawString(4 * rl_mm, topo - 8 * rl_mm, on)
 
-    doc.build(elementos)
-    log(f"[picklist] 📄 PDF gerado: {out.name} ({len(pedidos)} pedidos)")
+        # Quantidade (se > 1, destaque extra)
+        if qtd > 1:
+            c.setFont("Helvetica-Bold", 9)
+            c.setFillColor(rl_colors.HexColor("#b45309"))
+            c.drawRightString(LW - 4 * rl_mm, topo - 8 * rl_mm, f"QTD {qtd}x")
+
+        # Nome do produto
+        c.setFont("Helvetica", 8)
+        c.setFillColor(rl_colors.black)
+        c.drawString(4 * rl_mm, topo - 17 * rl_mm, produto)
+
+        # SKU
+        c.setFont("Helvetica", 7)
+        c.setFillColor(rl_colors.grey)
+        c.drawString(4 * rl_mm, topo - 24 * rl_mm, f"SKU: {sku}")
+
+        # Linha separadora no rodapé
+        c.setStrokeColor(rl_colors.HexColor("#cccccc"))
+        c.setLineWidth(0.4)
+        c.line(0, 2 * rl_mm, LW, 2 * rl_mm)
+
+        c.showPage()
+
+    c.save()
+    log(f"[picklist] 📄 PDF gerado: {out.name} ({len(pedidos)} pedidos, 10x5cm)")
     return out
 
 
@@ -2274,8 +2271,9 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
 
     log(f"[picklist] 📋 {len(pedidos)} pedido(s) para picklist")
 
+    margem_topo_mm = float(config.get("margem_topo_mm", 5) or 0)
     try:
-        pdf_pick = _gerar_picklist_pdf(pedidos)
+        pdf_pick = _gerar_picklist_pdf(pedidos, margem_topo_mm=margem_topo_mm)
     except Exception as e:
         log(f"[picklist] ❌ Erro ao gerar PDF: {e}")
         return False
@@ -2499,30 +2497,25 @@ def servir_etiqueta(order_number):
     config = json.loads(CONFIG_FILE.read_text(encoding="utf-8")) if CONFIG_FILE.exists() else {}
     nome_impressora = config.get("nome_impressora", "").strip()
 
-    quantidade_pedido = 1  # atualizado por _obter_pdf se Supabase responder
-
     def _obter_pdf() -> bool:
-        nonlocal quantidade_pedido
         if pdf_path.exists():
             _garantir_pagina_unica(pdf_path)
+            return True
         try:
             supa = create_client(*_supa())
             r = (supa.table("pedidos")
-                 .select("label_url,quantidade")
+                 .select("label_url")
                  .eq("order_number", order_number)
                  .limit(1).execute())
             rows = r.data or []
-            if rows:
-                quantidade_pedido = int(rows[0].get("quantidade") or 1)
-                url = rows[0].get("label_url")
-                if not pdf_path.exists() and url \
-                        and "127.0.0.1:5001" not in url \
-                        and "localhost:5001" not in url:
-                    _ul.urlretrieve(url, str(pdf_path))
-                    _garantir_pagina_unica(pdf_path)
+            url = rows[0].get("label_url") if rows else None
+            if url and "127.0.0.1:5001" not in url and "localhost:5001" not in url:
+                _ul.urlretrieve(url, str(pdf_path))
+                _garantir_pagina_unica(pdf_path)
+                return True
         except Exception:
             pass
-        return pdf_path.exists()
+        return False
 
     if not _obter_pdf():
         r = jsonify({"erro": "Etiqueta não disponível — execute o robô primeiro"})
@@ -2551,16 +2544,12 @@ def servir_etiqueta(order_number):
     )
     log(f"[etiqueta] 📄 {order_number} | impressora={impressora_usar or '(padrão)'} | tem_impressora={tem_impressora} | sistema={sistema}")
 
-    margem_topo_mm = float(config.get("margem_topo_mm", 3) or 0)
+    margem_topo_mm = float(config.get("margem_topo_mm", 5) or 0)
 
     if tem_impressora:
         try:
             pdf_imprimir = _corrigir_mediabox(pdf_path)
             pdf_imprimir = _adicionar_margem_topo(pdf_imprimir, margem_topo_mm)
-            # Multi-unidade: gera PDF com N páginas antes de mandar para impressora
-            if quantidade_pedido > 1:
-                pdf_imprimir = _gerar_pdf_multicopia(pdf_imprimir, quantidade_pedido)
-                log(f"[etiqueta] 🗂️ {order_number} — {quantidade_pedido} unidades → {quantidade_pedido} etiquetas")
             log(f"[etiqueta] 📐 {order_number} | pdf={pdf_imprimir.name} | tamanho={pdf_imprimir.stat().st_size}B")
             if sistema == "Darwin":
                 cmd = ["lp", "-d", impressora_usar, str(pdf_imprimir)] if impressora_usar else ["lp", str(pdf_imprimir)]
@@ -2573,8 +2562,7 @@ def servir_etiqueta(order_number):
                 log(f"[etiqueta] 🔄 {order_number} → SumatraPDF → {impressora_usar or 'padrão'}")
                 _imprimir_windows(pdf_imprimir, impressora_usar)
                 log(f"[etiqueta] 🖨️ {order_number} → {impressora_usar or 'impressora padrão'}")
-            r = jsonify({"ok": True, "impresso": True, "impressora": impressora_usar,
-                         "copias": quantidade_pedido})
+            r = jsonify({"ok": True, "impresso": True, "impressora": impressora_usar})
             r.headers["Access-Control-Allow-Origin"] = "*"
             return r
         except Exception as e:

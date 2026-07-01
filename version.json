@@ -1,4 +1,4 @@
 {
-  "version": "1.5.81",
-  "descricao": "picklist por rodada do Supabase (sem Playwright); multi-copia de etiqueta para pedidos com quantidade > 1"
+  "version": "1.5.82",
+  "descricao": "picklist 10x5cm termica (uma etiqueta por pedido); margem topo 5mm (era 3mm); cache de margem por valor; remove multicopia de etiqueta"
 }
