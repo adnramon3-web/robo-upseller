@@ -1,4 +1,4 @@
 {
-  "version": "1.5.89",
-  "descricao": "fix root cause: pypdf ausente no requirements — margem nunca foi aplicada"
+  "version": "1.5.90",
+  "descricao": "margem: stdlib puro (re+zlib), sem pypdf — injeta cm nos content streams"
 }

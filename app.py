@@ -2037,46 +2037,78 @@ def _corrigir_mediabox(pdf_path: "Path") -> "Path":
 
 
 def _adicionar_margem_topo(pdf_path: "Path", topo_mm: float, esq_mm: float = 0.0) -> "Path":
-    """Escala o conteúdo para dentro da página centralizando, criando margem branca
-    real em todos os lados. Funciona independente do /Rotate do PDF (Shein/Shopee
-    têm rotação de 90° que invertia a direção das tentativas anteriores).
-    Toda a informação é preservada — apenas ligeiramente menor."""
+    """Injeta um operador 'cm' de escala+centralização nos content streams do PDF
+    usando apenas stdlib (re + zlib) — sem dependência de pypdf.
+    Funciona independente de /Rotate (Shein/Shopee têm rotação 90°)."""
     if topo_mm <= 0 and esq_mm <= 0:
         return pdf_path
     try:
-        try:
-            from pypdf import PdfReader, PdfWriter, Transformation
-        except ImportError:
-            import subprocess as _sp
-            _sp.run([sys.executable, "-m", "pip", "install", "pypdf>=3.0", "-q"],
-                    timeout=90, capture_output=True)
-            from pypdf import PdfReader, PdfWriter, Transformation
+        import re as _re, zlib as _zlib
         t_tag = str(topo_mm).replace(".", "_")
         e_tag = str(esq_mm).replace(".", "_")
-        out = pdf_path.with_stem(pdf_path.stem + f"_mc{t_tag}x{e_tag}")
+        out = pdf_path.with_stem(pdf_path.stem + f"_mz{t_tag}x{e_tag}")
         if out.exists():
             return out
-        pt_margin = max(topo_mm, esq_mm) * 72 / 25.4  # margem uniforme em todos os lados
-        reader = PdfReader(str(pdf_path))
-        orig   = reader.pages[0]
-        w = float(orig.mediabox.width)
-        h = float(orig.mediabox.height)
-        # Escala para caber com margem em todos os 4 lados
-        scale = min((w - 2 * pt_margin) / w, (h - 2 * pt_margin) / h)
+
+        data = pdf_path.read_bytes()
+
+        # Dimensões da página original
+        mb = _re.search(rb'/MediaBox\s*\[([^\]]+)\]', data)
+        if not mb:
+            log(f"[etiqueta] ⚠️ margem: MediaBox nao encontrado em {pdf_path.name}")
+            return pdf_path
+        vals = list(map(float, mb.group(1).split()))
+        if len(vals) != 4:
+            return pdf_path
+        page_w = vals[2] - vals[0]
+        page_h = vals[3] - vals[1]
+
+        pt_margin = max(topo_mm, esq_mm) * 72 / 25.4
+        scale = min((page_w - 2 * pt_margin) / page_w,
+                    (page_h - 2 * pt_margin) / page_h)
         scale = max(0.5, min(0.99, scale))
-        # Centraliza o conteúdo escalado dentro da página original
-        tx = w * (1 - scale) / 2
-        ty = h * (1 - scale) / 2
-        orig.add_transformation(
-            Transformation().scale(scale, scale).translate(tx=tx, ty=ty)
+        tx = page_w * (1 - scale) / 2
+        ty = page_h * (1 - scale) / 2
+
+        # Operadores PDF a injetar: salva estado, aplica escala+translação
+        cm_open  = (f"q\n{scale:.6f} 0 0 {scale:.6f} {tx:.4f} {ty:.4f} cm\n").encode()
+        cm_close = b"\nQ\n"
+
+        patched  = data
+        n_patched = 0
+
+        def _patch(m):
+            nonlocal n_patched
+            hdr, length_s, mid, sdata, tail = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+            try:
+                dec = _zlib.decompress(sdata)
+            except Exception:
+                return m.group(0)
+            # Só modifica streams que parecem content streams (têm operadores PDF legíveis)
+            sample = dec[:400].decode('latin-1', errors='replace')
+            if not _re.search(r'\b(?:q|Q|BT|ET|cm|Do|Tf|Td|Tm|re|m\b|l\b|S\b|f\b|w\b|rg\b|RG\b|gs\b)\b', sample):
+                return m.group(0)
+            new_dec  = cm_open + dec + cm_close
+            new_comp = _zlib.compress(new_dec)
+            new_hdr  = _re.sub(rb'/Length\s+\d+',
+                               b'/Length ' + str(len(new_comp)).encode(),
+                               hdr + length_s + mid)
+            n_patched += 1
+            return new_hdr + new_comp + tail
+
+        pattern = _re.compile(
+            rb'(<<[^>]*?/Filter\s*/FlateDecode[^>]*?/Length\s+)(\d+)([^>]*?>>\s*stream\r?\n)'
+            rb'([\x00-\xff]+?)(\r?\nendstream)',
+            _re.DOTALL
         )
-        if "/CropBox" in orig:
-            del orig["/CropBox"]
-        writer = PdfWriter()
-        writer.add_page(orig)
-        with open(str(out), "wb") as f:
-            writer.write(f)
-        log(f"[etiqueta] 📐 margem={pt_margin/2.835:.1f}mm escala={scale:.3f} tx={tx:.1f} ty={ty:.1f} → {out.name}")
+        patched = pattern.sub(_patch, patched)
+
+        if n_patched == 0:
+            log(f"[etiqueta] ⚠️ margem: nenhum content stream encontrado em {pdf_path.name}")
+            return pdf_path
+
+        out.write_bytes(patched)
+        log(f"[etiqueta] 📐 margem={pt_margin/2.835:.1f}mm escala={scale:.3f} streams={n_patched} → {out.name}")
         return out
     except Exception as e:
         log(f"[etiqueta] ⚠️ _adicionar_margem_topo: {e}")
