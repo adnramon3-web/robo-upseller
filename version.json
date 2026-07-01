@@ -1,4 +1,4 @@
 {
-  "version": "1.5.84",
-  "descricao": "margem topo etiqueta: default 5mm -> 8mm (ajuste corte Elgin)"
+  "version": "1.5.85",
+  "descricao": "margem topo etiqueta: 8mm -> 12mm (ainda cortava Shein/Shopee)"
 }
