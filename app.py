@@ -2037,33 +2037,32 @@ def _corrigir_mediabox(pdf_path: "Path") -> "Path":
 
 
 def _adicionar_margem_topo(pdf_path: "Path", topo_mm: float, esq_mm: float = 0.0) -> "Path":
-    """Expande o MediaBox no topo e/ou à esquerda para compensar corte físico da impressora.
-    Expandir o topo → SumatraPDF (fit) desloca conteúdo para baixo.
-    Expandir a esquerda → SumatraPDF (fit) desloca conteúdo para a direita.
-    Os valores são incluídos no nome do cache — mudança de config gera novo arquivo."""
+    """Cria uma nova página maior e coloca o conteúdo original deslocado para dentro,
+    compensando o corte físico da impressora Elgin.
+    - topo_mm: espaço extra no topo  → conteúdo desce na impressão
+    - esq_mm : espaço extra à esquerda → conteúdo vai para a direita
+    Os valores ficam no nome do cache; mudar config invalida automaticamente."""
     if topo_mm <= 0 and esq_mm <= 0:
         return pdf_path
     try:
-        from pypdf import PdfReader, PdfWriter
-        from pypdf.generic import ArrayObject, FloatObject
+        from pypdf import PdfReader, PdfWriter, Transformation
         t_tag = str(topo_mm).replace(".", "_")
         e_tag = str(esq_mm).replace(".", "_")
-        out = pdf_path.with_stem(pdf_path.stem + f"_mt{t_tag}_me{e_tag}")
+        out = pdf_path.with_stem(pdf_path.stem + f"_mg{t_tag}x{e_tag}")
         if out.exists():
             return out
         pt_topo = topo_mm * 72 / 25.4
         pt_esq  = esq_mm  * 72 / 25.4
         reader = PdfReader(str(pdf_path))
-        writer = PdfWriter()
-        page = reader.pages[0]
-        mb = page.mediabox
-        page.mediabox = ArrayObject([
-            FloatObject(float(mb.left)   - pt_esq),   # expande borda esquerda
-            FloatObject(float(mb.bottom)),
-            FloatObject(float(mb.right)),
-            FloatObject(float(mb.top)    + pt_topo),   # expande borda superior
-        ])
-        writer.add_page(page)
+        orig   = reader.pages[0]
+        w = float(orig.mediabox.width)
+        h = float(orig.mediabox.height)
+        writer   = PdfWriter()
+        # Página em branco maior; conteúdo deslocado pt_esq para a direita
+        # O espaço extra no topo fica vazio — SumatraPDF (fit) encolhe tudo e
+        # o conteúdo aparece mais abaixo/direita no papel físico
+        new_page = writer.add_blank_page(w + pt_esq, h + pt_topo)
+        new_page.merge_transformed_page(orig, Transformation().translate(tx=pt_esq, ty=0))
         with open(str(out), "wb") as f:
             writer.write(f)
         log(f"[etiqueta] 📐 margem topo={topo_mm}mm esq={esq_mm}mm → {out.name}")
