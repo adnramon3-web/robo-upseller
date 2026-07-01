@@ -2440,7 +2440,38 @@ async def _imprimir_picklist_playwright(config: dict):
             await context.close()
 
 
-# ── Rota: imprimir picklist ───────────────────────────────────────────────────
+# ── Rota: marcar picklist como impressa (chamada pelo PCP após imprimir) ──────
+@app.route("/marcar-picklist-impresso", methods=["POST", "OPTIONS"])
+def marcar_picklist_impresso():
+    if request.method == "OPTIONS":
+        resp = jsonify({})
+        resp.headers["Access-Control-Allow-Origin"]  = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "POST"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return resp
+    data         = request.get_json() or {}
+    order_numbers = data.get("order_numbers", [])
+    if not order_numbers:
+        r = jsonify({"ok": False, "erro": "Nenhum pedido informado"})
+        r.headers["Access-Control-Allow-Origin"] = "*"
+        return r
+    try:
+        supa  = create_client(*_supa())
+        agora = datetime.utcnow().isoformat()
+        for i in range(0, len(order_numbers), 50):
+            supa.table("pedidos").update({"picklist_impresso_em": agora}) \
+                .in_("order_number", order_numbers[i:i+50]).execute()
+        log(f"[picklist] ✅ {len(order_numbers)} pedido(s) marcados via PCP")
+        r = jsonify({"ok": True, "marcados": len(order_numbers)})
+        r.headers["Access-Control-Allow-Origin"] = "*"
+        return r
+    except Exception as e:
+        r = jsonify({"ok": False, "erro": str(e)})
+        r.headers["Access-Control-Allow-Origin"] = "*"
+        return r
+
+
+# ── Rota: imprimir picklist (legado — mantida para compatibilidade) ────────────
 @app.route("/imprimir-picklist", methods=["POST", "OPTIONS"])
 def imprimir_picklist():
     if request.method == "OPTIONS":

@@ -1,4 +1,4 @@
 {
-  "version": "1.5.82",
-  "descricao": "picklist 10x5cm termica (uma etiqueta por pedido); margem topo 5mm (era 3mm); cache de margem por valor; remove multicopia de etiqueta"
+  "version": "1.5.83",
+  "descricao": "picklist gerada e impressa pelo PCP (sem robo); robo expoe /marcar-picklist-impresso para registrar no Supabase"
 }
