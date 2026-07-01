@@ -2036,36 +2036,37 @@ def _corrigir_mediabox(pdf_path: "Path") -> "Path":
         return pdf_path
 
 
-def _adicionar_margem_topo(pdf_path: "Path", mm: float) -> "Path":
-    """Expande o MediaBox no topo em `mm` milímetros.
-    O conteúdo não muda de posição — o espaço extra no topo faz o SumatraPDF
-    (fit) deslocar o conteúdo para baixo, compensando o corte físico da impressora.
-    O valor de mm é incluído no nome do arquivo de cache — se o config mudar,
-    um novo arquivo é gerado automaticamente."""
-    if mm <= 0:
+def _adicionar_margem_topo(pdf_path: "Path", topo_mm: float, esq_mm: float = 0.0) -> "Path":
+    """Expande o MediaBox no topo e/ou à esquerda para compensar corte físico da impressora.
+    Expandir o topo → SumatraPDF (fit) desloca conteúdo para baixo.
+    Expandir a esquerda → SumatraPDF (fit) desloca conteúdo para a direita.
+    Os valores são incluídos no nome do cache — mudança de config gera novo arquivo."""
+    if topo_mm <= 0 and esq_mm <= 0:
         return pdf_path
     try:
         from pypdf import PdfReader, PdfWriter
         from pypdf.generic import ArrayObject, FloatObject
-        mm_tag = str(mm).replace(".", "_")
-        out = pdf_path.with_stem(pdf_path.stem + f"_m{mm_tag}")
+        t_tag = str(topo_mm).replace(".", "_")
+        e_tag = str(esq_mm).replace(".", "_")
+        out = pdf_path.with_stem(pdf_path.stem + f"_mt{t_tag}_me{e_tag}")
         if out.exists():
             return out
-        pt = mm * 72 / 25.4  # mm → points
+        pt_topo = topo_mm * 72 / 25.4
+        pt_esq  = esq_mm  * 72 / 25.4
         reader = PdfReader(str(pdf_path))
         writer = PdfWriter()
         page = reader.pages[0]
         mb = page.mediabox
         page.mediabox = ArrayObject([
-            FloatObject(float(mb.left)),
+            FloatObject(float(mb.left)   - pt_esq),   # expande borda esquerda
             FloatObject(float(mb.bottom)),
             FloatObject(float(mb.right)),
-            FloatObject(float(mb.top) + pt),
+            FloatObject(float(mb.top)    + pt_topo),   # expande borda superior
         ])
         writer.add_page(page)
         with open(str(out), "wb") as f:
             writer.write(f)
-        log(f"[etiqueta] 📐 margem topo {mm}mm → {out.name}")
+        log(f"[etiqueta] 📐 margem topo={topo_mm}mm esq={esq_mm}mm → {out.name}")
         return out
     except Exception as e:
         log(f"[etiqueta] ⚠️ _adicionar_margem_topo: {e}")
@@ -2575,12 +2576,13 @@ def servir_etiqueta(order_number):
     )
     log(f"[etiqueta] 📄 {order_number} | impressora={impressora_usar or '(padrão)'} | tem_impressora={tem_impressora} | sistema={sistema}")
 
-    margem_topo_mm = float(config.get("margem_topo_mm", 12) or 0)
+    margem_topo_mm = float(config.get("margem_topo_mm", 8) or 0)
+    margem_esq_mm  = float(config.get("margem_esq_mm",  8) or 0)
 
     if tem_impressora:
         try:
             pdf_imprimir = _corrigir_mediabox(pdf_path)
-            pdf_imprimir = _adicionar_margem_topo(pdf_imprimir, margem_topo_mm)
+            pdf_imprimir = _adicionar_margem_topo(pdf_imprimir, margem_topo_mm, margem_esq_mm)
             log(f"[etiqueta] 📐 {order_number} | pdf={pdf_imprimir.name} | tamanho={pdf_imprimir.stat().st_size}B")
             if sistema == "Darwin":
                 cmd = ["lp", "-d", impressora_usar, str(pdf_imprimir)] if impressora_usar else ["lp", str(pdf_imprimir)]
