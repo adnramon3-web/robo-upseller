@@ -314,6 +314,10 @@ async def _backfill_historico(config: dict, dias: int):
                 break
 
         if on not in pedidos_dict:
+            nome_cliente = (
+                order.get("receiverName") or order.get("buyerName") or
+                order.get("recipientName") or order.get("receiveName") or ""
+            ).strip() or None
             pedidos_dict[on] = {
                 "order_number":      on,
                 "numero_plataforma": (order.get("orderId") or order.get("extendedId") or "").strip() or None,
@@ -326,6 +330,7 @@ async def _backfill_historico(config: dict, dias: int):
                 "valor":             valor,
                 "cliente":           token,
                 "label_url":         api_label_url,
+                "nome_cliente":      nome_cliente,
             }
 
     # Filtra só os que não estão no Supabase
@@ -347,7 +352,7 @@ async def _backfill_historico(config: dict, dias: int):
     # Insere em lotes com tratamento de erro por coluna
     inseridos = 0
     erros = 0
-    COLUNAS_OPCIONAIS = {"plataforma", "valor", "label_url", "numero_plataforma"}
+    COLUNAS_OPCIONAIS = {"plataforma", "valor", "label_url", "numero_plataforma", "nome_cliente"}
     for i in range(0, len(faltando), 50):
         lote_orig = faltando[i:i + 50]
         excluir: set = set()
@@ -431,6 +436,7 @@ CREATE TABLE IF NOT EXISTS pedidos (
     label_url        TEXT
 );
 ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS numero_plataforma TEXT;
+ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS nome_cliente TEXT;
 
 CREATE TABLE IF NOT EXISTS pedido_itens (
     id           BIGSERIAL PRIMARY KEY,
@@ -5594,6 +5600,15 @@ if __name__ == "__main__":
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
 
+    def _migrar_colunas():
+        try:
+            sb = create_client(*_supa())
+            sb.rpc("exec_sql", {"sql": "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS nome_cliente TEXT;"}).execute()
+            log("[startup] ✅ Coluna nome_cliente verificada/criada")
+        except Exception:
+            pass  # exec_sql pode não existir; coluna pode já existir — tudo ok
+
+    threading.Thread(target=_migrar_colunas, daemon=True).start()
     threading.Thread(target=_loop_agendador, daemon=True).start()
     threading.Thread(target=_loop_captura_etiquetas, daemon=True).start()
     # Pré-baixa SumatraPDF no Windows para a primeira impressão ser imediata

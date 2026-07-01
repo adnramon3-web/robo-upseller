@@ -1,4 +1,4 @@
 {
-  "version": "1.5.91",
-  "descricao": "margem padrao reduzida 8mm -> 4mm (ficou grande demais)"
+  "version": "1.5.92",
+  "descricao": "picklist: adiciona nome_cliente e plataforma; migration automatica da coluna nome_cliente"
 }
