@@ -2823,6 +2823,45 @@ def servir_etiqueta(order_number):
     return r
 
 
+@app.route("/gerar-picklist-teste", methods=["POST", "OPTIONS"], provide_automatic_options=False)
+def gerar_picklist_teste():
+    """Gera picklist de todos os pedidos com label_url no Supabase (sem marcar picklist_impresso_em)."""
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    if not CONFIG_FILE.exists():
+        r = jsonify({"ok": False, "erro": "Config não encontrada"})
+        r.headers["Access-Control-Allow-Origin"] = "*"
+        return r, 400
+    cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    token = cfg.get("token", "")
+    try:
+        supa = create_client(*_supa())
+        res = (supa.table("pedidos")
+               .select("order_number,product_name,sku,quantidade,status_upseller,label_url")
+               .eq("status", "ativo")
+               .eq("cliente", token)
+               .not_.is_("label_url", "null")
+               .order("data", desc=False)
+               .execute())
+        pedidos = res.data or []
+    except Exception as e:
+        r = jsonify({"ok": False, "erro": str(e)})
+        r.headers["Access-Control-Allow-Origin"] = "*"
+        return r, 500
+    if not pedidos:
+        r = jsonify({"ok": False, "erro": "Nenhum pedido com etiqueta encontrado"})
+        r.headers["Access-Control-Allow-Origin"] = "*"
+        return r, 404
+    margem_topo_mm = float(cfg.get("margem_topo_mm", 5) or 0)
+    pdf = _gerar_picklist_pdf(pedidos, margem_topo_mm=margem_topo_mm)
+    log(f"[picklist-teste] 📋 {len(pedidos)} pedidos com etiqueta → {pdf.name}")
+    r = jsonify({"ok": True, "total": len(pedidos),
+                 "url": f"http://127.0.0.1:5001/picklist-ver/{pdf.name}",
+                 "nome": pdf.name})
+    r.headers["Access-Control-Allow-Origin"] = "*"
+    return r
+
+
 @app.route("/picklist-pdf", methods=["GET"])
 def picklist_pdf():
     arquivos = sorted(PASTA_PICKLISTS.glob("picklist_*.pdf"))
