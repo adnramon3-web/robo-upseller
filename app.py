@@ -2842,6 +2842,57 @@ def picklist_pdf():
     return resp
 
 
+@app.route("/picklists-disponiveis", methods=["GET", "OPTIONS"], provide_automatic_options=False)
+def picklists_disponiveis():
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    arquivos = sorted(PASTA_PICKLISTS.glob("picklist_*.pdf"), reverse=True)
+    lista = []
+    for pdf in arquivos:
+        st = pdf.stat()
+        lista.append({
+            "nome":    pdf.name,
+            "tamanho": st.st_size,
+            "criado":  datetime.fromtimestamp(st.st_mtime).strftime("%d/%m/%Y %H:%M"),
+            "url":     f"http://127.0.0.1:5001/picklist-ver/{pdf.name}",
+        })
+    r = jsonify({"ok": True, "picklists": lista})
+    r.headers["Access-Control-Allow-Origin"] = "*"
+    return r
+
+
+@app.route("/picklist-ver/<nome>", methods=["GET"])
+def picklist_ver(nome):
+    from flask import Response
+    pdf = PASTA_PICKLISTS / nome
+    if not pdf.exists() or not nome.startswith("picklist_") or not nome.endswith(".pdf"):
+        return jsonify({"erro": "Não encontrado"}), 404
+    resp = Response(pdf.read_bytes(), mimetype="application/pdf")
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Content-Disposition"] = f"inline; filename={nome}"
+    return resp
+
+
+@app.route("/picklist-apagar/<nome>", methods=["DELETE", "OPTIONS"], provide_automatic_options=False)
+def picklist_apagar(nome):
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    if not nome.startswith("picklist_") or not nome.endswith(".pdf"):
+        r = jsonify({"ok": False, "erro": "Nome inválido"})
+        r.headers["Access-Control-Allow-Origin"] = "*"
+        return r, 400
+    pdf = PASTA_PICKLISTS / nome
+    try:
+        pdf.unlink(missing_ok=True)
+    except Exception as e:
+        r = jsonify({"ok": False, "erro": str(e)})
+        r.headers["Access-Control-Allow-Origin"] = "*"
+        return r, 500
+    r = jsonify({"ok": True})
+    r.headers["Access-Control-Allow-Origin"] = "*"
+    return r
+
+
 # ── Sincroniza pedidos novos (capturados entre imports) no Supabase ──────────
 
 async def _sincronizar_pedidos_novos_supabase(page, order_numbers: list, config: dict):
@@ -5810,6 +5861,21 @@ def _limpar_etiquetas_antigas(dias: int = 7):
         log(f"🗑️ {removidos} etiqueta(s) com mais de {dias} dias removidas")
 
 
+def _limpar_picklists_antigas(dias: int = 7):
+    """Apaga PDFs de picklist com mais de X dias."""
+    corte = date.today() - timedelta(days=dias)
+    removidos = 0
+    for pdf in PASTA_PICKLISTS.glob("picklist_*.pdf"):
+        try:
+            if date.fromtimestamp(pdf.stat().st_mtime) <= corte:
+                pdf.unlink()
+                removidos += 1
+        except Exception:
+            pass
+    if removidos:
+        log(f"🗑️ {removidos} picklist(s) com mais de {dias} dias removidas")
+
+
 def _loop_captura_etiquetas():
     """Captura etiquetas do UpSeller a cada 60s, com retroativo a cada 5 min."""
     INTERVALO = 60  # 1 minuto
@@ -5993,6 +6059,7 @@ if __name__ == "__main__":
     PASTA_ETIQUETAS.mkdir(exist_ok=True)
     PASTA_PICKLISTS.mkdir(exist_ok=True)
     _limpar_etiquetas_antigas()
+    _limpar_picklists_antigas()
     # No Mac, mantém o sistema acordado enquanto o app estiver rodando
     if platform.system() == "Darwin":
         import os
