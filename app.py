@@ -2286,11 +2286,13 @@ def _nome_impressora_padrao() -> str:
 # ── Picklist gerada do Supabase (sem Playwright) ─────────────────────────────
 
 def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0) -> "Path":
-    """Gera PDF de picklist em papel térmico 10x5cm — capa resumo + uma etiqueta por pedido."""
+    """Gera PDF de picklist em papel térmico 10x5cm.
+    Capa resumo + uma etiqueta por UNIDADE (pedidos com qty>1 geram N etiquetas) com código de barras."""
     from reportlab.pdfgen import canvas as rl_canvas
     from reportlab.lib.units import mm as rl_mm
     from reportlab.lib import colors as rl_colors
     from reportlab.lib.colors import HexColor
+    from reportlab.graphics.barcode import code128 as rl_barcode
     from collections import Counter
 
     PASTA_PICKLISTS.mkdir(exist_ok=True)
@@ -2300,22 +2302,28 @@ def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0) -> "Path":
     LW = 100 * rl_mm
     LH = 50  * rl_mm
     offset_y = margem_topo_mm * rl_mm
-    topo = LH - offset_y - 2 * rl_mm
+    topo = LH - offset_y - 2 * rl_mm   # coordenada Y do topo útil
 
-    ts = datetime.now().strftime("%d/%m/%Y %H:%M")
+    ts = datetime.now().strftime("%d/%m %H:%M")
 
     def _cat(p):
         st  = (p.get("status") or "").strip().lower()
         sup = (p.get("status_upseller") or "").strip().lower()
-        if st == "cancelado":          return "cancelado"
-        if sup == "para reservar":     return "reservar"
-        if sup == "para retirada":     return "retirada"
+        if st == "cancelado":      return "cancelado"
+        if sup == "para reservar": return "reservar"
+        if sup == "para retirada": return "retirada"
         return "normal"
 
-    # Ordena: normal → retirada → reservar → cancelado
-    _ORD = {"normal": 0, "retirada": 1, "reservar": 2, "cancelado": 3}
+    _ORD   = {"normal": 0, "retirada": 1, "reservar": 2, "cancelado": 3}
     pedidos = sorted(pedidos, key=lambda p: _ORD.get(_cat(p), 0))
-    cats = Counter(_cat(p) for p in pedidos)
+    cats    = Counter(_cat(p) for p in pedidos)
+
+    # Expande para uma entrada por UNIDADE (para multi-item gerar fração 1/N, 2/N…)
+    unidades = []
+    for p in pedidos:
+        qtd = max(int(p.get("quantidade") or 1), 1)
+        for i in range(qtd):
+            unidades.append((p, i + 1, qtd))
 
     _BADGE = {
         "retirada":  (HexColor("#1D4ED8"), HexColor("#DBEAFE"), "RETIRADA"),
@@ -2328,11 +2336,12 @@ def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0) -> "Path":
     # ── CAPA RESUMO ───────────────────────────────────────────────────────────
     c.setFont("Helvetica-Bold", 9)
     c.setFillColor(rl_colors.black)
-    c.drawString(4 * rl_mm, topo, f"PICKLIST — {ts}")
+    c.drawString(4 * rl_mm, topo, f"PICKLIST — {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     c.setFont("Helvetica-Bold", 8)
-    c.drawString(4 * rl_mm, topo - 8 * rl_mm, f"Total: {len(pedidos)} pedidos")
+    c.drawString(4 * rl_mm, topo - 8 * rl_mm,
+                 f"Total: {len(pedidos)} pedidos  |  {len(unidades)} unidades")
 
-    y = topo - 16 * rl_mm
+    y = topo - 17 * rl_mm
     for label, key, color in [
         ("Para Processar", "normal",    rl_colors.black),
         ("Para Retirada",  "retirada",  HexColor("#1D4ED8")),
@@ -2351,15 +2360,18 @@ def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0) -> "Path":
     c.line(0, 2 * rl_mm, LW, 2 * rl_mm)
     c.showPage()
 
-    # ── UMA ETIQUETA POR PEDIDO ───────────────────────────────────────────────
-    for p in pedidos:
+    # ── UMA ETIQUETA POR UNIDADE ──────────────────────────────────────────────
+    for p, frac_i, frac_total in unidades:
         cat     = _cat(p)
-        qtd     = int(p.get("quantidade") or 1)
         on      = p.get("order_number", "")
-        produto = (p.get("product_name") or "")[:38]
-        sku     = p.get("sku", "")
+        produto = (p.get("product_name") or "")[:36]
+        sku     = (p.get("sku") or "")
+        cliente = (p.get("nome_cliente") or "")[:30]
+        plat    = (p.get("plataforma") or "")[:12]
+        data    = (p.get("data") or "")  # "YYYY-MM-DD"
+        data_fmt = f"{data[8:10]}/{data[5:7]}/{data[2:4]}" if len(data) >= 10 else ""
 
-        # Fundo levemente colorido para situações especiais
+        # Fundo colorido para situações especiais
         if cat == "cancelado":
             c.setFillColor(HexColor("#FFF5F5"))
             c.rect(0, 0, LW, LH, fill=1, stroke=0)
@@ -2373,7 +2385,7 @@ def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0) -> "Path":
             fg, bg, txt = badge
             bw, bh = 26 * rl_mm, 6 * rl_mm
             bx = LW - bw - 3 * rl_mm
-            by = topo - 1 * rl_mm
+            by = topo - 0.5 * rl_mm
             c.setFillColor(bg)
             c.roundRect(bx, by, bw, bh, 1.5 * rl_mm, fill=1, stroke=0)
             c.setFillColor(fg)
@@ -2385,33 +2397,58 @@ def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0) -> "Path":
         c.setFillColor(rl_colors.grey)
         c.drawString(4 * rl_mm, topo, f"PICKLIST  {ts}")
 
-        # Número do pedido
-        c.setFont("Helvetica-Bold", 12)
+        # Número do pedido + fração
+        c.setFont("Helvetica-Bold", 11)
         c.setFillColor(HexColor("#991B1B") if cat == "cancelado" else rl_colors.black)
-        c.drawString(4 * rl_mm, topo - 8 * rl_mm, on)
+        c.drawString(4 * rl_mm, topo - 7 * rl_mm, on)
+        if frac_total > 1:
+            c.setFont("Helvetica-Bold", 10)
+            c.setFillColor(HexColor("#b45309"))
+            c.drawRightString(LW - 4 * rl_mm, topo - 7 * rl_mm, f"{frac_i}/{frac_total}")
 
-        # Linha de aviso (cancelado / reservar) ou produto+sku (normal/retirada)
+        # Plataforma
+        if plat and not badge:  # só mostra se não há badge ocupando espaço
+            c.setFont("Helvetica-Bold", 6)
+            c.setFillColor(HexColor("#1d4ed8"))
+            c.drawRightString(LW - 4 * rl_mm, topo, plat)
+
+        # Conteúdo central: produto / aviso
         if cat == "cancelado":
             c.setFont("Helvetica-Bold", 7)
             c.setFillColor(HexColor("#991B1B"))
-            c.drawString(4 * rl_mm, topo - 17 * rl_mm, "NAO PROCESSAR — PEDIDO CANCELADO")
+            c.drawString(4 * rl_mm, topo - 14 * rl_mm, "NAO PROCESSAR — PEDIDO CANCELADO")
         elif cat == "reservar":
             c.setFont("Helvetica", 7)
             c.setFillColor(HexColor("#92400E"))
-            c.drawString(4 * rl_mm, topo - 17 * rl_mm, "Aguardando liberacao — nao processar ainda")
+            c.drawString(4 * rl_mm, topo - 14 * rl_mm, "Aguardando liberacao — nao processar ainda")
         else:
-            c.setFont("Helvetica", 8)
+            c.setFont("Helvetica", 7.5)
             c.setFillColor(rl_colors.black)
-            c.drawString(4 * rl_mm, topo - 17 * rl_mm, produto)
-            c.setFont("Helvetica", 7)
-            c.setFillColor(rl_colors.grey)
-            c.drawString(4 * rl_mm, topo - 24 * rl_mm, f"SKU: {sku}")
+            c.drawString(4 * rl_mm, topo - 14 * rl_mm, produto)
 
-        # Quantidade
-        if qtd > 1:
-            c.setFont("Helvetica-Bold", 9)
-            c.setFillColor(HexColor("#b45309"))
-            c.drawRightString(LW - 4 * rl_mm, topo - 8 * rl_mm, f"QTD {qtd}x")
+            sku_linha = f"SKU: {sku}" + (f"  ·  {data_fmt}" if data_fmt else "") + \
+                        (f"  ·  {plat}" if plat else "")
+            c.setFont("Helvetica", 6.5)
+            c.setFillColor(rl_colors.grey)
+            c.drawString(4 * rl_mm, topo - 20 * rl_mm, sku_linha[:52])
+
+            if cliente:
+                c.setFont("Helvetica-Bold", 6.5)
+                c.setFillColor(HexColor("#1a56db"))
+                c.drawString(4 * rl_mm, topo - 26 * rl_mm, cliente)
+
+        # Código de barras (Code128, centralizado, altura 10mm)
+        try:
+            bc = rl_barcode.Code128(on, barHeight=10 * rl_mm, barWidth=1.0, humanReadable=False)
+            bc_x = max(2 * rl_mm, (LW - bc.width) / 2)
+            bc.drawOn(c, bc_x, 5 * rl_mm)
+        except Exception:
+            pass
+
+        # Número legível abaixo do código de barras
+        c.setFont("Helvetica", 5)
+        c.setFillColor(rl_colors.grey)
+        c.drawCentredString(LW / 2, 3 * rl_mm, on)
 
         # Linha separadora
         c.setStrokeColor(HexColor("#cccccc"))
@@ -2420,7 +2457,7 @@ def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0) -> "Path":
         c.showPage()
 
     c.save()
-    log(f"[picklist] 📄 PDF gerado: {out.name} ({len(pedidos)} pedidos, 10x5cm)")
+    log(f"[picklist] 📄 PDF gerado: {out.name} ({len(pedidos)} pedidos / {len(unidades)} unidades)")
     return out
 
 
@@ -2434,8 +2471,9 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
         token = config.get("token", "")
 
         # Pedidos ativos ainda não na picklist
+        _COLS = "order_number,product_name,sku,quantidade,status_upseller,label_url,nome_cliente,plataforma,data"
         r = (supa.table("pedidos")
-             .select("order_number,product_name,sku,quantidade,status_upseller,label_url")
+             .select(_COLS)
              .eq("status", "ativo")
              .eq("cliente", token)
              .is_("picklist_impresso_em", "null")
@@ -2445,7 +2483,7 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
 
         # Cancelados ainda não avisados na picklist
         r_c = (supa.table("pedidos")
-               .select("order_number,product_name,sku,quantidade,status_upseller")
+               .select(_COLS.replace(",label_url", ""))
                .eq("status", "cancelado")
                .eq("cliente", token)
                .is_("picklist_impresso_em", "null")
@@ -2837,7 +2875,7 @@ def gerar_picklist_teste():
     try:
         supa = create_client(*_supa())
         res = (supa.table("pedidos")
-               .select("order_number,product_name,sku,quantidade,status_upseller,label_url")
+               .select("order_number,product_name,sku,quantidade,status_upseller,label_url,nome_cliente,plataforma,data")
                .eq("status", "ativo")
                .eq("cliente", token)
                .not_.is_("label_url", "null")
