@@ -77,6 +77,18 @@ _etapa_atual     = ""                 # etapa visível no PCP
 _parar           = threading.Event()  # sinaliza parada solicitada pelo usuário
 _captura_lock    = threading.Lock()   # evita duas capturas simultâneas
 _capturar_skip   = set()              # pedidos com URL inválida nesta sessão (background ignora)
+_ultima_rodada: dict = {}             # stats da última rodada — expostos via /status
+_API_STATE_LABEL = {
+    "allocate":        "Para Reservar",
+    "pending_review":  "Para Reservar",
+    "to_allocate":     "Para Reservar",
+    "to_reserve":      "Para Reservar",
+    "in_process":      "Para Imprimir",
+    "invoice_pending": "Para Emitir",
+    "to_ship":         "Para Enviar",
+    "to_pickup":       "Para Retirada",
+    "pickup":          "Para Retirada",
+}
 
 
 def _carregar_execucoes() -> set:
@@ -144,7 +156,8 @@ def salvar():
         "token":           dados["token"].strip(),
         "upseller_email":  dados["upseller_email"].strip(),
         "upseller_senha":  dados["upseller_senha"].strip(),
-        "horarios":        dados.get("horarios", []),
+        "horarios":           dados.get("horarios", []),
+        "horarios_semanais":  dados.get("horarios_semanais", None),
         "etapas":          dados.get("etapas", {"importar": True, "picklist": True, "nfe": True, "envio": True}),
         "nome_impressora":         dados.get("nome_impressora", "").strip(),
         "auto_imprimir_etiquetas": bool(dados.get("auto_imprimir_etiquetas", False)),
@@ -167,6 +180,13 @@ def salvar_config_parcial():
             pass
     for k, v in dados.items():
         config[k] = v
+    # Se salvou horarios_semanais, mantém backward-compat gerando lista flat de todos os horários únicos
+    if "horarios_semanais" in dados:
+        todos: set = set()
+        for v in (dados["horarios_semanais"].values()):
+            if v:
+                todos.update(v)
+        config["horarios"] = sorted(todos)
     CONFIG_FILE.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     return _cors(jsonify({"ok": True}))
 
@@ -905,14 +925,19 @@ def status():
         except Exception:
             cliente = "Token inválido"
 
-    horarios = config.get("horarios", [])
-    # backward compat — converte config antigo (hora_inicio/hora_fim/intervalo) se necessário
-    if not horarios and config.get("hora_inicio"):
-        horarios = _gerar_horarios(
-            config.get("hora_inicio", "07:00"),
-            config.get("hora_fim", "18:00"),
-            int(config.get("intervalo_horas", 1)),
-        )
+    _DIA_KEYS = ["seg", "ter", "qua", "qui", "sex", "sab", "dom"]
+    _dia_hoje = _DIA_KEYS[datetime.now().weekday()]
+    horarios_semanais = config.get("horarios_semanais", {})
+    if horarios_semanais:
+        horarios = horarios_semanais.get(_dia_hoje) or []
+    else:
+        horarios = config.get("horarios", [])
+        if not horarios and config.get("hora_inicio"):
+            horarios = _gerar_horarios(
+                config.get("hora_inicio", "07:00"),
+                config.get("hora_fim", "18:00"),
+                int(config.get("intervalo_horas", 1)),
+            )
     etapas  = config.get("etapas", {"importar": True, "picklist": True, "nfe": True, "envio": True})
     agora   = datetime.now().strftime("%H:%M")
     proxima = next((h for h in sorted(horarios) if h > agora), horarios[0] if horarios else "—")
@@ -948,15 +973,17 @@ def status():
         "token":          config.get("token", ""),
         "cliente":        cliente,
         "email":          config.get("email", ""),
-        "horarios":       horarios,
-        "etapas":         etapas,
-        "proxima":        proxima,
+        "horarios":          horarios,
+        "horarios_semanais": config.get("horarios_semanais"),
+        "etapas":            etapas,
+        "proxima":           proxima,
         "nome_impressora": config.get("nome_impressora", ""),
         "auto_imprimir":  config.get("auto_imprimir", False),
         "rodando":     rodando or _pos_import_ativo,
         "etapa":       _etapa_atual,
         "sessao_ok":   sessao_ok,
         "versao":      versao,
+        "ultima_rodada": _ultima_rodada,
     })
 
 
@@ -1170,6 +1197,7 @@ def _upload_etiqueta_supabase(pdf_path: Path, order_number: str) -> str | None:
         except Exception as e:
             if tentativa == 1:
                 log(f"[storage] ⚠️ Upload {order_number} falhou: {e}")
+                _ultima_rodada["storage_erros"] = _ultima_rodada.get("storage_erros", 0) + 1
     return None
 
 
@@ -1306,6 +1334,8 @@ def _rodar_em_thread(config: dict, data_inicio: datetime, data_fim: datetime):
     _etapa_atual = "Importando pedidos..."
     _parar.clear()
     _capturar_skip.clear()
+    _ultima_rodada.update({"inseridos": 0, "atualizados": 0, "storage_erros": 0,
+                           "etiquetas_ok": 0, "etiquetas_total": 0, "sem_etiqueta": 0, "em": None})
     # Aguarda o background capturar fechar o Chrome antes de abrir o Excel
     # (dois processos no mesmo perfil causam conflito)
     adquiriu = _captura_lock.acquire(timeout=45)
@@ -1362,6 +1392,8 @@ def _rodar_em_thread_duplo(config: dict,
     rodando = True
     _pos_import_ativo = True
     _parar.clear()
+    _ultima_rodada.update({"inseridos": 0, "atualizados": 0, "storage_erros": 0,
+                           "etiquetas_ok": 0, "etiquetas_total": 0, "sem_etiqueta": 0, "em": None})
     adquiriu = _captura_lock.acquire(timeout=45)
     if adquiriu:
         _captura_lock.release()
@@ -3307,6 +3339,7 @@ async def _capturar_retroativo_playwright(config: dict) -> None:
 
             if faltam_r2:
                 log(f"[retro] ℹ️ {len(faltam_r2)} pedido(s) ainda aguardando etiqueta da plataforma")
+                _ultima_rodada["sem_etiqueta"] = len(faltam_r2)
 
         except Exception as e_main:
             log(f"[retro] ❌ {e_main}")
@@ -3727,6 +3760,7 @@ async def _capturar_etiquetas_playwright(config: dict, aguardar_se_vazio: bool =
                     break
 
             log(f"[capturar] ✅ {capturados}/{len(order_numbers)} etiqueta(s) prontas")
+            _ultima_rodada.update({"etiquetas_ok": capturados, "etiquetas_total": len(order_numbers)})
 
             # ── Download etiquetas Shopee/ML via label_url no Supabase ──────────
             try:
@@ -4743,25 +4777,37 @@ async def _programar_envio_playwright(config: dict) -> bool:
                             break
                         continue
 
-                    # Clica "Programar Envio" com coordenadas reais
-                    pos_envio = await page.evaluate("""() => {
+                    # Clica "Programar Envio" via JS direto (evita interceptação por overlay
+                    # e funciona mesmo quando o botão fica abaixo do viewport em modais longos)
+                    clicou_toolbar = await page.evaluate("""() => {
+                        // Procura em elementos genéricos (SPAN, A, BUTTON) — o action bar
+                        // usa SPAN dentro de BUTTON.ant-btn-link, não um <button> comum
+                        const todos = Array.from(document.querySelectorAll('*'))
+                            .filter(el => el.offsetParent !== null &&
+                                          el.innerText && el.innerText.trim() === 'Programar Envio' &&
+                                          !el.children.length);
+                        // Prefere o elemento no action bar (y < 400, x > 100)
+                        const action = todos.find(el => {
+                            const r = el.getBoundingClientRect();
+                            return r.y < 400 && r.x > 100;
+                        });
+                        if (action) { action.click(); return action.tagName + '/' + (action.className||'action'); }
+                        // Fallback: qualquer button com texto "Programar Envio"
                         const btn = Array.from(document.querySelectorAll('button'))
                             .find(b => b.innerText.trim().includes('Programar Envio') && b.offsetParent !== null);
-                        if (!btn) return null;
-                        const r = btn.getBoundingClientRect();
-                        return {x: r.x + r.width/2, y: r.y + r.height/2};
+                        if (btn) { btn.click(); return 'BUTTON/btn'; }
+                        return null;
                     }""")
-                    if pos_envio:
-                        await page.mouse.click(pos_envio['x'], pos_envio['y'])
-                        log(f"[envio] 🖱️ Clicou 'Programar Envio' em ({pos_envio['x']:.0f},{pos_envio['y']:.0f})")
+                    if clicou_toolbar:
+                        log(f"[envio] 🖱️ Clicou 'Programar Envio' via JS ({clicou_toolbar})")
                     else:
-                        await programar_btn.click()
-                        log("[envio] 🖱️ Clicou 'Programar Envio' (fallback)")
+                        await programar_btn.click(force=True)
+                        log("[envio] 🖱️ Clicou 'Programar Envio' (locator fallback)")
                     await page.wait_for_timeout(3000)
 
-                    # Confirma modal/popover se aparecer
-                    pos_modal_btn = await page.evaluate("""() => {
-                        const textos = ['Programar', 'Confirmar', 'Confirm', 'OK', 'Ok', 'Sim', 'Yes'];
+                    # Confirma modal via JS direto (funciona mesmo com botão abaixo do viewport)
+                    clicou_modal = await page.evaluate("""() => {
+                        const textos = ['Programar Envio', 'Programar', 'Confirmar', 'Confirm', 'OK', 'Ok', 'Sim', 'Yes'];
                         const seletores = [
                             '.ant-modal-content button',
                             '.ant-popover-inner button',
@@ -4772,22 +4818,60 @@ async def _programar_envio_playwright(config: dict) -> bool:
                             const btns = Array.from(document.querySelectorAll(sel));
                             for (const txt of textos) {
                                 const btn = btns.find(b => b.innerText.trim().includes(txt) && b.offsetParent !== null);
-                                if (btn) {
-                                    const r = btn.getBoundingClientRect();
-                                    return {x: r.x + r.width/2, y: r.y + r.height/2, txt: btn.innerText.trim().substring(0,30)};
-                                }
+                                if (btn) { btn.click(); return btn.innerText.trim().substring(0, 30); }
                             }
                         }
                         return null;
                     }""")
-                    if pos_modal_btn:
-                        await page.mouse.click(pos_modal_btn['x'], pos_modal_btn['y'])
-                        log(f"[envio] ✅ Confirmação clicada '{pos_modal_btn['txt']}'")
+                    if clicou_modal:
+                        log(f"[envio] ✅ Confirmação clicada '{clicou_modal}' via JS")
                         await page.wait_for_timeout(2000)
                     else:
                         log(f"[envio] ℹ️ {plat_nome}: sem modal de confirmação — processando direto")
 
-                    # Aguarda redução
+                    # Detecta "Programado com sucesso" (Shopee Xpress agenda coleta de forma
+                    # assíncrona — pedidos só saem de Para Enviar quando o rastreio é gerado,
+                    # então não há redução imediata de contagem; o sucesso é detectado via modal)
+                    await page.wait_for_timeout(1500)
+                    coleta_async = await page.evaluate("""() => {
+                        const m = document.querySelector('.ant-modal-content');
+                        if (!m || m.offsetParent === null) return null;
+                        const txt = m.innerText || '';
+                        if (txt.includes('Programado com sucesso') || txt.includes('sucesso')) {
+                            const fechar = Array.from(m.querySelectorAll('button'))
+                                .find(b => b.innerText.trim() === 'Fechar' && b.offsetParent !== null);
+                            if (fechar) { fechar.click(); return 'fechado'; }
+                            return 'sucesso';
+                        }
+                        return null;
+                    }""")
+
+                    if coleta_async:
+                        log(f"[envio] ✅ {plat_nome}: coleta agendada (Shopee Xpress async — pedidos vão para Para Imprimir após rastreio)")
+                        progresso = True
+                        await page.wait_for_timeout(1000)
+                        # Verifica quantos ainda faltam via aba "Para Programar"
+                        faltam = await page.evaluate("""() => {
+                            const tabs = Array.from(document.querySelectorAll(
+                                '.ant-tabs-tab, [class*="tab"], [role="tab"]'
+                            ));
+                            for (const t of tabs) {
+                                if (t.innerText.includes('Para Programar')) {
+                                    const m = t.innerText.match(/\\d+/);
+                                    return m ? parseInt(m[0]) : null;
+                                }
+                            }
+                            return null;
+                        }""")
+                        if faltam is not None:
+                            log(f"[envio] 📊 {plat_nome}: {faltam} pedido(s) ainda em 'Para Programar'")
+                            if faltam == 0:
+                                log(f"[envio] ✅ {plat_nome}: todos agendados!")
+                                break
+                        log(f"[envio] ✅ {plat_nome}: lote {rodada} processado")
+                        continue  # próxima rodada sem esperar 90s
+
+                    # Aguarda redução de contagem (TikTok, Shein, ML — processamento síncrono)
                     total_antes = total
                     log(f"[envio] ⏳ {plat_nome}: aguardando processamento... (total: {total_antes})")
                     progresso = False
@@ -5054,7 +5138,7 @@ def extrair(config: dict, data_alvo: date):
             updates  = [{k: v for k, v in l.items() if k != "data"}
                         for l in linhas if l["order_number"] in existentes_set]
 
-            colunas_opcionais = {"plataforma", "valor", "label_url", "numero_plataforma", "nome_cliente"}
+            colunas_opcionais = {"plataforma", "valor", "label_url", "numero_plataforma", "nome_cliente", "status_upseller"}
 
             def _upsert_com_fallback(lote_orig, label):
                 excluir: set = set()
@@ -5063,6 +5147,7 @@ def extrair(config: dict, data_alvo: date):
                     try:
                         supa.table("pedidos").upsert(tentativa, on_conflict="order_number").execute()
                         log(f"✅ {len(tentativa)} pedidos {label} ao Supabase!")
+                        _ultima_rodada["inseridos"] = _ultima_rodada.get("inseridos", 0) + len(tentativa)
                         return
                     except Exception as e_col:
                         col_faltando = next((c for c in colunas_opcionais - excluir if c in str(e_col)), None)
@@ -5084,6 +5169,7 @@ def extrair(config: dict, data_alvo: date):
                     except Exception as e_upd:
                         log(f"⚠️ Erro ao atualizar {on}: {e_upd}")
                 log(f"✅ {len(lote)} pedidos atualizados (data preservada)")
+                _ultima_rodada["atualizados"] = _ultima_rodada.get("atualizados", 0) + len(lote)
 
             if novos:
                 _upsert_com_fallback(novos, "inseridos")
@@ -5107,6 +5193,7 @@ def extrair(config: dict, data_alvo: date):
         log(f"Erro Supabase (pedido_itens): {e}")
 
     atualizar_ultima_execucao(token)
+    _ultima_rodada.update({"em": datetime.now().strftime("%d/%m %H:%M"), "pedidos": len(pedidos)})
     log(f"✅ Concluído! {len(pedidos)} pedidos | {data_display}")
 
     try:
@@ -5156,10 +5243,14 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                 log("[api] ⚠️ Sessão expirada — faça login manualmente")
                 return False
 
+            # Para Reservar usa orderState=allocate com allocateStatus=pending_review
+            # (descoberto via interceptação da página /pt/order/to-allocate)
             SECOES = [
-                ("in_process",      "labelStatus=success&warehouseType=0", "Para Imprimir", False),
-                ("invoice_pending", "invoiceStatus=to_issue&isVoided=0",   "Para Emitir",   False),
-                ("to_ship",         "",                                     "Para Enviar",   False),
+                ("allocate",        "allocateStatus=pending_review",                "Para Reservar", False),
+                ("in_process",      "labelStatus=success&warehouseType=0",          "Para Imprimir", False),
+                ("invoice_pending", "invoiceStatus=to_issue&isVoided=0",            "Para Emitir",   False),
+                ("to_ship",         "",                                              "Para Enviar",   False),
+                ("to_pickup",       "",                                              "Para Retirada", False),
             ]
 
             for state, extra, label_secao, filtrar_por_data in SECOES:
@@ -5184,9 +5275,9 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                         }} catch(e) {{ return null; }}
                     }}""")
 
-                    data = (result or {}).get("data", {})
-                    lista = data.get("list", [])
-                    total = data.get("total", 0)
+                    data = (result or {}).get("data") or {}
+                    lista = data.get("list") or []
+                    total = data.get("total") or 0
 
                     if total_secao is None:
                         total_secao = total
@@ -5198,8 +5289,12 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                             if (o.get("invoiceTime") or "").startswith(data_arquivo)
                         ]
 
-                    if total_secao is not None and page_num == 1 and not filtrar_por_data:
-                        log(f"[api] {label_secao}: {total} pedido(s)")
+                    if page_num == 1 and not filtrar_por_data:
+                        if total > 0:
+                            log(f"[api] {label_secao}: {total} pedido(s)")
+                        else:
+                            log(f"[api] {label_secao}: 0 — raw={str(result)[:200]}")
+                        _ultima_rodada[label_secao.lower().replace(" ", "_")] = total
 
                     for order in lista:
                         order["_state"] = state
@@ -5238,8 +5333,9 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                     supa_c = create_client(*_supa())
                     for i in range(0, len(cancelados_api), 50):
                         lote_c = list(cancelados_api_set)[i:i+50]
-                        supa_c.table("pedidos").update({"status": "cancelado"}).in_("order_number", lote_c).eq("status", "ativo").execute()
+                        supa_c.table("pedidos").update({"status": "cancelado", "status_upseller": "Cancelado"}).in_("order_number", lote_c).eq("status", "ativo").execute()
                     log(f"[api] ⛔ {len(cancelados_api_set)} pedido(s) voided verificado(s) no UpSeller")
+                    _ultima_rodada["cancelados"] = _ultima_rodada.get("cancelados", 0) + len(cancelados_api_set)
             except Exception as e_v:
                 log(f"[api] ⚠️ Verificação de cancelados falhou: {e_v}")
 
@@ -5335,6 +5431,7 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                 "valor":             valor,
                 "label_url":         api_label_url,
                 "nome_cliente":      nome_cliente,
+                "status_upseller":   _API_STATE_LABEL.get(order.get("_state", ""), None),
             }
         else:
             pedidos_dict[order_num]["quantidade"] += qtd_total
@@ -5413,6 +5510,7 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
             "valor":             p.get("valor"),
             "label_url":         p.get("label_url"),
             "nome_cliente":      p.get("nome_cliente"),
+            "status_upseller":   p.get("status_upseller"),
         } for p in pedidos]
 
         if linhas:
@@ -5505,14 +5603,19 @@ def _loop_agendador():
             continue
         try:
             config   = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            horarios = config.get("horarios", [])
-            # backward compat — converte config antigo se necessário
-            if not horarios and config.get("hora_inicio"):
-                horarios = _gerar_horarios(
-                    config.get("hora_inicio", "07:00"),
-                    config.get("hora_fim", "18:00"),
-                    int(config.get("intervalo_horas", 1)),
-                )
+            _DIA_KEYS_WD = ["seg", "ter", "qua", "qui", "sex", "sab", "dom"]
+            _dia_wd = _DIA_KEYS_WD[datetime.now().weekday()]
+            _hs_wd  = config.get("horarios_semanais", {})
+            if _hs_wd:
+                horarios = _hs_wd.get(_dia_wd) or []
+            else:
+                horarios = config.get("horarios", [])
+                if not horarios and config.get("hora_inicio"):
+                    horarios = _gerar_horarios(
+                        config.get("hora_inicio", "07:00"),
+                        config.get("hora_fim", "18:00"),
+                        int(config.get("intervalo_horas", 1)),
+                    )
 
             if not horarios:
                 continue

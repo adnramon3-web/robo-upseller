@@ -1,4 +1,4 @@
 {
-  "version": "1.5.94",
-  "descricao": "fix: NoneType na API; nome_cliente na importacao automatica; debug log campos da API"
+  "version": "1.6.1",
+  "descricao": "fix: Programar Envio Shopee usa JS click (SPAN/ant-btn-link) + detecta coleta async via modal"
 }
