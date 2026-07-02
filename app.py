@@ -2286,62 +2286,137 @@ def _nome_impressora_padrao() -> str:
 # ── Picklist gerada do Supabase (sem Playwright) ─────────────────────────────
 
 def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0) -> "Path":
-    """Gera PDF de picklist em papel térmico 10x5cm — uma etiqueta por pedido."""
+    """Gera PDF de picklist em papel térmico 10x5cm — capa resumo + uma etiqueta por pedido."""
     from reportlab.pdfgen import canvas as rl_canvas
     from reportlab.lib.units import mm as rl_mm
     from reportlab.lib import colors as rl_colors
+    from reportlab.lib.colors import HexColor
+    from collections import Counter
 
     PASTA_PICKLISTS.mkdir(exist_ok=True)
     nome = f"picklist_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
     out  = PASTA_PICKLISTS / nome
 
-    LW = 100 * rl_mm   # 100 mm
-    LH = 50  * rl_mm   # 50 mm
-    # margem topo já embutida no layout (mesmo offset que as etiquetas)
+    LW = 100 * rl_mm
+    LH = 50  * rl_mm
     offset_y = margem_topo_mm * rl_mm
-    # topo disponível para conteúdo (de cima para baixo em coordenadas PDF)
-    topo = LH - offset_y - 2 * rl_mm  # começa 2mm abaixo do offset
+    topo = LH - offset_y - 2 * rl_mm
 
     ts = datetime.now().strftime("%d/%m/%Y %H:%M")
 
+    def _cat(p):
+        st  = (p.get("status") or "").strip().lower()
+        sup = (p.get("status_upseller") or "").strip().lower()
+        if st == "cancelado":          return "cancelado"
+        if sup == "para reservar":     return "reservar"
+        if sup == "para retirada":     return "retirada"
+        return "normal"
+
+    # Ordena: normal → retirada → reservar → cancelado
+    _ORD = {"normal": 0, "retirada": 1, "reservar": 2, "cancelado": 3}
+    pedidos = sorted(pedidos, key=lambda p: _ORD.get(_cat(p), 0))
+    cats = Counter(_cat(p) for p in pedidos)
+
+    _BADGE = {
+        "retirada":  (HexColor("#1D4ED8"), HexColor("#DBEAFE"), "RETIRADA"),
+        "reservar":  (HexColor("#92400E"), HexColor("#FEF3C7"), "RESERVAR"),
+        "cancelado": (HexColor("#991B1B"), HexColor("#FEE2E2"), "CANCELADO"),
+    }
+
     c = rl_canvas.Canvas(str(out), pagesize=(LW, LH))
+
+    # ── CAPA RESUMO ───────────────────────────────────────────────────────────
+    c.setFont("Helvetica-Bold", 9)
+    c.setFillColor(rl_colors.black)
+    c.drawString(4 * rl_mm, topo, f"PICKLIST — {ts}")
+    c.setFont("Helvetica-Bold", 8)
+    c.drawString(4 * rl_mm, topo - 8 * rl_mm, f"Total: {len(pedidos)} pedidos")
+
+    y = topo - 16 * rl_mm
+    for label, key, color in [
+        ("Para Processar", "normal",    rl_colors.black),
+        ("Para Retirada",  "retirada",  HexColor("#1D4ED8")),
+        ("Para Reservar",  "reservar",  HexColor("#92400E")),
+        ("Cancelados",     "cancelado", HexColor("#991B1B")),
+    ]:
+        n = cats.get(key, 0)
+        if n:
+            c.setFillColor(color)
+            c.setFont("Helvetica-Bold" if key == "cancelado" else "Helvetica", 7)
+            c.drawString(6 * rl_mm, y, f"{n}x  {label}")
+            y -= 6 * rl_mm
+
+    c.setStrokeColor(HexColor("#cccccc"))
+    c.setLineWidth(0.4)
+    c.line(0, 2 * rl_mm, LW, 2 * rl_mm)
+    c.showPage()
+
+    # ── UMA ETIQUETA POR PEDIDO ───────────────────────────────────────────────
     for p in pedidos:
-        qtd = int(p.get("quantidade") or 1)
-        on  = p.get("order_number", "")
+        cat     = _cat(p)
+        qtd     = int(p.get("quantidade") or 1)
+        on      = p.get("order_number", "")
         produto = (p.get("product_name") or "")[:38]
         sku     = p.get("sku", "")
 
-        # Cabeçalho: "PICKLIST  DD/MM HH:MM  (N ped)"
+        # Fundo levemente colorido para situações especiais
+        if cat == "cancelado":
+            c.setFillColor(HexColor("#FFF5F5"))
+            c.rect(0, 0, LW, LH, fill=1, stroke=0)
+        elif cat == "reservar":
+            c.setFillColor(HexColor("#FFFBEB"))
+            c.rect(0, 0, LW, LH, fill=1, stroke=0)
+
+        # Badge topo-direito
+        badge = _BADGE.get(cat)
+        if badge:
+            fg, bg, txt = badge
+            bw, bh = 26 * rl_mm, 6 * rl_mm
+            bx = LW - bw - 3 * rl_mm
+            by = topo - 1 * rl_mm
+            c.setFillColor(bg)
+            c.roundRect(bx, by, bw, bh, 1.5 * rl_mm, fill=1, stroke=0)
+            c.setFillColor(fg)
+            c.setFont("Helvetica-Bold", 6.5)
+            c.drawCentredString(bx + bw / 2, by + 1.8 * rl_mm, txt)
+
+        # Cabeçalho
         c.setFont("Helvetica", 5.5)
         c.setFillColor(rl_colors.grey)
         c.drawString(4 * rl_mm, topo, f"PICKLIST  {ts}")
 
-        # Número do pedido — destaque
+        # Número do pedido
         c.setFont("Helvetica-Bold", 12)
-        c.setFillColor(rl_colors.black)
+        c.setFillColor(HexColor("#991B1B") if cat == "cancelado" else rl_colors.black)
         c.drawString(4 * rl_mm, topo - 8 * rl_mm, on)
 
-        # Quantidade (se > 1, destaque extra)
+        # Linha de aviso (cancelado / reservar) ou produto+sku (normal/retirada)
+        if cat == "cancelado":
+            c.setFont("Helvetica-Bold", 7)
+            c.setFillColor(HexColor("#991B1B"))
+            c.drawString(4 * rl_mm, topo - 17 * rl_mm, "NAO PROCESSAR — PEDIDO CANCELADO")
+        elif cat == "reservar":
+            c.setFont("Helvetica", 7)
+            c.setFillColor(HexColor("#92400E"))
+            c.drawString(4 * rl_mm, topo - 17 * rl_mm, "Aguardando liberacao — nao processar ainda")
+        else:
+            c.setFont("Helvetica", 8)
+            c.setFillColor(rl_colors.black)
+            c.drawString(4 * rl_mm, topo - 17 * rl_mm, produto)
+            c.setFont("Helvetica", 7)
+            c.setFillColor(rl_colors.grey)
+            c.drawString(4 * rl_mm, topo - 24 * rl_mm, f"SKU: {sku}")
+
+        # Quantidade
         if qtd > 1:
             c.setFont("Helvetica-Bold", 9)
-            c.setFillColor(rl_colors.HexColor("#b45309"))
+            c.setFillColor(HexColor("#b45309"))
             c.drawRightString(LW - 4 * rl_mm, topo - 8 * rl_mm, f"QTD {qtd}x")
 
-        # Nome do produto
-        c.setFont("Helvetica", 8)
-        c.setFillColor(rl_colors.black)
-        c.drawString(4 * rl_mm, topo - 17 * rl_mm, produto)
-
-        # SKU
-        c.setFont("Helvetica", 7)
-        c.setFillColor(rl_colors.grey)
-        c.drawString(4 * rl_mm, topo - 24 * rl_mm, f"SKU: {sku}")
-
-        # Linha separadora no rodapé
-        c.setStrokeColor(rl_colors.HexColor("#cccccc"))
+        # Linha separadora
+        c.setStrokeColor(HexColor("#cccccc"))
         c.setLineWidth(0.4)
         c.line(0, 2 * rl_mm, LW, 2 * rl_mm)
-
         c.showPage()
 
     c.save()
@@ -2351,18 +2426,43 @@ def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0) -> "Path":
 
 def _imprimir_picklist_supabase(config: dict) -> bool:
     """Gera e imprime a picklist da rodada atual a partir dos dados do Supabase.
-    Só inclui pedidos com picklist_impresso_em IS NULL → sem duplicidade entre rodadas."""
+    Pedidos ativos: incluídos uma vez (marcados com picklist_impresso_em).
+    Para Reservar: incluídos em toda picklist como aviso (não marcados — status muda quando ML liberar).
+    Cancelados: incluídos uma vez como aviso (marcados)."""
     try:
         supa  = create_client(*_supa())
         token = config.get("token", "")
+
+        # Pedidos ativos ainda não na picklist
         r = (supa.table("pedidos")
-             .select("order_number,product_name,sku,quantidade")
+             .select("order_number,product_name,sku,quantidade,status_upseller,label_url")
              .eq("status", "ativo")
              .eq("cliente", token)
              .is_("picklist_impresso_em", "null")
              .order("data", desc=False)
              .execute())
-        pedidos = r.data or []
+        ativos = r.data or []
+
+        # Cancelados ainda não avisados na picklist
+        r_c = (supa.table("pedidos")
+               .select("order_number,product_name,sku,quantidade,status_upseller")
+               .eq("status", "cancelado")
+               .eq("cliente", token)
+               .is_("picklist_impresso_em", "null")
+               .order("data", desc=False)
+               .execute())
+        cancelados = r_c.data or []
+        for p in cancelados:
+            p["status"] = "cancelado"
+
+        # Para Reservar sempre aparece (não marcados) — ficam até ML liberar
+        para_reservar = [p for p in ativos
+                         if (p.get("status_upseller") or "").strip().lower() == "para reservar"]
+        # Demais ativos: marcados após impressão
+        para_marcar_ativos = [p for p in ativos
+                              if (p.get("status_upseller") or "").strip().lower() != "para reservar"]
+
+        pedidos = ativos + cancelados  # tudo junto — _gerar_picklist_pdf ordena por categoria
     except Exception as e:
         log(f"[picklist] ⚠️ Erro ao consultar Supabase: {e}")
         return False
@@ -2371,7 +2471,11 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
         log("[picklist] ℹ️ Nenhum pedido novo — picklist não gerada")
         return True
 
-    log(f"[picklist] 📋 {len(pedidos)} pedido(s) para picklist")
+    n_reservar   = len(para_reservar)
+    n_cancelados = len(cancelados)
+    n_processar  = len(pedidos) - n_reservar - n_cancelados
+    log(f"[picklist] 📋 {len(pedidos)} pedido(s): {n_processar} processar, "
+        f"{n_reservar} reservar, {n_cancelados} cancelados")
 
     margem_topo_mm = float(config.get("margem_topo_mm", 5) or 0)
     try:
@@ -2401,16 +2505,17 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
     else:
         log("[picklist] 📋 Sem impressora — PDF disponível via PCP (/picklist-pdf)")
 
-    # Marca todos os pedidos desta rodada como incluídos na picklist
+    # Marca ativos (exceto Para Reservar) + cancelados — Para Reservar fica sem marca
+    # para reaparecer na próxima picklist quando o ML liberar
     try:
         agora    = datetime.utcnow().isoformat()
-        order_ns = [p["order_number"] for p in pedidos]
+        order_ns = [p["order_number"] for p in para_marcar_ativos + cancelados]
         for i in range(0, len(order_ns), 50):
             (supa.table("pedidos")
              .update({"picklist_impresso_em": agora})
              .in_("order_number", order_ns[i:i+50])
              .execute())
-        log(f"[picklist] ✅ {len(pedidos)} pedidos marcados — {agora[:16]}")
+        log(f"[picklist] ✅ {len(order_ns)} pedidos marcados ({n_reservar} reservar não marcados) — {agora[:16]}")
     except Exception as e:
         log(f"[picklist] ⚠️ Erro ao marcar Supabase: {e}")
 
