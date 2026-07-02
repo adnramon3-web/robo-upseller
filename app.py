@@ -1018,6 +1018,29 @@ def reiniciar():
     return jsonify({"ok": True})
 
 
+@app.route("/verificar-cancelados", methods=["POST", "OPTIONS"], provide_automatic_options=False)
+def rota_verificar_cancelados():
+    """Verifica pedidos sem etiqueta no UpSeller e marca cancelados no Supabase."""
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    if not CONFIG_FILE.exists():
+        return _cors(jsonify({"ok": False, "erro": "Config não encontrada"})), 400
+    cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+
+    def _run():
+        try:
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(_verificar_cancelados_playwright(cfg))
+            loop.close()
+        except Exception as e:
+            log(f"[cancelados] ❌ Erro: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return _cors(jsonify({"ok": True, "msg": "Verificação de cancelados iniciada — acompanhe o log"}))
+
+
 @app.route("/resumo-etiquetas", methods=["GET", "OPTIONS"], provide_automatic_options=False)
 def resumo_etiquetas():
     if request.method == "OPTIONS":
@@ -2210,18 +2233,15 @@ def _imprimir_windows(pdf_path: "Path", impressora: str) -> bool:
 # ── Verificação de impressora ─────────────────────────────────────────────────
 
 def _verificar_impressora() -> bool:
-    """Retorna True se houver impressora configurada no sistema."""
+    """Retorna True se houver impressora padrão configurada no sistema."""
     try:
         if platform.system() == "Darwin":
-            # Verifica impressora padrão
+            # Usa somente a impressora padrão do sistema. O fallback lpstat -a capturava
+            # impressoras não-padrão (Epson, AirPrint) e mandava labels para o lugar errado.
             r = subprocess.run(["lpstat", "-d"], capture_output=True, text=True, timeout=5)
             output = r.stdout.strip()
             sem_default = ("nenhum" in output.lower() or "no system default" in output.lower() or not output)
-            if r.returncode == 0 and not sem_default:
-                return True
-            # Fallback: qualquer impressora configurada no sistema (mesmo sem ser padrão)
-            r2 = subprocess.run(["lpstat", "-a"], capture_output=True, text=True, timeout=5)
-            return r2.returncode == 0 and bool(r2.stdout.strip())
+            return r.returncode == 0 and not sem_default
         elif platform.system() == "Windows":
             # PowerShell — mais confiável que wmic no Windows 10/11
             try:
@@ -2248,7 +2268,7 @@ def _verificar_impressora() -> bool:
 
 
 def _nome_impressora_padrao() -> str:
-    """Retorna o nome da primeira impressora disponível no sistema (para usar com lp -d)."""
+    """Retorna o nome da impressora padrão do sistema (para usar com lp -d)."""
     try:
         if platform.system() == "Darwin":
             r = subprocess.run(["lpstat", "-d"], capture_output=True, text=True, timeout=5)
@@ -2258,10 +2278,6 @@ def _nome_impressora_padrao() -> str:
                 partes = output.split(":")
                 if len(partes) > 1:
                     return partes[-1].strip()
-            # Pega a primeira impressora listada
-            r2 = subprocess.run(["lpstat", "-a"], capture_output=True, text=True, timeout=5)
-            if r2.stdout.strip():
-                return r2.stdout.strip().split()[0]
     except Exception:
         pass
     return ""
@@ -5339,6 +5355,23 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
             except Exception as e_v:
                 log(f"[api] ⚠️ Verificação de cancelados falhou: {e_v}")
 
+            # Cruza sem-etiqueta do Supabase com filas ativas — detecta pedidos que saíram de todas as filas
+            try:
+                _ativos_set = {(o.get("orderNumber") or "").strip() for o in todos_raw if o.get("orderNumber")}
+                supa_d = create_client(*_supa())
+                res_d = supa_d.table("pedidos").select("order_number") \
+                    .eq("status", "ativo").is_("label_url", "null").execute()
+                nums_sem = {(r.get("order_number") or "").strip() for r in (res_d.data or []) if r.get("order_number")}
+                desap = nums_sem - _ativos_set
+                if desap:
+                    log(f"[api] ⚠️ {len(desap)} pedido(s) sem etiqueta fora de todas as filas (cancelados pela plataforma?): "
+                        + ", ".join(sorted(desap)[:15]) + ("..." if len(desap) > 15 else ""))
+                    _ultima_rodada["sem_fila"] = len(desap)
+                elif nums_sem:
+                    log(f"[api] ✅ {len(nums_sem)} sem etiqueta — todos nas filas ativas")
+            except Exception as e_d:
+                log(f"[api] ⚠️ Cruzamento sem-etiqueta falhou: {e_d}")
+
         except Exception as e:
             log(f"[api] ❌ Erro ao consultar API: {e}")
             return False
@@ -5686,6 +5719,150 @@ def _loop_captura_etiquetas():
         except Exception as e:
             log(f"[captura-auto] ⚠️ {e}")
         time.sleep(INTERVALO)
+
+
+async def _verificar_cancelados_playwright(config: dict) -> None:
+    """
+    Cruza pedidos sem label_url no Supabase com o estado atual no UpSeller.
+    - Voided (isVoided=1) → marca status='cancelado' no Supabase
+    - Não encontrado em nenhuma fila ativa nem voided → reporta para investigação
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        log("[cancelados] ❌ Playwright não instalado")
+        return
+
+    supa = create_client(*_supa())
+
+    try:
+        res = supa.table("pedidos").select("order_number, status_upseller") \
+            .eq("status", "ativo").is_("label_url", "null").execute()
+        pedidos = res.data or []
+    except Exception as e:
+        log(f"[cancelados] ❌ Erro ao consultar Supabase: {e}")
+        return
+
+    if not pedidos:
+        log("[cancelados] ℹ️ Nenhum pedido sem etiqueta no Supabase")
+        return
+
+    nums_sem_etiqueta: set[str] = {p["order_number"] for p in pedidos if p.get("order_number")}
+    log(f"[cancelados] 🔍 {len(nums_sem_etiqueta)} pedido(s) sem etiqueta — verificando no UpSeller...")
+
+    _limpar_crash_chrome()
+
+    async with async_playwright() as pw:
+        context = await pw.chromium.launch_persistent_context(
+            user_data_dir=str(PASTA_SESSAO),
+            headless=True,
+            args=["--window-size=1280,900"],
+        )
+        try:
+            page = context.pages[0] if context.pages else await context.new_page()
+            await page.goto(
+                "https://app.upseller.com/pt/order/in-process",
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+            await page.wait_for_timeout(2000)
+            if "/login" in page.url:
+                log("[cancelados] ⚠️ Sessão expirada — faça login manualmente")
+                return
+
+            # 1. Busca TODOS os voided (sem filtro de data)
+            log("[cancelados] 📡 Consultando pedidos voided no UpSeller...")
+            todos_voided: set[str] = set()
+            pg_v = 1
+            while True:
+                r_v = await page.evaluate(f"""async () => {{
+                    const r = await fetch('/api/order/index', {{
+                        method:'POST',
+                        headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+                        body:'timeType=0&isVoided=1&searchType=0&sortName=1&sortValue=1&pageNum={pg_v}&pageSize=50'
+                    }});
+                    return await r.json();
+                }}""")
+                lista_v = (r_v.get("data") or {}).get("list") or []
+                total_v = int((r_v.get("data") or {}).get("total") or 0)
+                todos_voided.update((o.get("orderNumber") or "").strip() for o in lista_v if o.get("orderNumber"))
+                if pg_v * 50 >= total_v or not lista_v:
+                    break
+                pg_v += 1
+            log(f"[cancelados] 📊 {len(todos_voided)} pedido(s) voided no UpSeller")
+
+            # 2. Busca TODOS os pedidos ativos de todas as filas
+            log("[cancelados] 📡 Consultando filas ativas no UpSeller...")
+            todos_ativos: set[str] = set()
+            FILAS_ATIVAS = [
+                ("allocate",        "allocateStatus=pending_review"),
+                ("in_process",      "labelStatus=success&warehouseType=0"),
+                ("invoice_pending", "invoiceStatus=to_issue&isVoided=0"),
+                ("to_ship",         ""),
+                ("to_pickup",       ""),
+            ]
+            for state, extra in FILAS_ATIVAS:
+                pg_a = 1
+                while True:
+                    body_a = (
+                        f"timeType=0&orderState={state}&isVoided=0&searchType=0"
+                        f"&sortName=1&sortValue=1&pageNum={pg_a}&pageSize=50"
+                        + (f"&{extra}" if extra else "")
+                    )
+                    r_a = await page.evaluate(f"""async () => {{
+                        const r = await fetch('/api/order/index', {{
+                            method:'POST',
+                            headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+                            body:'{body_a}'
+                        }});
+                        return await r.json();
+                    }}""")
+                    lista_a = (r_a.get("data") or {}).get("list") or []
+                    total_a = int((r_a.get("data") or {}).get("total") or 0)
+                    todos_ativos.update((o.get("orderNumber") or "").strip() for o in lista_a if o.get("orderNumber"))
+                    if pg_a * 50 >= total_a or not lista_a:
+                        break
+                    pg_a += 1
+            log(f"[cancelados] 📊 {len(todos_ativos)} pedido(s) ativos no UpSeller")
+
+        finally:
+            await context.close()
+
+    # 3. Cruza resultados
+    voided_match    = nums_sem_etiqueta & todos_voided
+    ativos_match    = nums_sem_etiqueta & todos_ativos
+    desaparecidos   = nums_sem_etiqueta - todos_voided - todos_ativos
+
+    # 4. Atualiza Supabase para voided
+    if voided_match:
+        try:
+            lote = list(voided_match)
+            for i in range(0, len(lote), 50):
+                supa.table("pedidos") \
+                    .update({"status": "cancelado", "status_upseller": "Cancelado"}) \
+                    .in_("order_number", lote[i:i+50]) \
+                    .eq("status", "ativo").execute()
+            log(f"[cancelados] ✅ {len(voided_match)} pedido(s) marcados como cancelado no Supabase")
+            for n in sorted(voided_match)[:20]:
+                log(f"[cancelados]   ⛔ {n}")
+            if len(voided_match) > 20:
+                log(f"[cancelados]   ... e mais {len(voided_match)-20}")
+        except Exception as e:
+            log(f"[cancelados] ❌ Erro ao atualizar Supabase (voided): {e}")
+    else:
+        log("[cancelados] ✅ Nenhum pedido sem etiqueta está voided no UpSeller")
+
+    # 5. Reporta desaparecidos (não em nenhuma fila, não voided)
+    if desaparecidos:
+        log(f"[cancelados] ⚠️ {len(desaparecidos)} pedido(s) não encontrados em nenhuma fila do UpSeller (verificar manualmente):")
+        for n in sorted(desaparecidos)[:30]:
+            log(f"[cancelados]   ? {n}")
+        if len(desaparecidos) > 30:
+            log(f"[cancelados]   ... e mais {len(desaparecidos)-30}")
+    else:
+        log("[cancelados] ✅ Todos os pedidos sem etiqueta foram encontrados nas filas ativas")
+
+    log(f"[cancelados] ✅ Concluído — voided: {len(voided_match)}, ativos: {len(ativos_match)}, sem fila: {len(desaparecidos)}")
 
 
 if __name__ == "__main__":
