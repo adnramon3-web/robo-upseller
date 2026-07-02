@@ -1,4 +1,4 @@
 {
-  "version": "1.5.93",
-  "descricao": "debug: loga campos da API no primeiro pedido quando receiverName nao encontrado"
+  "version": "1.5.94",
+  "descricao": "fix: NoneType na API; nome_cliente na importacao automatica; debug log campos da API"
 }

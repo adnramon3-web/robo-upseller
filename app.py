@@ -244,14 +244,16 @@ async def _backfill_historico(config: dict, dias: int):
                         f"&orderState={estado}&pageNum={page_num}&pageSize=50"
                     )
                     r = await page.evaluate(f"""async () => {{
-                        const resp = await fetch('/api/order/index', {{
-                            method:'POST',
-                            headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
-                            body:'{body}'
-                        }});
-                        return await resp.json();
+                        try {{
+                            const resp = await fetch('/api/order/index', {{
+                                method:'POST',
+                                headers:{{'Content-Type':'application/x-www-form-urlencoded'}},
+                                body:'{body}'
+                            }});
+                            return await resp.json();
+                        }} catch(e) {{ return null; }}
                     }}""")
-                    data = (r.get("data") or {})
+                    data = ((r or {}).get("data") or {})
                     lista = data.get("list") or []
                     total = data.get("total") or 0
                     if total_estado is None:
@@ -5052,7 +5054,7 @@ def extrair(config: dict, data_alvo: date):
             updates  = [{k: v for k, v in l.items() if k != "data"}
                         for l in linhas if l["order_number"] in existentes_set]
 
-            colunas_opcionais = {"plataforma", "valor", "label_url", "numero_plataforma"}
+            colunas_opcionais = {"plataforma", "valor", "label_url", "numero_plataforma", "nome_cliente"}
 
             def _upsert_com_fallback(lote_orig, label):
                 excluir: set = set()
@@ -5172,15 +5174,17 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                         + f"&pageNum={page_num}&pageSize=50"
                     )
                     result = await page.evaluate(f"""async () => {{
-                        const r = await fetch('/api/order/index', {{
-                            method: 'POST',
-                            headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
-                            body: '{body_str}'
-                        }});
-                        return await r.json();
+                        try {{
+                            const r = await fetch('/api/order/index', {{
+                                method: 'POST',
+                                headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+                                body: '{body_str}'
+                            }});
+                            return await r.json();
+                        }} catch(e) {{ return null; }}
                     }}""")
 
-                    data = result.get("data", {})
+                    data = (result or {}).get("data", {})
                     lista = data.get("list", [])
                     total = data.get("total", 0)
 
@@ -5312,6 +5316,13 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                 break
 
         if order_num not in pedidos_dict:
+            nome_cliente = (
+                order.get("receiverName") or order.get("buyerName") or
+                order.get("recipientName") or order.get("receiveName") or
+                order.get("receiver", {}).get("name") or ""
+            ).strip() or None
+            if nome_cliente is None and len(pedidos_dict) == 0:
+                log(f"[api] 🔍 campos do 1º pedido: {sorted(order.keys())}")
             pedidos_dict[order_num] = {
                 "order_number":      order_num,
                 "numero_plataforma": str(order.get("orderId") or order.get("extendedId") or "") or None,
@@ -5323,6 +5334,7 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                 "plataforma":        plataforma,
                 "valor":             valor,
                 "label_url":         api_label_url,
+                "nome_cliente":      nome_cliente,
             }
         else:
             pedidos_dict[order_num]["quantidade"] += qtd_total
@@ -5400,6 +5412,7 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
             "plataforma":        p.get("plataforma"),
             "valor":             p.get("valor"),
             "label_url":         p.get("label_url"),
+            "nome_cliente":      p.get("nome_cliente"),
         } for p in pedidos]
 
         if linhas:
@@ -5413,7 +5426,7 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
             updates2 = [{k: v for k, v in l.items() if k != "data"}
                         for l in linhas if l["order_number"] in existentes2]
 
-            colunas_opcionais = {"plataforma", "valor", "label_url", "numero_plataforma"}
+            colunas_opcionais = {"plataforma", "valor", "label_url", "numero_plataforma", "nome_cliente"}
 
             def _upsert_fb2(lote_orig, label):
                 excluir: set = set()
