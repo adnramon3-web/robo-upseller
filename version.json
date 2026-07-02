@@ -1,4 +1,4 @@
 {
-  "version": "1.5.92",
-  "descricao": "picklist: adiciona nome_cliente e plataforma; migration automatica da coluna nome_cliente"
+  "version": "1.5.93",
+  "descricao": "debug: loga campos da API no primeiro pedido quando receiverName nao encontrado"
 }

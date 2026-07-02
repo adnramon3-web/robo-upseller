@@ -316,8 +316,11 @@ async def _backfill_historico(config: dict, dias: int):
         if on not in pedidos_dict:
             nome_cliente = (
                 order.get("receiverName") or order.get("buyerName") or
-                order.get("recipientName") or order.get("receiveName") or ""
+                order.get("recipientName") or order.get("receiveName") or
+                order.get("receiver", {}).get("name") or ""
             ).strip() or None
+            if nome_cliente is None and len(pedidos_dict) == 0:
+                log(f"[backfill] 🔍 campos do 1º pedido: {sorted(order.keys())}")
             pedidos_dict[on] = {
                 "order_number":      on,
                 "numero_plataforma": (order.get("orderId") or order.get("extendedId") or "").strip() or None,
