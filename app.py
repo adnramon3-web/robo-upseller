@@ -159,7 +159,7 @@ def salvar():
         "upseller_senha":  dados["upseller_senha"].strip(),
         "horarios":           dados.get("horarios", []),
         "horarios_semanais":  dados.get("horarios_semanais", None),
-        "etapas":          dados.get("etapas", {"importar": True, "picklist": True, "nfe": True, "envio": True}),
+        "etapas":          dados.get("etapas", {"importar": True, "picklist": False, "nfe": True, "envio": True}),
         "nome_impressora":         dados.get("nome_impressora", "").strip(),
         "auto_imprimir_etiquetas": bool(dados.get("auto_imprimir_etiquetas", False)),
     }
@@ -944,7 +944,7 @@ def status():
                 config.get("hora_fim", "18:00"),
                 int(config.get("intervalo_horas", 1)),
             )
-    etapas  = config.get("etapas", {"importar": True, "picklist": True, "nfe": True, "envio": True})
+    etapas  = config.get("etapas", {"importar": True, "picklist": False, "nfe": True, "envio": True})
     agora   = datetime.now().strftime("%H:%M")
     proxima = next((h for h in sorted(horarios) if h > agora), horarios[0] if horarios else "—")
 
@@ -2636,11 +2636,7 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
     n_processar  = len(para_marcar_ativos)
     log(f"[picklist] 📋 {len(pedidos)} pedido(s): {n_processar} processar, {n_cancelados} cancelados")
 
-    margem_topo_mm  = float(config.get("margem_topo_mm", 5) or 0)
-    sistema         = platform.system()
-    nome_impressora = config.get("nome_impressora", "").strip()
-    tem_impressora  = bool(nome_impressora) or _verificar_impressora()
-    impressora_usar = nome_impressora or (_nome_impressora_padrao() if sistema == "Darwin" else "")
+    margem_topo_mm = float(config.get("margem_topo_mm", 5) or 0)
 
     # Agrupa por plataforma preservando ordem (ativos primeiro, cancelados por último dentro de cada grupo)
     import re as _re
@@ -2662,21 +2658,7 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
 
         total_u = sum(max(int(p.get("quantidade") or 1), 1) for p in grupo)
         _upload_picklist_supabase(pdf_pick, config.get("token", ""), len(grupo), total_u)
-
-        if tem_impressora:
-            try:
-                if sistema == "Darwin":
-                    cmd = (["lp", "-d", impressora_usar, str(pdf_pick)]
-                           if impressora_usar else ["lp", str(pdf_pick)])
-                    subprocess.run(cmd, timeout=30, check=True)
-                    log(f"[picklist] 🖨️ [{plat}] Enviado para {impressora_usar or 'impressora padrão'}")
-                elif sistema == "Windows":
-                    _imprimir_windows(pdf_pick, impressora_usar)
-                    log(f"[picklist] 🖨️ [{plat}] Enviado para {impressora_usar or 'impressora padrão'}")
-            except Exception as e:
-                log(f"[picklist] ⚠️ [{plat}] Erro ao imprimir: {e} — PDF disponível no PCP")
-        else:
-            log(f"[picklist] 📋 [{plat}] Sem impressora — PDF disponível via PCP")
+        log(f"[picklist] 📋 [{plat}] PDF disponível via PCP")
 
     # Marca todos os pedidos (ativos exceto Para Reservar + cancelados)
     try:
@@ -4304,16 +4286,15 @@ def _imprimir_pdf_local(pdf_path: Path, order_number: str, config: dict) -> dict
     try:
         if tem_impressora:
             if platform.system() == "Darwin":
-                subprocess.Popen(["lp", str(pdf_path)])
+                impressora_d = _nome_impressora_padrao()
+                if impressora_d:
+                    subprocess.Popen(["lp", "-d", impressora_d, str(pdf_path)])
+                else:
+                    subprocess.Popen(["lp", str(pdf_path)])
                 log(f"[etiqueta] 🖨️ {order_number} enviado para impressora")
             elif platform.system() == "Windows":
-                # run() bloqueante: espera o spool terminar antes de deletar o arquivo
-                subprocess.run(
-                    ["powershell", "-Command",
-                     f'Start-Process -FilePath "{pdf_path}" -Verb Print -Wait'],
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                    timeout=30
-                )
+                nome_imp = config.get("nome_impressora", "").strip()
+                _imprimir_windows(pdf_path, nome_imp)
                 log(f"[etiqueta] 🖨️ {order_number} enviado para impressora")
         else:
             if platform.system() == "Darwin":

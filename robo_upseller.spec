@@ -8,12 +8,13 @@ datas_pw,    binaries_pw,    hiddenimports_pw    = collect_all("playwright")
 datas_supa,  binaries_supa,  hiddenimports_supa  = collect_all("supabase")
 datas_flask, binaries_flask, hiddenimports_flask  = collect_all("flask")
 datas_rl,    binaries_rl,    hiddenimports_rl     = collect_all("reportlab")
+datas_pyp,   binaries_pyp,   hiddenimports_pyp    = collect_all("pypdf")
 
 a = Analysis(
     ["launcher.py"],
     pathex=[],
-    binaries=binaries_pw + binaries_supa + binaries_flask + binaries_rl,
-    datas=datas_pw + datas_supa + datas_flask + datas_rl + [
+    binaries=binaries_pw + binaries_supa + binaries_flask + binaries_rl + binaries_pyp,
+    datas=datas_pw + datas_supa + datas_flask + datas_rl + datas_pyp + [
         ("Instalar.bat",     "."),
         ("Instalar.command", "."),
         ("LEIA-ME.txt",      "."),
@@ -23,6 +24,7 @@ a = Analysis(
         + hiddenimports_supa
         + hiddenimports_flask
         + hiddenimports_rl
+        + hiddenimports_pyp
         + [
             "openpyxl",
             "openpyxl.styles",
@@ -32,6 +34,11 @@ a = Analysis(
             "httpx",
             "anyio",
             "sniffio",
+            "pypdf",
+            "pypdf._reader",
+            "pypdf._writer",
+            "pypdf.filters",
+            "pypdf.generic",
             "reportlab",
             "reportlab.pdfgen",
             "reportlab.pdfgen.canvas",
