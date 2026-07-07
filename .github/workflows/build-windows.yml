@@ -17,7 +17,7 @@ jobs:
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}\pw_browsers
         run: |
-          pip install flask supabase playwright openpyxl pyinstaller python-dotenv
+          pip install -r requirements.txt
           playwright install chromium --with-deps
       - name: Compilar
         run: pyinstaller robo_upseller.spec
@@ -42,7 +42,7 @@ jobs:
           python-version: "3.11"
       - name: Instalar dependências
         run: |
-          pip install flask supabase playwright openpyxl pyinstaller python-dotenv
+          pip install -r requirements.txt
           playwright install chromium
       - name: Compilar
         run: pyinstaller robo_upseller.spec

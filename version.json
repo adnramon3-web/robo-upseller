@@ -1,4 +1,4 @@
 {
-  "version": "1.6.1",
-  "descricao": "fix: Programar Envio Shopee usa JS click (SPAN/ant-btn-link) + detecta coleta async via modal"
+  "version": "1.6.3",
+  "descricao": "fix: reportlab no bundle PyInstaller; picklist lock anti-duplicata; log Para Programar vs Aguardando Coleta no envio; Iniciar.command auto-instala deps"
 }

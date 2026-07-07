@@ -254,18 +254,14 @@
     </div>
   </div>
 
-  <!-- HORÁRIOS AUTOMÁTICOS -->
+  <!-- AGENDA SEMANAL -->
   <div class="card">
-    <div class="card-header"><span>🕐</span><h2>Horários Automáticos</h2></div>
+    <div class="card-header"><span>📅</span><h2>Agenda Semanal</h2></div>
     <div class="card-body">
       <p style="font-size:12px;color:#78909C;margin-bottom:14px;">
-        Adicione os horários que o robô deve executar automaticamente. Pode ser qualquer horário.
+        Defina em quais dias e horários o robô vai rodar automaticamente.
       </p>
-      <div class="horarios-lista" id="horarios-lista"></div>
-      <div class="add-horario">
-        <input type="time" id="novo-horario" value="08:00"/>
-        <button class="btn-add" onclick="adicionarHorario()">+ Adicionar</button>
-      </div>
+      <div id="agenda-semanal" style="border:1px solid #E3E8F0;border-radius:10px;overflow:hidden"></div>
     </div>
   </div>
 
@@ -373,36 +369,10 @@
 
   <!-- EXECUÇÃO MANUAL -->
   <div class="card">
-    <div class="card-header"><span>▶️</span><h2>Execução Manual</h2></div>
+    <div class="card-header"><span>▶️</span><h2>Execução</h2></div>
     <div class="card-body">
       <div class="progress-bar" id="progress-bar"><div class="progress-fill"></div></div>
-      <div class="exec-grid">
-        <div class="exec-block">
-          <div class="exec-icon">📆</div>
-          <div class="exec-titulo">Dia Específico</div>
-          <input type="date" id="data-ontem" class="exec-select" style="cursor:pointer;"/>
-          <div class="exec-sub">00:00 até 23:59</div>
-          <div style="flex:1"></div>
-          <button class="exec-btn exec-btn-periodo" id="btn-ontem" onclick="executar('ontem')">▶ Executar</button>
-        </div>
-        <div class="exec-block">
-          <div class="exec-icon">📅</div>
-          <div class="exec-titulo">Hoje até agora</div>
-          <div class="exec-data" id="exec-data-hoje">—</div>
-          <div class="exec-sub" id="exec-hora-hoje">até —:—</div>
-          <div style="flex:1"></div>
-          <button class="exec-btn exec-btn-hoje" id="btn-hoje" onclick="executar('hoje')">▶ Executar</button>
-        </div>
-        <div class="exec-block">
-          <div class="exec-icon">🔄</div>
-          <div class="exec-titulo">Ontem + Hoje</div>
-          <div class="exec-data" style="font-size:12px;color:#7B1FA2;">Carga completa</div>
-          <div class="exec-sub">início do dia</div>
-          <div style="flex:1"></div>
-          <button class="exec-btn" id="btn-ambos" onclick="executar('ambos')"
-            style="background:linear-gradient(135deg,#6A1B9A,#9C27B0);color:#fff;">▶ Executar</button>
-        </div>
-      </div>
+      <button class="exec-btn exec-btn-hoje" id="btn-hoje" onclick="executar('hoje')" style="width:100%;height:48px;font-size:15px;font-weight:700;border-radius:10px;margin-bottom:10px">▶ Rodar</button>
       <button class="btn-sec btn-capturar" id="btn-capturar" onclick="capturarEtiquetas()">🏷️ Capturar Etiquetas</button>
       <div class="robot-controls">
         <button class="btn-ctrl btn-parar" id="btn-parar" onclick="pararRobo()" disabled>⏹️ Parar</button>
@@ -450,45 +420,113 @@
     setInterval(atualizarBlocos, 30000);
   });
 
-  function atualizarBlocos() {
-    const hoje  = new Date();
-    const ontem = new Date(hoje); ontem.setDate(hoje.getDate() - 1);
-    const fmt   = d => d.toLocaleDateString('pt-BR', {day:'2-digit',month:'2-digit',year:'numeric'});
-    const hm    = d => d.toLocaleTimeString('pt-BR', {hour:'2-digit',minute:'2-digit'});
-    const inp   = document.getElementById('data-ontem');
-    if (inp && !inp.value) inp.value = ontem.toISOString().split('T')[0];
-    document.getElementById('exec-data-hoje').textContent = fmt(hoje);
-    document.getElementById('exec-hora-hoje').textContent = `até ${hm(hoje)}`;
+  function atualizarBlocos() {}
+
+  // ── Agenda Semanal ───────────────────────────────────────────────────────
+  const _DIAS = [
+    { key:'seg', label:'Segunda'  },
+    { key:'ter', label:'Terça'    },
+    { key:'qua', label:'Quarta'   },
+    { key:'qui', label:'Quinta'   },
+    { key:'sex', label:'Sexta'    },
+    { key:'sab', label:'Sábado',  fim:true },
+    { key:'dom', label:'Domingo', fim:true },
+  ];
+
+  function _chipH(val) {
+    const d = document.createElement('div');
+    d.className = 'horario-chip';
+    d.innerHTML = `🕐 <input type="time" value="${val}" style="border:none;background:none;font-size:13px;font-weight:700;color:#1565C0;width:54px;outline:none;padding:0"/>
+      <button onclick="this.parentElement.remove()" style="background:none;border:none;cursor:pointer;color:#90A4AE;font-size:15px;line-height:1;padding:0">×</button>`;
+    return d;
   }
 
-  // ── Horários ─────────────────────────────────────────────────────────────
-  function renderHorarios() {
-    const lista = document.getElementById('horarios-lista');
-    lista.innerHTML = '';
-    _horarios.sort().forEach(h => {
-      const chip = document.createElement('div');
-      chip.className = 'horario-chip';
-      chip.innerHTML = `🕐 ${h} <button onclick="removerHorario('${h}')" title="Remover">×</button>`;
-      lista.appendChild(chip);
+  function _buildDia(container, key, label, times, fim) {
+    const ativo = Array.isArray(times);
+    container.dataset.ativo = ativo ? '1' : '0';
+    container.style.cssText = `display:flex;align-items:center;gap:8px;padding:9px 14px;border-bottom:1px solid #EEF2F7;background:${fim&&!ativo?'#FAFBFC':'#fff'};min-height:46px`;
+
+    const lbl = document.createElement('span');
+    lbl.textContent = label;
+    lbl.style.cssText = `width:66px;font-size:12px;font-weight:${ativo?'700':'500'};color:${ativo?'#1e293b':'#94A3B8'};flex-shrink:0`;
+    container.appendChild(lbl);
+
+    if (ativo) {
+      const chips = document.createElement('div');
+      chips.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;flex:1;align-items:center';
+      (times.length ? times : ['08:00']).forEach(t => chips.appendChild(_chipH(t)));
+      const addB = document.createElement('button');
+      addB.textContent = '+ horário';
+      addB.className = 'btn-add';
+      addB.style.cssText = 'height:28px;padding:0 10px;font-size:11px;border-radius:6px';
+      addB.onclick = () => chips.insertBefore(_chipH('08:00'), addB);
+      chips.appendChild(addB);
+      container.appendChild(chips);
+
+      const disB = document.createElement('button');
+      disB.textContent = 'Desativar';
+      disB.style.cssText = 'border:1px solid #E3E8F0;border-radius:6px;padding:3px 10px;background:none;color:#94A3B8;font-size:10px;cursor:pointer;flex-shrink:0';
+      disB.onclick = () => { container.innerHTML=''; _buildDia(container, key, label, null, fim); };
+      container.appendChild(disB);
+    } else {
+      const txt = document.createElement('span');
+      txt.textContent = 'Desativado';
+      txt.style.cssText = 'font-size:11px;color:#CBD5E1;flex:1;font-style:italic';
+      container.appendChild(txt);
+
+      const atiB = document.createElement('button');
+      atiB.textContent = 'Ativar dia';
+      atiB.style.cssText = 'border:1.5px solid var(--azul-cl);border-radius:6px;padding:4px 12px;background:#EEF6FF;color:var(--azul);font-size:11px;font-weight:700;cursor:pointer;flex-shrink:0';
+      atiB.onclick = () => { container.innerHTML=''; _buildDia(container, key, label, ['08:00'], fim); };
+      container.appendChild(atiB);
+    }
+  }
+
+  function renderAgenda(horarios_semanais) {
+    const wrap = document.getElementById('agenda-semanal');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+    _DIAS.forEach(({ key, label, fim }) => {
+      const row = document.createElement('div');
+      row.id = `dia-${key}`;
+      const times = horarios_semanais ? horarios_semanais[key] : ['08:00'];
+      _buildDia(row, key, label, Array.isArray(times) ? times : null, fim);
+      wrap.appendChild(row);
     });
-    if (_horarios.length === 0) {
-      lista.innerHTML = '<span style="font-size:12px;color:#B0BEC5;padding:6px 0;">Nenhum horário cadastrado</span>';
-    }
+    if (wrap.lastChild) wrap.lastChild.style.borderBottom = 'none';
   }
 
-  function adicionarHorario() {
-    const val = document.getElementById('novo-horario').value;
-    if (!val) return;
-    if (!_horarios.includes(val)) {
-      _horarios.push(val);
-      renderHorarios();
-    }
+  function _flatToSemanal(horarios) {
+    const h = horarios && horarios.length ? [...horarios] : ['08:00'];
+    return { seg:h, ter:h, qua:h, qui:h, sex:h, sab:null, dom:null };
   }
 
-  function removerHorario(h) {
-    _horarios = _horarios.filter(x => x !== h);
-    renderHorarios();
+  function _coletarSemanal() {
+    const s = {};
+    _DIAS.forEach(({ key }) => {
+      const row = document.getElementById(`dia-${key}`);
+      if (!row) return;
+      if (row.dataset.ativo === '1') {
+        const vals = [...row.querySelectorAll('input[type=time]')].map(i=>i.value).filter(Boolean).sort();
+        s[key] = vals.length ? vals : ['08:00'];
+      } else {
+        s[key] = null;
+      }
+    });
+    return s;
   }
+
+  // compat: mantém _horarios como union de todos os dias (usado no status pill)
+  function _horariosDaSemanal(s) {
+    const todos = new Set();
+    Object.values(s).forEach(v => { if(v) v.forEach(h => todos.add(h)); });
+    return [...todos].sort();
+  }
+
+  // legacy shim — não usado mais, mantido para compatibilidade
+  function renderHorarios() {}
+  function adicionarHorario() {}
+  function removerHorario() {}
 
   // ── Etapas ───────────────────────────────────────────────────────────────
   function atualizarEtapa(nome) {
@@ -527,16 +565,14 @@
       document.getElementById('ci-sub').textContent =
         hs.length ? `${hs.length} horário(s) · Próxima execução: ${proxima}` : 'Nenhum horário configurado';
 
-      // Carrega horários e etapas vindos do servidor
-      if (Array.isArray(data.horarios)) {
-        _horarios = data.horarios;
-        renderHorarios();
-      }
+      // Carrega agenda semanal ou converte lista antiga
+      const semanal = data.horarios_semanais || _flatToSemanal(data.horarios || []);
+      renderAgenda(semanal);
       if (data.etapas) aplicarEtapas(data.etapas);
     } else {
       pill.className = 'status-pill nok';
       txt.textContent = 'Não configurado';
-      renderHorarios();
+      renderAgenda(null);
     }
 
     const btnAuth = document.getElementById('btn-auth');
@@ -576,7 +612,8 @@
         token:           document.getElementById('token').value,
         upseller_email:  document.getElementById('email').value,
         upseller_senha:  document.getElementById('senha').value,
-        horarios:        _horarios,
+        horarios_semanais: _coletarSemanal(),
+        horarios:          _horariosDaSemanal(_coletarSemanal()),
         etapas:          _etapas,
         nome_impressora:         document.getElementById('nome_impressora').value,
         auto_imprimir_etiquetas: document.getElementById('auto_imprimir_etiquetas').checked,
@@ -597,11 +634,8 @@
 
   // ── Executar ─────────────────────────────────────────────────────────────
   function _setBotoes(disabled) {
-    ['btn-ontem','btn-hoje','btn-ambos'].forEach(id => {
-      const el = document.getElementById(id);
-      if (el) el.disabled = disabled;
-    });
-    // Parar: habilitado enquanto rodando, desabilitado quando parado
+    const rodar = document.getElementById('btn-hoje');
+    if (rodar) rodar.disabled = disabled;
     const parar = document.getElementById('btn-parar');
     if (parar) parar.disabled = !disabled;
   }
@@ -634,11 +668,10 @@
   async function executar(modo) {
     _setBotoes(true);
     document.getElementById('progress-bar').classList.add('active');
-    const dataOntem = document.getElementById('data-ontem')?.value || '';
     const resp = await fetch('/executar', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ modo, data_alvo: dataOntem })
+      body: JSON.stringify({ modo })
     });
     const data = await resp.json();
     if (!data.ok) {

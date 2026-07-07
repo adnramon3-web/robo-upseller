@@ -57,7 +57,7 @@ app.config["TEMPLATES_AUTO_RELOAD"] = True
 def _add_cors_global(response):
     response.headers["Access-Control-Allow-Origin"]  = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS"
     return response
 
 _ignorar_paths = {"/", "/status", "/log", "/log-stream", "/favicon.ico"}
@@ -77,6 +77,7 @@ _etapa_atual     = ""                 # etapa visível no PCP
 _parar           = threading.Event()  # sinaliza parada solicitada pelo usuário
 _captura_lock    = threading.Lock()   # evita duas capturas simultâneas
 _capturar_skip   = set()              # pedidos com URL inválida nesta sessão (background ignora)
+_picklist_lock   = threading.Lock()   # evita picklists duplicadas simultâneas
 _ultima_rodada: dict = {}             # stats da última rodada — expostos via /status
 _API_STATE_LABEL = {
     "allocate":        "Para Reservar",
@@ -329,10 +330,13 @@ async def _backfill_historico(config: dict, dias: int):
         qtd_total = sum(int(i.get("productCount") or 1) for i in items) or 1
         # Usa payTime (data do pagamento) → createTime → fallback
         data_pedido = data_fim
+        hora_pagamento = None
         for campo_data in ("payTime", "createTime", "orderTime", "invoiceTime"):
-            v = (order.get(campo_data) or "")[:10]  # "YYYY-MM-DD"
-            if len(v) == 10 and v[4] == "-":
-                data_pedido = v
+            v = (order.get(campo_data) or "").strip().replace("T", " ")
+            if len(v) >= 10 and v[4] == "-":
+                data_pedido = v[:10]
+                if len(v) >= 16:
+                    hora_pagamento = v[11:16]  # "HH:MM"
                 break
 
         if on not in pedidos_dict:
@@ -350,6 +354,7 @@ async def _backfill_historico(config: dict, dias: int):
                 "product_name":      (first.get("productName") or "").strip(),
                 "image_url":         (first.get("productImg")  or "").strip(),
                 "data":              data_pedido,
+                "hora_pagamento":    hora_pagamento,
                 "quantidade":        qtd_total,
                 "plataforma":        plataforma,
                 "valor":             valor,
@@ -462,6 +467,7 @@ CREATE TABLE IF NOT EXISTS pedidos (
 );
 ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS numero_plataforma TEXT;
 ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS nome_cliente TEXT;
+ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS hora_pagamento TEXT;
 
 CREATE TABLE IF NOT EXISTS pedido_itens (
     id           BIGSERIAL PRIMARY KEY,
@@ -529,7 +535,7 @@ CREATE TABLE IF NOT EXISTS pedido_itens (
 # ── Executar agora ────────────────────────────────────────────────────────────
 def _cors(r):
     r.headers["Access-Control-Allow-Origin"]  = "*"
-    r.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    r.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
     r.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return r
 
@@ -1000,6 +1006,25 @@ def parar():
     return _cors(jsonify({"ok": True}))
 
 
+@app.route("/sincronizar-status", methods=["POST", "OPTIONS"], provide_automatic_options=False)
+def sincronizar_status():
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    if not CONFIG_FILE.exists():
+        return _cors(jsonify({"ok": False, "erro": "Robô não configurado"})), 400
+    def _run():
+        global _ultimo_sync_status
+        try:
+            config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            total = asyncio.run(_sincronizar_status_upseller(config))
+            _ultimo_sync_status = time.time()
+            log(f"[status] ✅ Sync manual concluído — {total} pedidos atualizados")
+        except Exception as e:
+            log(f"[status] ⚠️ Sync manual falhou: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+    return _cors(jsonify({"ok": True, "msg": "Sync de status iniciado em background"}))
+
+
 @app.route("/recarregar-config", methods=["POST", "OPTIONS"], provide_automatic_options=False)
 def recarregar_config():
     if request.method == "OPTIONS":
@@ -1169,15 +1194,17 @@ def atualizar_ultima_execucao(token: str):
         pass
 
 
-_ultimo_retro: float = 0.0  # timestamp da última captura retroativa
+_ultimo_retro: float = 0.0       # timestamp da última captura retroativa
 _INTERVALO_RETRO: float = 5 * 60  # retroativo a cada 5 minutos
+_ultimo_sync_status: float = 0.0        # timestamp do último sync de status
+_INTERVALO_SYNC_STATUS: float = 30 * 60  # sync de status a cada 30 minutos
 
 
 def _executar_captura(config: dict, aguardar: bool = True, background: bool = False):
     """Roda captura com lock — impede duas execuções simultâneas.
     Background: pula se já rodando. Executar principal: espera até 60s o background ceder.
     """
-    global _ultimo_retro
+    global _ultimo_retro, _ultimo_sync_status
     if background:
         if not _captura_lock.acquire(blocking=False):
             log("[captura] ⏭️ Já em execução — pulando")
@@ -1190,12 +1217,17 @@ def _executar_captura(config: dict, aguardar: bool = True, background: bool = Fa
             return
     try:
         asyncio.run(_capturar_etiquetas_playwright(config, aguardar_se_vazio=aguardar, background=background))
-        # Retroativo: tenta capturar pedidos sem label_url a cada 5 min (só background)
         if background:
             agora = time.time()
+            # Retroativo: tenta capturar pedidos sem label_url a cada 5 min
             if agora - _ultimo_retro >= _INTERVALO_RETRO:
                 asyncio.run(_capturar_retroativo_playwright(config))
                 _ultimo_retro = time.time()
+            # Sync de status_upseller a cada 30 min
+            if agora - _ultimo_sync_status >= _INTERVALO_SYNC_STATUS:
+                log("[status] 🔄 Sync periódico de status_upseller...")
+                asyncio.run(_sincronizar_status_upseller(config))
+                _ultimo_sync_status = time.time()
     finally:
         _captura_lock.release()
 
@@ -1222,6 +1254,102 @@ def _upload_etiqueta_supabase(pdf_path: Path, order_number: str) -> str | None:
                 log(f"[storage] ⚠️ Upload {order_number} falhou: {e}")
                 _ultima_rodada["storage_erros"] = _ultima_rodada.get("storage_erros", 0) + 1
     return None
+
+
+def _upload_picklist_supabase(pdf_path: Path, token: str, total_pedidos: int, total_unidades: int) -> str | None:
+    """Faz upload da picklist para Supabase Storage, salva metadados na tabela picklists e retorna URL pública."""
+    try:
+        supa = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        nome = pdf_path.name
+        caminho = f"picklists/{nome}"
+        supa.storage.from_("robo-upseller").upload(
+            caminho,
+            pdf_path.read_bytes(),
+            {"content-type": "application/pdf", "upsert": "true"},
+        )
+        url = f"{SUPABASE_STORAGE_URL}/{caminho}"
+        supa.table("picklists").insert({
+            "cliente":        token,
+            "nome":           nome,
+            "url":            url,
+            "total_pedidos":  total_pedidos,
+            "total_unidades": total_unidades,
+        }).execute()
+        log(f"[picklist] ☁️ Upload Supabase: {nome}")
+        return url
+    except Exception as e:
+        log(f"[picklist] ⚠️ Upload Supabase falhou: {e}")
+        return None
+
+
+def _salvar_imagens_supabase(token: str, pedidos: list, itens_list: list) -> int:
+    """Baixa imagens externas e salva no Supabase Storage, atualizando image_url in-place."""
+    import urllib.request as _ureq
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    supa = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    try:
+        existentes = {f["name"] for f in (supa.storage.from_("robo-upseller").list("imagens") or [])}
+    except Exception:
+        existentes = set()
+
+    # Separa pedidos que precisam de download
+    pendentes = []
+    for p in pedidos:
+        img = (p.get("image_url") or "").strip()
+        if not img or SUPABASE_URL in img:
+            continue
+        on  = p["order_number"]
+        ext = "jpg"
+        if ".png" in img.lower():   ext = "png"
+        elif ".webp" in img.lower(): ext = "webp"
+        nome_arquivo = f"{on}.{ext}"
+        caminho      = f"imagens/{nome_arquivo}"
+        storage_url  = f"{SUPABASE_STORAGE_URL}/{caminho}"
+        if nome_arquivo in existentes:
+            p["image_url"] = storage_url
+            for it in itens_list:
+                if it["order_number"] == on:
+                    it["image_url"] = storage_url
+            continue
+        pendentes.append((p, img, on, ext, nome_arquivo, caminho, storage_url))
+
+    if not pendentes:
+        return 0
+
+    itens_por_on = {}
+    for it in itens_list:
+        itens_por_on.setdefault(it["order_number"], []).append(it)
+
+    salvos_lock = threading.Lock()
+    salvos = 0
+
+    def _baixar_e_salvar(args):
+        p, img, on, ext, nome_arquivo, caminho, storage_url = args
+        try:
+            req  = _ureq.Request(img, headers={"User-Agent": "Mozilla/5.0"})
+            data = _ureq.urlopen(req, timeout=8).read()
+            create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY).storage.from_("robo-upseller").upload(
+                caminho, data,
+                {"content-type": f"image/{ext}", "upsert": "true"},
+            )
+            p["image_url"] = storage_url
+            for it in itens_por_on.get(on, []):
+                it["image_url"] = storage_url
+            return True
+        except Exception as e:
+            log(f"[img] ⚠️ {on}: {e}")
+            return False
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futuros = {ex.submit(_baixar_e_salvar, args): args for args in pendentes}
+        for fut in as_completed(futuros):
+            if fut.result():
+                with salvos_lock:
+                    salvos += 1
+
+    if salvos:
+        log(f"[img] ✅ {salvos} imagem(ns) salvas no Supabase Storage")
+    return salvos
 
 
 def _limpar_etiquetas_storage(dias: int = 7):
@@ -1302,9 +1430,8 @@ def _pos_import(config: dict):
     global _picklist_hoje, _etapa_atual
     etapas = config.get("etapas", {})
 
-    # 1. Sincroniza PDFs em disco com Supabase e captura o que já está em Para Imprimir
+    # 1. Captura o que já está em Para Imprimir (PDFs já sincronizados antes do __fim__)
     _etapa_atual = "Capturando etiquetas..."
-    _atualizar_supabase_com_pdfs_locais(config.get("token", ""))
     log("━━ Capturando etiquetas já prontas ━━")
     _executar_captura(config, aguardar=False)
     _atualizar_json_com_urls_robot(config.get("token", ""))
@@ -1328,6 +1455,8 @@ def _pos_import(config: dict):
         _etapa_atual = "Emitindo NF-e..."
         log("━━ Emitindo NF-e em massa ━━")
         asyncio.run(_emitir_nfe_massa_playwright(config))
+        log("━━ Atualizando status pós NF-e ━━")
+        asyncio.run(_sincronizar_status_upseller(config))
 
     if _parar.is_set():
         log("⏹️ Execução cancelada pelo usuário")
@@ -1338,6 +1467,8 @@ def _pos_import(config: dict):
         _etapa_atual = "Programando envio..."
         log("━━ Programando envio ━━")
         asyncio.run(_programar_envio_playwright(config))
+        log("━━ Atualizando status pós Envio ━━")
+        asyncio.run(_sincronizar_status_upseller(config))
 
     if _parar.is_set():
         log("⏹️ Execução cancelada pelo usuário")
@@ -1358,7 +1489,8 @@ def _rodar_em_thread(config: dict, data_inicio: datetime, data_fim: datetime):
     _parar.clear()
     _capturar_skip.clear()
     _ultima_rodada.update({"inseridos": 0, "atualizados": 0, "storage_erros": 0,
-                           "etiquetas_ok": 0, "etiquetas_total": 0, "sem_etiqueta": 0, "em": None})
+                           "etiquetas_ok": 0, "etiquetas_total": 0, "sem_etiqueta": 0,
+                           "cancelados": 0, "em": None})
     # Aguarda o background capturar fechar o Chrome antes de abrir o Excel
     # (dois processos no mesmo perfil causam conflito)
     adquiriu = _captura_lock.acquire(timeout=45)
@@ -1416,7 +1548,8 @@ def _rodar_em_thread_duplo(config: dict,
     _pos_import_ativo = True
     _parar.clear()
     _ultima_rodada.update({"inseridos": 0, "atualizados": 0, "storage_erros": 0,
-                           "etiquetas_ok": 0, "etiquetas_total": 0, "sem_etiqueta": 0, "em": None})
+                           "etiquetas_ok": 0, "etiquetas_total": 0, "sem_etiqueta": 0,
+                           "cancelados": 0, "em": None})
     adquiriu = _captura_lock.acquire(timeout=45)
     if adquiriu:
         _captura_lock.release()
@@ -1460,8 +1593,14 @@ def _imprimir_picklist_thread(config: dict):
         log("━━ Picklist aguardando import terminar... ━━")
         while rodando:
             time.sleep(10)
-    log("━━ Gerando picklist automático ━━")
-    _imprimir_picklist_supabase(config)
+    if not _picklist_lock.acquire(blocking=False):
+        log("━━ Picklist já em geração por outra thread — ignorando ━━")
+        return
+    try:
+        log("━━ Gerando picklist automático ━━")
+        _imprimir_picklist_supabase(config)
+    finally:
+        _picklist_lock.release()
 
 
 # ── Playwright: download automático do Excel ──────────────────────────────────
@@ -2285,159 +2424,146 @@ def _nome_impressora_padrao() -> str:
 
 # ── Picklist gerada do Supabase (sem Playwright) ─────────────────────────────
 
-def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0) -> "Path":
+def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0, sufixo: str = "", plataforma: str = "") -> "Path":
     """Gera PDF de picklist em papel térmico 10x5cm.
-    Capa resumo + uma etiqueta por UNIDADE (pedidos com qty>1 geram N etiquetas) com código de barras."""
+    Capa resumo + uma etiqueta por UNIDADE com foto do produto e código de barras."""
+    import urllib.request, io as _io
     from reportlab.pdfgen import canvas as rl_canvas
     from reportlab.lib.units import mm as rl_mm
     from reportlab.lib import colors as rl_colors
     from reportlab.lib.colors import HexColor
+    from reportlab.lib.utils import ImageReader
     from reportlab.graphics.barcode import code128 as rl_barcode
-    from collections import Counter
 
     PASTA_PICKLISTS.mkdir(exist_ok=True)
-    nome = f"picklist_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    _sfx = f"_{sufixo}" if sufixo else ""
+    nome = f"picklist_{datetime.now().strftime('%Y%m%d_%H%M%S')}{_sfx}.pdf"
     out  = PASTA_PICKLISTS / nome
 
     LW = 100 * rl_mm
     LH = 50  * rl_mm
     offset_y = margem_topo_mm * rl_mm
-    topo = LH - offset_y - 2 * rl_mm   # coordenada Y do topo útil
+    topo = LH - offset_y - 2 * rl_mm
 
-    ts = datetime.now().strftime("%d/%m %H:%M")
+    ts = datetime.now().strftime("%d/%m/%Y, %H:%M")
 
-    def _cat(p):
-        st  = (p.get("status") or "").strip().lower()
-        sup = (p.get("status_upseller") or "").strip().lower()
-        if st == "cancelado":      return "cancelado"
-        if sup == "para reservar": return "reservar"
-        if sup == "para retirada": return "retirada"
-        return "normal"
-
-    _ORD   = {"normal": 0, "retirada": 1, "reservar": 2, "cancelado": 3}
-    pedidos = sorted(pedidos, key=lambda p: _ORD.get(_cat(p), 0))
-    cats    = Counter(_cat(p) for p in pedidos)
-
-    # Expande para uma entrada por UNIDADE (para multi-item gerar fração 1/N, 2/N…)
     unidades = []
     for p in pedidos:
         qtd = max(int(p.get("quantidade") or 1), 1)
         for i in range(qtd):
             unidades.append((p, i + 1, qtd))
 
-    _BADGE = {
-        "retirada":  (HexColor("#1D4ED8"), HexColor("#DBEAFE"), "RETIRADA"),
-        "reservar":  (HexColor("#92400E"), HexColor("#FEF3C7"), "RESERVAR"),
-        "cancelado": (HexColor("#991B1B"), HexColor("#FEE2E2"), "CANCELADO"),
-    }
+    total_u = len(unidades)
+
+    # Cache de imagens: url → bytes ou None
+    _img_cache: dict = {}
+    def _baixar_img(url: str):
+        if not url:
+            return None
+        if url in _img_cache:
+            return _img_cache[url]
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            data = urllib.request.urlopen(req, timeout=4).read()
+            _img_cache[url] = data
+            return data
+        except Exception:
+            _img_cache[url] = None
+            return None
 
     c = rl_canvas.Canvas(str(out), pagesize=(LW, LH))
 
     # ── CAPA RESUMO ───────────────────────────────────────────────────────────
     c.setFont("Helvetica-Bold", 9)
     c.setFillColor(rl_colors.black)
-    c.drawString(4 * rl_mm, topo, f"PICKLIST — {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    c.drawString(4 * rl_mm, topo, f"PICKLIST — {ts}")
     c.setFont("Helvetica-Bold", 8)
     c.drawString(4 * rl_mm, topo - 8 * rl_mm,
-                 f"Total: {len(pedidos)} pedidos  |  {len(unidades)} unidades")
-
-    y = topo - 17 * rl_mm
-    for label, key, color in [
-        ("Para Processar", "normal",    rl_colors.black),
-        ("Para Retirada",  "retirada",  HexColor("#1D4ED8")),
-        ("Para Reservar",  "reservar",  HexColor("#92400E")),
-        ("Cancelados",     "cancelado", HexColor("#991B1B")),
-    ]:
-        n = cats.get(key, 0)
-        if n:
-            c.setFillColor(color)
-            c.setFont("Helvetica-Bold" if key == "cancelado" else "Helvetica", 7)
-            c.drawString(6 * rl_mm, y, f"{n}x  {label}")
-            y -= 6 * rl_mm
-
-    c.setStrokeColor(HexColor("#cccccc"))
+                 f"Total: {len(pedidos)} pedidos  |  {total_u} unidades")
+    if plataforma:
+        c.setFont("Helvetica-Bold", 16)
+        c.setFillColor(HexColor("#1e3a5f"))
+        c.drawCentredString(LW / 2, LH / 2 - 2 * rl_mm, plataforma.upper())
+    c.setStrokeColor(HexColor("#e5e7eb"))
     c.setLineWidth(0.4)
     c.line(0, 2 * rl_mm, LW, 2 * rl_mm)
     c.showPage()
 
     # ── UMA ETIQUETA POR UNIDADE ──────────────────────────────────────────────
-    for p, frac_i, frac_total in unidades:
-        cat     = _cat(p)
-        on      = p.get("order_number", "")
-        produto = (p.get("product_name") or "")[:36]
-        sku     = (p.get("sku") or "")
-        cliente = (p.get("nome_cliente") or "")[:30]
-        plat    = (p.get("plataforma") or "")[:12]
-        data    = (p.get("data") or "")  # "YYYY-MM-DD"
-        data_fmt = f"{data[8:10]}/{data[5:7]}/{data[2:4]}" if len(data) >= 10 else ""
+    # Coordenadas fixas do layout
+    TX      = 22 * rl_mm   # X início do bloco de texto (após foto)
+    PH      = 15 * rl_mm   # altura da foto
+    PW      = 15 * rl_mm   # largura da foto
+    PX      = 4  * rl_mm   # X da foto
+    PY      = 19 * rl_mm   # Y base da foto (bottom)
 
-        # Fundo colorido para situações especiais
-        if cat == "cancelado":
-            c.setFillColor(HexColor("#FFF5F5"))
-            c.rect(0, 0, LW, LH, fill=1, stroke=0)
-        elif cat == "reservar":
-            c.setFillColor(HexColor("#FFFBEB"))
-            c.rect(0, 0, LW, LH, fill=1, stroke=0)
+    for idx, (p, frac_i, frac_total) in enumerate(unidades, start=1):
+        on       = p.get("order_number", "")
+        produto  = (p.get("product_name") or "")
+        sku      = (p.get("sku") or "")
+        cliente  = (p.get("nome_cliente") or "")[:30].upper()
+        plat     = (p.get("plataforma") or "")[:14]
+        data     = (p.get("data") or "")
+        hora     = (p.get("hora_pagamento") or "")
+        data_fmt = (f"{data[8:10]}/{data[5:7]}/{data[2:4]}" if len(data) >= 10 else "") + (f" {hora}" if hora else "")
+        img_url  = (p.get("image_url") or "").strip()
 
-        # Badge topo-direito
-        badge = _BADGE.get(cat)
-        if badge:
-            fg, bg, txt = badge
-            bw, bh = 26 * rl_mm, 6 * rl_mm
-            bx = LW - bw - 3 * rl_mm
-            by = topo - 0.5 * rl_mm
-            c.setFillColor(bg)
-            c.roundRect(bx, by, bw, bh, 1.5 * rl_mm, fill=1, stroke=0)
-            c.setFillColor(fg)
-            c.setFont("Helvetica-Bold", 6.5)
-            c.drawCentredString(bx + bw / 2, by + 1.8 * rl_mm, txt)
-
-        # Cabeçalho
+        # ── Cabeçalho ────────────────────────────────────────────────────────
         c.setFont("Helvetica", 5.5)
-        c.setFillColor(rl_colors.grey)
+        c.setFillColor(HexColor("#9ca3af"))
         c.drawString(4 * rl_mm, topo, f"PICKLIST  {ts}")
+        c.drawRightString(LW - 3 * rl_mm, topo, f"{idx}/{total_u}")
 
-        # Número do pedido + fração
-        c.setFont("Helvetica-Bold", 11)
-        c.setFillColor(HexColor("#991B1B") if cat == "cancelado" else rl_colors.black)
-        c.drawString(4 * rl_mm, topo - 7 * rl_mm, on)
+        # ── Foto do produto (15x15mm, lado esquerdo) ─────────────────────────
+        img_data = _baixar_img(img_url)
+        if img_data:
+            try:
+                c.drawImage(ImageReader(_io.BytesIO(img_data)),
+                            PX, PY, width=PW, height=PH,
+                            preserveAspectRatio=True, anchor="c", mask="auto")
+            except Exception:
+                pass
+
+        # ── Linha do número do pedido ─────────────────────────────────────────
+        ORDER_Y = topo - 7 * rl_mm
+        c.setFont("Helvetica-Bold", 10)
+        c.setFillColor(rl_colors.black)
+        c.drawString(TX, ORDER_Y, on)
+
+        # Plataforma — chip cinza ao lado do número do pedido
+        if plat:
+            on_w = c.stringWidth(on, "Helvetica-Bold", 10)
+            c.setFont("Helvetica", 6)
+            c.setFillColor(HexColor("#6b7280"))
+            c.drawString(TX + on_w + 2 * rl_mm, ORDER_Y + 0.5, plat)
+
+        # Fração n/qtd — direita, laranja
         if frac_total > 1:
             c.setFont("Helvetica-Bold", 10)
             c.setFillColor(HexColor("#b45309"))
-            c.drawRightString(LW - 4 * rl_mm, topo - 7 * rl_mm, f"{frac_i}/{frac_total}")
+            c.drawRightString(LW - 3 * rl_mm, ORDER_Y, f"{frac_i}/{frac_total}")
 
-        # Plataforma
-        if plat and not badge:  # só mostra se não há badge ocupando espaço
-            c.setFont("Helvetica-Bold", 6)
-            c.setFillColor(HexColor("#1d4ed8"))
-            c.drawRightString(LW - 4 * rl_mm, topo, plat)
-
-        # Conteúdo central: produto / aviso
-        if cat == "cancelado":
-            c.setFont("Helvetica-Bold", 7)
-            c.setFillColor(HexColor("#991B1B"))
-            c.drawString(4 * rl_mm, topo - 14 * rl_mm, "NAO PROCESSAR — PEDIDO CANCELADO")
-        elif cat == "reservar":
+        # ── Conteúdo ─────────────────────────────────────────────────────────
+        if True:
+            nome_curto = produto[:40] if len(produto) <= 40 else produto[:37] + "..."
             c.setFont("Helvetica", 7)
-            c.setFillColor(HexColor("#92400E"))
-            c.drawString(4 * rl_mm, topo - 14 * rl_mm, "Aguardando liberacao — nao processar ainda")
-        else:
-            c.setFont("Helvetica", 7.5)
             c.setFillColor(rl_colors.black)
-            c.drawString(4 * rl_mm, topo - 14 * rl_mm, produto)
+            c.drawString(TX, ORDER_Y - 7 * rl_mm, nome_curto)
 
-            sku_linha = f"SKU: {sku}" + (f"  ·  {data_fmt}" if data_fmt else "") + \
-                        (f"  ·  {plat}" if plat else "")
-            c.setFont("Helvetica", 6.5)
-            c.setFillColor(rl_colors.grey)
-            c.drawString(4 * rl_mm, topo - 20 * rl_mm, sku_linha[:52])
+            sku_curto = sku[:26]
+            sku_linha = f"SKU: {sku_curto}" + (f"  ·  {data_fmt}" if data_fmt else "")
+            c.setFont("Helvetica", 6)
+            c.setFillColor(HexColor("#6b7280"))
+            c.drawString(TX, ORDER_Y - 13 * rl_mm, sku_linha)
 
             if cliente:
                 c.setFont("Helvetica-Bold", 6.5)
                 c.setFillColor(HexColor("#1a56db"))
-                c.drawString(4 * rl_mm, topo - 26 * rl_mm, cliente)
+                c.drawString(TX, ORDER_Y - 19 * rl_mm, cliente)
 
-        # Código de barras (Code128, centralizado, altura 10mm)
+        # ── Código de barras (Code128, centralizado, 10mm altura) ───────────
+        c.setFillColor(rl_colors.black)
+        c.setStrokeColor(rl_colors.black)
         try:
             bc = rl_barcode.Code128(on, barHeight=10 * rl_mm, barWidth=1.0, humanReadable=False)
             bc_x = max(2 * rl_mm, (LW - bc.width) / 2)
@@ -2445,19 +2571,19 @@ def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0) -> "Path":
         except Exception:
             pass
 
-        # Número legível abaixo do código de barras
+        # Número legível abaixo do código
         c.setFont("Helvetica", 5)
-        c.setFillColor(rl_colors.grey)
-        c.drawCentredString(LW / 2, 3 * rl_mm, on)
+        c.setFillColor(HexColor("#9ca3af"))
+        c.drawCentredString(LW / 2, 3.2 * rl_mm, on)
 
         # Linha separadora
-        c.setStrokeColor(HexColor("#cccccc"))
+        c.setStrokeColor(HexColor("#e5e7eb"))
         c.setLineWidth(0.4)
         c.line(0, 2 * rl_mm, LW, 2 * rl_mm)
         c.showPage()
 
     c.save()
-    log(f"[picklist] 📄 PDF gerado: {out.name} ({len(pedidos)} pedidos / {len(unidades)} unidades)")
+    log(f"[picklist] 📄 PDF gerado: {out.name} ({len(pedidos)} pedidos / {total_u} unidades)")
     return out
 
 
@@ -2471,7 +2597,7 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
         token = config.get("token", "")
 
         # Pedidos ativos ainda não na picklist
-        _COLS = "order_number,product_name,sku,quantidade,status_upseller,label_url,nome_cliente,plataforma,data"
+        _COLS = "order_number,product_name,sku,quantidade,status_upseller,label_url,image_url,nome_cliente,plataforma,data,hora_pagamento"
         r = (supa.table("pedidos")
              .select(_COLS)
              .eq("status", "ativo")
@@ -2483,7 +2609,7 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
 
         # Cancelados ainda não avisados na picklist
         r_c = (supa.table("pedidos")
-               .select(_COLS.replace(",label_url", ""))
+               .select(_COLS.replace(",label_url", "").replace(",image_url", ""))
                .eq("status", "cancelado")
                .eq("cliente", token)
                .is_("picklist_impresso_em", "null")
@@ -2493,14 +2619,11 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
         for p in cancelados:
             p["status"] = "cancelado"
 
-        # Para Reservar sempre aparece (não marcados) — ficam até ML liberar
-        para_reservar = [p for p in ativos
-                         if (p.get("status_upseller") or "").strip().lower() == "para reservar"]
-        # Demais ativos: marcados após impressão
+        # Para Reservar excluído da picklist — sem etiqueta, operador não consegue processar
         para_marcar_ativos = [p for p in ativos
                               if (p.get("status_upseller") or "").strip().lower() != "para reservar"]
 
-        pedidos = ativos + cancelados  # tudo junto — _gerar_picklist_pdf ordena por categoria
+        pedidos = para_marcar_ativos + cancelados
     except Exception as e:
         log(f"[picklist] ⚠️ Erro ao consultar Supabase: {e}")
         return False
@@ -2509,42 +2632,53 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
         log("[picklist] ℹ️ Nenhum pedido novo — picklist não gerada")
         return True
 
-    n_reservar   = len(para_reservar)
     n_cancelados = len(cancelados)
-    n_processar  = len(pedidos) - n_reservar - n_cancelados
-    log(f"[picklist] 📋 {len(pedidos)} pedido(s): {n_processar} processar, "
-        f"{n_reservar} reservar, {n_cancelados} cancelados")
+    n_processar  = len(para_marcar_ativos)
+    log(f"[picklist] 📋 {len(pedidos)} pedido(s): {n_processar} processar, {n_cancelados} cancelados")
 
-    margem_topo_mm = float(config.get("margem_topo_mm", 5) or 0)
-    try:
-        pdf_pick = _gerar_picklist_pdf(pedidos, margem_topo_mm=margem_topo_mm)
-    except Exception as e:
-        log(f"[picklist] ❌ Erro ao gerar PDF: {e}")
-        return False
-
-    # Imprime se houver impressora; caso contrário fica disponível via /picklist-pdf
-    sistema        = platform.system()
+    margem_topo_mm  = float(config.get("margem_topo_mm", 5) or 0)
+    sistema         = platform.system()
     nome_impressora = config.get("nome_impressora", "").strip()
     tem_impressora  = bool(nome_impressora) or _verificar_impressora()
     impressora_usar = nome_impressora or (_nome_impressora_padrao() if sistema == "Darwin" else "")
 
-    if tem_impressora:
-        try:
-            if sistema == "Darwin":
-                cmd = (["lp", "-d", impressora_usar, str(pdf_pick)]
-                       if impressora_usar else ["lp", str(pdf_pick)])
-                subprocess.run(cmd, timeout=30, check=True)
-                log(f"[picklist] 🖨️ Enviado para {impressora_usar or 'impressora padrão'}")
-            elif sistema == "Windows":
-                _imprimir_windows(pdf_pick, impressora_usar)
-                log(f"[picklist] 🖨️ Enviado para {impressora_usar or 'impressora padrão'}")
-        except Exception as e:
-            log(f"[picklist] ⚠️ Erro ao imprimir: {e} — PDF disponível no PCP")
-    else:
-        log("[picklist] 📋 Sem impressora — PDF disponível via PCP (/picklist-pdf)")
+    # Agrupa por plataforma preservando ordem (ativos primeiro, cancelados por último dentro de cada grupo)
+    import re as _re
+    grupos: dict[str, list] = {}
+    for p in pedidos:
+        plat = (p.get("plataforma") or "outros").strip()
+        grupos.setdefault(plat, []).append(p)
 
-    # Marca ativos (exceto Para Reservar) + cancelados — Para Reservar fica sem marca
-    # para reaparecer na próxima picklist quando o ML liberar
+    def _slug(nome: str) -> str:
+        return _re.sub(r"[^a-z0-9]", "", nome.lower())[:20]
+
+    for plat, grupo in grupos.items():
+        sufixo = _slug(plat)
+        try:
+            pdf_pick = _gerar_picklist_pdf(grupo, margem_topo_mm=margem_topo_mm, sufixo=sufixo, plataforma=plat)
+        except Exception as e:
+            log(f"[picklist] ❌ Erro ao gerar PDF [{plat}]: {e}")
+            continue
+
+        total_u = sum(max(int(p.get("quantidade") or 1), 1) for p in grupo)
+        _upload_picklist_supabase(pdf_pick, config.get("token", ""), len(grupo), total_u)
+
+        if tem_impressora:
+            try:
+                if sistema == "Darwin":
+                    cmd = (["lp", "-d", impressora_usar, str(pdf_pick)]
+                           if impressora_usar else ["lp", str(pdf_pick)])
+                    subprocess.run(cmd, timeout=30, check=True)
+                    log(f"[picklist] 🖨️ [{plat}] Enviado para {impressora_usar or 'impressora padrão'}")
+                elif sistema == "Windows":
+                    _imprimir_windows(pdf_pick, impressora_usar)
+                    log(f"[picklist] 🖨️ [{plat}] Enviado para {impressora_usar or 'impressora padrão'}")
+            except Exception as e:
+                log(f"[picklist] ⚠️ [{plat}] Erro ao imprimir: {e} — PDF disponível no PCP")
+        else:
+            log(f"[picklist] 📋 [{plat}] Sem impressora — PDF disponível via PCP")
+
+    # Marca todos os pedidos (ativos exceto Para Reservar + cancelados)
     try:
         agora    = datetime.utcnow().isoformat()
         order_ns = [p["order_number"] for p in para_marcar_ativos + cancelados]
@@ -2553,7 +2687,7 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
              .update({"picklist_impresso_em": agora})
              .in_("order_number", order_ns[i:i+50])
              .execute())
-        log(f"[picklist] ✅ {len(order_ns)} pedidos marcados ({n_reservar} reservar não marcados) — {agora[:16]}")
+        log(f"[picklist] ✅ {len(order_ns)} pedidos marcados — {agora[:16]}")
     except Exception as e:
         log(f"[picklist] ⚠️ Erro ao marcar Supabase: {e}")
 
@@ -2732,13 +2866,16 @@ def imprimir_picklist():
         return r
 
     config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    threading.Thread(
-        target=_imprimir_picklist_thread,
-        args=(config,),
-        daemon=True
-    ).start()
 
-    r = jsonify({"ok": True})
+    ja_gerando = _picklist_lock.locked()
+    if not ja_gerando:
+        threading.Thread(
+            target=_imprimir_picklist_thread,
+            args=(config,),
+            daemon=True
+        ).start()
+
+    r = jsonify({"ok": True, "aguardando": rodando, "ja_gerando": ja_gerando})
     r.headers["Access-Control-Allow-Origin"] = "*"
     return r
 
@@ -2845,16 +2982,8 @@ def servir_etiqueta(order_number):
         except Exception as e:
             log(f"[etiqueta] ⚠️ Erro ao imprimir: {e!r} — abrindo PDF no viewer")
 
-    # Sem impressora: abre o PDF no sistema e retorna JSON para PCP confirmar
-    log(f"[etiqueta] 📋 {order_number} — abrindo PDF no sistema (sem impressora)")
-    try:
-        pdf_imprimir = _corrigir_mediabox(pdf_path)
-        if sistema == "Darwin":
-            subprocess.Popen(["open", str(pdf_imprimir)])
-        elif sistema == "Windows":
-            subprocess.Popen(["start", "", str(pdf_imprimir)], shell=True)
-    except Exception as e:
-        log(f"[etiqueta] ⚠️ Não foi possível abrir PDF: {e}")
+    # Sem impressora: retorna JSON para PCP abrir o PDF no browser
+    log(f"[etiqueta] 📋 {order_number} — sem impressora, PDF disponível via PCP")
     r = jsonify({"ok": True, "impresso": False, "motivo": "sem_impressora",
                  "pdf": f"http://127.0.0.1:5001/etiqueta/{order_number}?raw=1"})
     r.headers["Access-Control-Allow-Origin"] = "*"
@@ -2875,7 +3004,7 @@ def gerar_picklist_teste():
     try:
         supa = create_client(*_supa())
         res = (supa.table("pedidos")
-               .select("order_number,product_name,sku,quantidade,status_upseller,label_url,nome_cliente,plataforma,data")
+               .select("order_number,product_name,sku,quantidade,status_upseller,label_url,image_url,nome_cliente,plataforma,data")
                .eq("status", "ativo")
                .eq("cliente", token)
                .not_.is_("label_url", "null")
@@ -2966,6 +3095,34 @@ def picklist_apagar(nome):
         r.headers["Access-Control-Allow-Origin"] = "*"
         return r, 500
     r = jsonify({"ok": True})
+    r.headers["Access-Control-Allow-Origin"] = "*"
+    return r
+
+
+@app.route("/imprimir-existente/<nome>", methods=["POST", "OPTIONS"], provide_automatic_options=False)
+def imprimir_existente(nome):
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    if not nome.startswith("picklist_") or not nome.endswith(".pdf"):
+        r = jsonify({"ok": False, "erro": "Nome inválido"})
+        r.headers["Access-Control-Allow-Origin"] = "*"
+        return r, 400
+    pdf = PASTA_PICKLISTS / nome
+    if not pdf.exists():
+        r = jsonify({"ok": False, "erro": "Arquivo não encontrado"})
+        r.headers["Access-Control-Allow-Origin"] = "*"
+        return r, 404
+    try:
+        impressora = _nome_impressora_padrao()
+        if impressora:
+            import subprocess as _sp
+            _sp.run(["lp", "-d", impressora, str(pdf)], timeout=30, check=True)
+            log(f"[picklist] 🖨️ Reimpressão: {nome} → {impressora}")
+        else:
+            log(f"[picklist] ⚠️ Sem impressora para reimprimir {nome}")
+        r = jsonify({"ok": True, "impressora": impressora or None})
+    except Exception as e:
+        r = jsonify({"ok": False, "erro": str(e)})
     r.headers["Access-Control-Allow-Origin"] = "*"
     return r
 
@@ -3093,6 +3250,7 @@ async def _capturar_retroativo_playwright(config: dict) -> None:
         ontem_r = (_date_r.today() - _td_r(days=1)).isoformat()
         res_r = supa_r.table("pedidos").select("order_number") \
             .is_("label_url", "null") \
+            .eq("status_upseller", "Para Imprimir") \
             .gte("data", ontem_r) \
             .execute()
         sem_label = [
@@ -3161,7 +3319,9 @@ async def _capturar_retroativo_playwright(config: dict) -> None:
             ]
 
             for nome_aba_b, url_aba_b in abas_batch:
-                if not pendentes_b or _parar.is_set():
+                if not pendentes_b or _parar.is_set() or rodando:
+                    if rodando:
+                        log("[retro] ⏸️ Ciclo principal iniciado — retro interrompido")
                     break
                 try:
                     await page.goto(url_aba_b, wait_until="domcontentloaded", timeout=30_000)
@@ -3334,7 +3494,8 @@ async def _capturar_retroativo_playwright(config: dict) -> None:
                 log(f"[retro] 🔍 {len(sem_label_r1)} restantes — tentando dropdown individual...")
 
             for on in sem_label_r1[:30]:
-                if _parar.is_set():
+                if _parar.is_set() or rodando:
+                    log("[retro] ⏸️ Ciclo principal iniciado — retro interrompido")
                     break
                 if (PASTA_ETIQUETAS / f"etiqueta_{on}.pdf").exists():
                     continue
@@ -4916,6 +5077,20 @@ async def _programar_envio_playwright(config: dict) -> bool:
                     return val
                 return await page.locator("tbody tr").count()
 
+            async def _get_tab_count(nome_tab: str):
+                return await page.evaluate(f"""() => {{
+                    const tabs = Array.from(document.querySelectorAll(
+                        '.ant-tabs-tab, [class*="tab"], [role="tab"]'
+                    ));
+                    for (const t of tabs) {{
+                        if (t.innerText.includes('{nome_tab}')) {{
+                            const m = t.innerText.match(/\\d+/);
+                            return m ? parseInt(m[0]) : null;
+                        }}
+                    }}
+                    return null;
+                }}""")
+
             for plat_nome in PLATAFORMAS_UI:
                 await page.reload(wait_until="domcontentloaded")
                 await page.wait_for_timeout(2000)
@@ -4928,16 +5103,30 @@ async def _programar_envio_playwright(config: dict) -> bool:
 
                 linhas = await page.locator("tbody tr").count()
                 if linhas == 0:
-                    log(f"[envio] ✅ {plat_nome}: sem pedidos pendentes")
+                    # Verifica se há pedidos em Aguardando Coleta (já agendados)
+                    aguardando = await _get_tab_count("Aguardando Coleta")
+                    if aguardando:
+                        log(f"[envio] ✅ {plat_nome}: sem pedidos pendentes ({aguardando} já agendados aguardando coleta)")
+                    else:
+                        log(f"[envio] ✅ {plat_nome}: sem pedidos pendentes")
                     continue
 
                 programar_btn_chk = page.locator("button", has_text="Programar Envio").first
                 if await programar_btn_chk.count() == 0 or not await programar_btn_chk.is_visible():
-                    log(f"[envio] ✅ {plat_nome}: botão 'Programar Envio' não disponível")
+                    aguardando = await _get_tab_count("Aguardando Coleta")
+                    if aguardando:
+                        log(f"[envio] ✅ {plat_nome}: todos já agendados, {aguardando} aguardando coleta")
+                    else:
+                        log(f"[envio] ✅ {plat_nome}: botão 'Programar Envio' não disponível")
                     continue
 
                 total_inicial = await _get_total_pag()
-                log(f"[envio] 📊 {plat_nome}: {total_inicial} pedido(s) — iniciando agendamento")
+                aguardando_ini = await _get_tab_count("Aguardando Coleta")
+                para_programar_ini = await _get_tab_count("Para Programar")
+                if para_programar_ini is not None and aguardando_ini is not None:
+                    log(f"[envio] 📊 {plat_nome}: {para_programar_ini} para agendar + {aguardando_ini} aguardando coleta — iniciando agendamento")
+                else:
+                    log(f"[envio] 📊 {plat_nome}: {total_inicial} pedido(s) — iniciando agendamento")
 
                 rodada = 0
                 total_anterior = None
@@ -5492,10 +5681,7 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                 log("[api] ⚠️ Sessão expirada — faça login manualmente")
                 return False
 
-            # Para Reservar usa orderState=allocate com allocateStatus=pending_review
-            # (descoberto via interceptação da página /pt/order/to-allocate)
             SECOES = [
-                ("allocate",        "allocateStatus=pending_review",                "Para Reservar", False),
                 ("in_process",      "labelStatus=success&warehouseType=0",          "Para Imprimir", False),
                 ("invoice_pending", "invoiceStatus=to_issue&isVoided=0",            "Para Emitir",   False),
                 ("to_ship",         "",                                              "Para Enviar",   False),
@@ -5580,11 +5766,14 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                 cancelados_api_set = {n for n in cancelados_api if n}
                 if cancelados_api_set:
                     supa_c = create_client(*_supa())
-                    for i in range(0, len(cancelados_api), 50):
+                    total_cancelados = 0
+                    for i in range(0, len(list(cancelados_api_set)), 50):
                         lote_c = list(cancelados_api_set)[i:i+50]
-                        supa_c.table("pedidos").update({"status": "cancelado", "status_upseller": "Cancelado"}).in_("order_number", lote_c).eq("status", "ativo").execute()
-                    log(f"[api] ⛔ {len(cancelados_api_set)} pedido(s) voided verificado(s) no UpSeller")
-                    _ultima_rodada["cancelados"] = _ultima_rodada.get("cancelados", 0) + len(cancelados_api_set)
+                        res_c = supa_c.table("pedidos").update({"status": "cancelado", "status_upseller": "Cancelado"}).in_("order_number", lote_c).eq("status", "ativo").execute()
+                        total_cancelados += len(res_c.data or [])
+                    log(f"[api] ⛔ {len(cancelados_api_set)} voided no UpSeller — {total_cancelados} marcado(s) como cancelado no Supabase")
+                    if total_cancelados:
+                        _ultima_rodada["cancelados"] = _ultima_rodada.get("cancelados", 0) + total_cancelados
             except Exception as e_v:
                 log(f"[api] ⚠️ Verificação de cancelados falhou: {e_v}")
 
@@ -5669,12 +5858,15 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                 api_label_url = v
                 break
 
-        # Data real do pedido: usa payTime > createTime > data_arquivo
-        data_pedido = data_arquivo
-        for campo_dt in ("payTime", "createTime", "orderTime"):
-            v = (order.get(campo_dt) or "")[:10]
-            if len(v) == 10 and v[4] == "-":
-                data_pedido = v
+        # Data e hora do pagamento
+        data_pedido    = data_arquivo
+        hora_pagamento = None
+        for campo_dt in ("orderPayTime", "orderCreateTime", "payTime", "createTime", "orderTime"):
+            v = (order.get(campo_dt) or "").strip().replace("T", " ")
+            if len(v) >= 10 and v[4] == "-":
+                data_pedido = v[:10]
+                if len(v) >= 16:
+                    hora_pagamento = v[11:16]  # "HH:MM"
                 break
 
         if order_num not in pedidos_dict:
@@ -5698,6 +5890,7 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                 "label_url":         api_label_url,
                 "nome_cliente":      nome_cliente,
                 "status_upseller":   _API_STATE_LABEL.get(order.get("_state", ""), None),
+                "hora_pagamento":    hora_pagamento,
             }
         else:
             pedidos_dict[order_num]["quantidade"] += qtd_total
@@ -5707,6 +5900,9 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
     pedidos = list(pedidos_dict.values())
     multi   = sum(1 for p in pedidos if p.get("quantidade", 1) > 1)
     log(f"Pedidos: {len(pedidos)} ({multi} com 2+ itens, {len(itens_list)} itens)")
+
+    # Salva imagens externas (Shopee, TikTok etc.) no Supabase Storage
+    _salvar_imagens_supabase(token, pedidos, itens_list)
 
     # Recupera label_urls salvas no Supabase de execuções anteriores
     try:
@@ -5777,6 +5973,7 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
             "label_url":         p.get("label_url"),
             "nome_cliente":      p.get("nome_cliente"),
             "status_upseller":   p.get("status_upseller"),
+            "hora_pagamento":    p.get("hora_pagamento"),
         } for p in pedidos]
 
         if linhas:
@@ -5969,6 +6166,81 @@ def _loop_captura_etiquetas():
         time.sleep(INTERVALO)
 
 
+async def _sincronizar_status_upseller(config: dict) -> int:
+    """Consulta todas as filas do UpSeller e atualiza status_upseller no Supabase."""
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return 0
+
+    token = config["token"]
+    FILAS = [
+        ("invoice_pending", "invoiceStatus=to_issue&isVoided=0",   "Para Emitir"),
+        ("to_ship",         "",                                     "Para Enviar"),
+        ("in_process",      "labelStatus=success&warehouseType=0", "Para Imprimir"),
+        ("to_pickup",       "",                                     "Para Retirada"),
+    ]
+    estado_por_pedido: dict = {}
+
+    async with async_playwright() as pw:
+        context = await pw.chromium.launch_persistent_context(
+            user_data_dir=str(PASTA_SESSAO), headless=True,
+            args=["--window-size=1280,900"],
+        )
+        try:
+            page = context.pages[0] if context.pages else await context.new_page()
+            await page.goto("https://app.upseller.com/pt/order/in-process",
+                            wait_until="domcontentloaded", timeout=60_000)
+            await page.wait_for_timeout(2000)
+
+            for state, extra, label in FILAS:
+                pg = 1
+                while True:
+                    body = (
+                        f"timeType=0&orderState={state}&isVoided=0&searchType=0"
+                        f"&sortName=1&sortValue=1&pageNum={pg}&pageSize=200"
+                        + (f"&{extra}" if extra else "")
+                    )
+                    r = await page.evaluate(f"""async () => {{
+                        const r = await fetch('/api/order/index', {{
+                            method: 'POST',
+                            headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+                            body: '{body}'
+                        }});
+                        return await r.json();
+                    }}""")
+                    lista = (r.get("data") or {}).get("list") or []
+                    total = int((r.get("data") or {}).get("total") or 0)
+                    for o in lista:
+                        on = (o.get("orderNumber") or "").strip()
+                        if on:
+                            estado_por_pedido[on] = label
+                    if pg * 200 >= total or not lista:
+                        break
+                    pg += 1
+        finally:
+            await context.close()
+
+    if not estado_por_pedido:
+        return 0
+
+    supa = create_client(*_supa())
+    por_status: dict = {}
+    for on, status in estado_por_pedido.items():
+        por_status.setdefault(status, []).append(on)
+
+    total_upd = 0
+    for status, nums in por_status.items():
+        for i in range(0, len(nums), 50):
+            lote = nums[i:i+50]
+            supa.table("pedidos").update({"status_upseller": status}) \
+                .in_("order_number", lote).eq("cliente", token).execute()
+            total_upd += len(lote)
+
+    log(f"[status] ✅ {total_upd} pedidos com status_upseller atualizado no Supabase")
+    return total_upd
+
+
 async def _verificar_cancelados_playwright(config: dict) -> None:
     """
     Cruza pedidos sem label_url no Supabase com o estado atual no UpSeller.
@@ -6137,6 +6409,27 @@ if __name__ == "__main__":
     PASTA_PICKLISTS.mkdir(exist_ok=True)
     _limpar_etiquetas_antigas()
     _limpar_picklists_antigas()
+
+    # Separador no robo_debug.log para marcar início de nova instância
+    try:
+        import logging as _logging
+        _versao_str = "?"
+        try:
+            _versao_str = json.loads((PASTA_RAIZ / "version.json").read_text())["version"]
+        except Exception:
+            pass
+        _sep = (
+            f"\n{'━'*54}\n"
+            f"  ROBÔ INICIADO  {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}  v{_versao_str}\n"
+            f"{'━'*54}"
+        )
+        with open(PASTA_RAIZ / "robo_debug.log", "a", encoding="utf-8") as _f:
+            _f.write(_sep + "\n")
+        # Suprime logs de acesso HTTP do werkzeug (GET /status a cada 20s)
+        _logging.getLogger("werkzeug").setLevel(_logging.ERROR)
+    except Exception:
+        pass
+
     # No Mac, mantém o sistema acordado enquanto o app estiver rodando
     if platform.system() == "Darwin":
         import os

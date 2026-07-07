@@ -7,12 +7,13 @@ from PyInstaller.utils.hooks import collect_all
 datas_pw,    binaries_pw,    hiddenimports_pw    = collect_all("playwright")
 datas_supa,  binaries_supa,  hiddenimports_supa  = collect_all("supabase")
 datas_flask, binaries_flask, hiddenimports_flask  = collect_all("flask")
+datas_rl,    binaries_rl,    hiddenimports_rl     = collect_all("reportlab")
 
 a = Analysis(
     ["launcher.py"],
     pathex=[],
-    binaries=binaries_pw + binaries_supa + binaries_flask,
-    datas=datas_pw + datas_supa + datas_flask + [
+    binaries=binaries_pw + binaries_supa + binaries_flask + binaries_rl,
+    datas=datas_pw + datas_supa + datas_flask + datas_rl + [
         ("Instalar.bat",     "."),
         ("Instalar.command", "."),
         ("LEIA-ME.txt",      "."),
@@ -21,6 +22,7 @@ a = Analysis(
         hiddenimports_pw
         + hiddenimports_supa
         + hiddenimports_flask
+        + hiddenimports_rl
         + [
             "openpyxl",
             "openpyxl.styles",
@@ -30,6 +32,16 @@ a = Analysis(
             "httpx",
             "anyio",
             "sniffio",
+            "reportlab",
+            "reportlab.pdfgen",
+            "reportlab.pdfgen.canvas",
+            "reportlab.lib",
+            "reportlab.lib.units",
+            "reportlab.lib.colors",
+            "reportlab.lib.utils",
+            "reportlab.graphics",
+            "reportlab.graphics.barcode",
+            "reportlab.graphics.barcode.code128",
         ]
     ),
     hookspath=[],
