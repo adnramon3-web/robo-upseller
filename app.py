@@ -48,6 +48,27 @@ PASTA_ETIQUETAS = PASTA_RAIZ / "etiquetas"
 PASTA_PICKLISTS = PASTA_RAIZ / "picklists"
 EXECUCOES_FILE  = PASTA_RAIZ / "execucoes.json"
 
+# ── Normalização de nomes de plataforma ───────────────────────────────────────
+_PLAT_NORM_MAP = {
+    "shopee":        "Shopee",
+    "shein":         "Shein",
+    "kwai":          "Kwai",
+    "mercado":       "Mercado Livre",
+    "mercado livre": "Mercado Livre",
+    "mercado libre": "Mercado Livre",
+    "mercadolivre":  "Mercado Livre",
+    "mercadolibre":  "Mercado Livre",
+    "tiktok":        "TikTok",
+    "tiktok shop":   "TikTok",
+    "tiktokshop":    "TikTok",
+    "tik tok":       "TikTok",
+    "tik tok shop":  "TikTok",
+}
+
+def _norm_plat(nome: str) -> str:
+    """Normaliza nome de plataforma para exibição consistente."""
+    return _PLAT_NORM_MAP.get((nome or "").strip().lower(), (nome or "").strip()) or "Outros"
+
 # ── Flask app ─────────────────────────────────────────────────────────────────
 _template_dir = PASTA_RAIZ / "templates"
 app = Flask(__name__, template_folder=str(_template_dir))
@@ -55,9 +76,10 @@ app.config["TEMPLATES_AUTO_RELOAD"] = True
 
 @app.after_request
 def _add_cors_global(response):
-    response.headers["Access-Control-Allow-Origin"]  = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS"
+    response.headers["Access-Control-Allow-Origin"]          = "*"
+    response.headers["Access-Control-Allow-Headers"]         = "Content-Type,Authorization"
+    response.headers["Access-Control-Allow-Methods"]         = "GET,POST,DELETE,OPTIONS"
+    response.headers["Access-Control-Allow-Private-Network"] = "true"
     return response
 
 _ignorar_paths = {"/", "/status", "/log", "/log-stream", "/favicon.ico"}
@@ -79,6 +101,7 @@ _captura_lock    = threading.Lock()   # evita duas capturas simultâneas
 _capturar_skip   = set()              # pedidos com URL inválida nesta sessão (background ignora)
 _picklist_lock   = threading.Lock()   # evita picklists duplicadas simultâneas
 _ultima_rodada: dict = {}             # stats da última rodada — expostos via /status
+_hb_ts: float = 0.0                  # epoch do último heartbeat enviado
 _API_STATE_LABEL = {
     "allocate":        "Para Reservar",
     "pending_review":  "Para Reservar",
@@ -304,7 +327,7 @@ async def _backfill_historico(config: dict, dias: int):
         on = (order.get("orderNumber") or "").strip()
         if not on:
             continue
-        plataforma = PLAT.get((order.get("platform") or "").lower(), order.get("platform") or "")
+        plataforma = _norm_plat(order.get("platform") or "")
         try:
             valor = float(order.get("orderAmount") or 0) or None
         except Exception:
@@ -361,30 +384,36 @@ async def _backfill_historico(config: dict, dias: int):
                 "cliente":           token,
                 "label_url":         api_label_url,
                 "nome_cliente":      nome_cliente,
+                "shop_id":           str(order.get("shopId") or "") or None,
+                "shop_nome":         (order.get("shopName") or "").strip() or None,
+                "taxa_plataforma":   _extrair_taxa_plataforma(order),
             }
 
-    # Filtra só os que não estão no Supabase
+    # Upserta todos (on_conflict=order_number) — atualiza shop_nome em pedidos já existentes
     supa = create_client(*_supa())
+    todos_pedidos = list(pedidos_dict.values())
+    log(f"[backfill] 📥 {len(todos_pedidos)} pedido(s) para upsert no Supabase")
+
+    if not todos_pedidos:
+        log("[backfill] ✅ Nenhum pedido encontrado para importar")
+        return
+
+    # Identifica quais são novos (para inserir itens só desses)
     nums = list(pedidos_dict.keys())
     existentes: set = set()
     for i in range(0, len(nums), 100):
         lote = nums[i:i + 100]
         r = supa.table("pedidos").select("order_number").in_("order_number", lote).execute()
         existentes.update(row["order_number"] for row in (r.data or []))
+    novos = {n for n in nums if n not in existentes}
+    log(f"[backfill] 🆕 {len(novos)} novo(s), 🔄 {len(existentes)} atualização(ões) de shop_nome")
 
-    faltando = [pedidos_dict[n] for n in nums if n not in existentes]
-    log(f"[backfill] 📥 {len(faltando)} pedido(s) faltando no Supabase")
-
-    if not faltando:
-        log("[backfill] ✅ Supabase já está atualizado")
-        return
-
-    # Insere em lotes com tratamento de erro por coluna
+    # Upsert em lotes com tratamento de erro por coluna
     inseridos = 0
     erros = 0
-    COLUNAS_OPCIONAIS = {"plataforma", "valor", "label_url", "numero_plataforma", "nome_cliente"}
-    for i in range(0, len(faltando), 50):
-        lote_orig = faltando[i:i + 50]
+    COLUNAS_OPCIONAIS = {"plataforma", "valor", "label_url", "numero_plataforma", "nome_cliente", "shop_id", "shop_nome", "taxa_plataforma"}
+    for i in range(0, len(todos_pedidos), 50):
+        lote_orig = todos_pedidos[i:i + 50]
         excluir: set = set()
         lote = lote_orig
         while True:
@@ -399,12 +428,12 @@ async def _backfill_historico(config: dict, dias: int):
                     excluir.add(col)
                     lote = [{k: v for k, v in row.items() if k not in excluir} for row in lote_orig]
                 else:
-                    log(f"[backfill] ⚠️ Erro insert lote {i//50+1}: {msg[:120]}")
+                    log(f"[backfill] ⚠️ Erro upsert lote {i//50+1}: {msg[:120]}")
                     erros += len(lote_orig)
                     break
 
-    # Insere itens dos faltando
-    ons_faltando = {p["order_number"] for p in faltando}
+    # Insere itens apenas dos pedidos novos
+    ons_faltando = novos
     itens_inserir = [it for it in itens_list if it["order_number"] in ons_faltando]
     for i in range(0, len(itens_inserir), 50):
         try:
@@ -534,9 +563,10 @@ CREATE TABLE IF NOT EXISTS pedido_itens (
 
 # ── Executar agora ────────────────────────────────────────────────────────────
 def _cors(r):
-    r.headers["Access-Control-Allow-Origin"]  = "*"
-    r.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
-    r.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    r.headers["Access-Control-Allow-Origin"]          = "*"
+    r.headers["Access-Control-Allow-Methods"]         = "GET, POST, DELETE, OPTIONS"
+    r.headers["Access-Control-Allow-Headers"]         = "Content-Type"
+    r.headers["Access-Control-Allow-Private-Network"] = "true"
     return r
 
 def _cors_preflight():
@@ -918,8 +948,10 @@ def rodando_flag():
 
 
 # ── Status atual ──────────────────────────────────────────────────────────────
-@app.route("/status")
+@app.route("/status", methods=["GET", "OPTIONS"], provide_automatic_options=False)
 def status():
+    if request.method == "OPTIONS":
+        return _cors_preflight()
     config = {}
     if CONFIG_FILE.exists():
         config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -974,7 +1006,7 @@ def status():
     except Exception:
         versao = "?"
 
-    return jsonify({
+    resp_data = {
         "configurado":    bool(config.get("token")),
         "token":          config.get("token", ""),
         "cliente":        cliente,
@@ -990,10 +1022,71 @@ def status():
         "sessao_ok":   sessao_ok,
         "versao":      versao,
         "ultima_rodada": _ultima_rodada,
-    })
+    }
+
+    # Heartbeat via /status (fallback caso o thread falhe)
+    global _hb_ts
+    _tk = (config.get("token") or "").strip()
+    if _tk and (time.time() - _hb_ts) > 25:
+        def _hb_upload():
+            global _hb_ts
+            try:
+                _DIA_KEYS = ["seg", "ter", "qua", "qui", "sex", "sab", "dom"]
+                _dia = _DIA_KEYS[datetime.now().weekday()]
+                _hsem = config.get("horarios_semanais", {})
+                _hor  = _hsem.get(_dia) or config.get("horarios", [])
+                _agr  = datetime.now().strftime("%H:%M")
+                _prox = next((h for h in sorted(_hor) if h > _agr), _hor[0] if _hor else "")
+                _payload = json.dumps({
+                    "online":            True,
+                    "versao":            versao,
+                    "rodando":           rodando,
+                    "etapa":             _etapa_atual,
+                    "proxima":           _prox,
+                    "horarios":          config.get("horarios", []),
+                    "horarios_semanais": _hsem,
+                    "etapas":            config.get("etapas", {}),
+                    "ultima_rodada":     _ultima_rodada,
+                    "atualizado_em":     datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }, ensure_ascii=False).encode("utf-8")
+                _url = f"{SUPABASE_URL}/storage/v1/object/robo-upseller/heartbeat/{_tk}.json"
+                _req = urllib.request.Request(_url, data=_payload, method="POST")
+                _req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_KEY}")
+                _req.add_header("Content-Type", "application/json")
+                _req.add_header("x-upsert", "true")
+                urllib.request.urlopen(_req, timeout=10)
+                _hb_ts = time.time()
+            except Exception:
+                pass
+        threading.Thread(target=_hb_upload, daemon=True).start()
+
+    return jsonify(resp_data)
 
 
 # ── Controles do processo ─────────────────────────────────────────────────────
+
+@app.route("/heartbeat-now", methods=["GET"])
+def heartbeat_now():
+    """Diagnóstico: força upload do heartbeat e retorna resultado."""
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8")) if CONFIG_FILE.exists() else {}
+        _tk = (cfg.get("token") or "").strip()
+        if not _tk:
+            return jsonify({"ok": False, "erro": "token não configurado"}), 400
+        _payload = json.dumps({
+            "online": True, "versao": "1.7.6",
+            "atualizado_em": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }).encode("utf-8")
+        _url = f"{SUPABASE_URL}/storage/v1/object/robo-upseller/heartbeat/{_tk}.json"
+        _req = urllib.request.Request(_url, data=_payload, method="POST")
+        _req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_KEY}")
+        _req.add_header("Content-Type", "application/json")
+        _req.add_header("x-upsert", "true")
+        _r = urllib.request.urlopen(_req, timeout=10)
+        return jsonify({"ok": True, "status": _r.status, "token": _tk})
+    except Exception as e:
+        return jsonify({"ok": False, "erro": str(e)}), 500
+
 
 @app.route("/parar", methods=["POST", "OPTIONS"], provide_automatic_options=False)
 def parar():
@@ -1585,19 +1678,13 @@ def _rodar_em_thread_duplo(config: dict,
 
 
 def _imprimir_picklist_thread(config: dict):
-    """Imprime picklist em thread separada (chamado pelo agendador).
-    Aguarda automaticamente se um import estiver em andamento."""
-    # Pequena pausa para deixar o import setar rodando=True caso tenha disparado junto
-    time.sleep(5)
-    if rodando:
-        log("━━ Picklist aguardando import terminar... ━━")
-        while rodando:
-            time.sleep(10)
+    """Gera picklist em thread separada. Roda em paralelo ao import sem conflito
+    (usa apenas Supabase + ReportLab, não toca no Playwright nem no estado do import)."""
     if not _picklist_lock.acquire(blocking=False):
         log("━━ Picklist já em geração por outra thread — ignorando ━━")
         return
     try:
-        log("━━ Gerando picklist automático ━━")
+        log("━━ Gerando picklist ━━")
         _imprimir_picklist_supabase(config)
     finally:
         _picklist_lock.release()
@@ -2447,29 +2534,53 @@ def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0, sufixo: str 
 
     ts = datetime.now().strftime("%d/%m/%Y, %H:%M")
 
-    unidades = []
+    # Agrupa slots pelo pedido para calcular frac_total correto por pedido
+    _seen_order: dict = {}   # order_number → (total_unidades, [slots])
     for p in pedidos:
+        on  = p.get("order_number", "")
         qtd = max(int(p.get("quantidade") or 1), 1)
-        for i in range(qtd):
-            unidades.append((p, i + 1, qtd))
+        if on not in _seen_order:
+            _seen_order[on] = [0, []]
+        _seen_order[on][0] += qtd
+        _seen_order[on][1].append((p, qtd))
+
+    unidades = []
+    for on, (frac_total, slots) in _seen_order.items():
+        frac_i = 0
+        for p, qtd in slots:
+            for _ in range(qtd):
+                frac_i += 1
+                unidades.append((p, frac_i, frac_total))
 
     total_u = len(unidades)
 
     # Cache de imagens: url → bytes ou None
     _img_cache: dict = {}
+
+    def _baixar_uma(url: str):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            return url, urllib.request.urlopen(req, timeout=3).read()
+        except Exception:
+            return url, None
+
+    # Pré-baixa todas as imagens únicas em paralelo
+    urls_unicas = list({p.get("image_url","").strip() for p in pedidos if p.get("image_url","").strip()})
+    if urls_unicas:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(12, len(urls_unicas))) as ex:
+            for url, data in ex.map(_baixar_uma, urls_unicas):
+                _img_cache[url] = data
+
     def _baixar_img(url: str):
         if not url:
             return None
         if url in _img_cache:
             return _img_cache[url]
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            data = urllib.request.urlopen(req, timeout=4).read()
-            _img_cache[url] = data
-            return data
-        except Exception:
-            _img_cache[url] = None
-            return None
+        # fallback síncrono para URLs não pré-baixadas
+        url, data = _baixar_uma(url)
+        _img_cache[url] = data
+        return data
 
     c = rl_canvas.Canvas(str(out), pagesize=(LW, LH))
 
@@ -2548,18 +2659,21 @@ def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0, sufixo: str 
             nome_curto = produto[:40] if len(produto) <= 40 else produto[:37] + "..."
             c.setFont("Helvetica", 7)
             c.setFillColor(rl_colors.black)
-            c.drawString(TX, ORDER_Y - 7 * rl_mm, nome_curto)
+            c.drawString(TX, ORDER_Y - 6 * rl_mm, nome_curto)
 
-            sku_curto = sku[:26]
-            sku_linha = f"SKU: {sku_curto}" + (f"  ·  {data_fmt}" if data_fmt else "")
+            sku_display = sku if len(sku) <= 35 else sku[:32] + "..."
             c.setFont("Helvetica", 6)
             c.setFillColor(HexColor("#6b7280"))
-            c.drawString(TX, ORDER_Y - 13 * rl_mm, sku_linha)
+            c.drawString(TX, ORDER_Y - 11 * rl_mm, f"SKU: {sku_display}")
+
+            if data_fmt:
+                c.setFont("Helvetica", 6)
+                c.drawString(TX, ORDER_Y - 16 * rl_mm, data_fmt)
 
             if cliente:
                 c.setFont("Helvetica-Bold", 6.5)
                 c.setFillColor(HexColor("#1a56db"))
-                c.drawString(TX, ORDER_Y - 19 * rl_mm, cliente)
+                c.drawString(TX, ORDER_Y - 20 * rl_mm, cliente)
 
         # ── Código de barras (Code128, centralizado, 10mm altura) ───────────
         c.setFillColor(rl_colors.black)
@@ -2623,7 +2737,32 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
         para_marcar_ativos = [p for p in ativos
                               if (p.get("status_upseller") or "").strip().lower() != "para reservar"]
 
-        pedidos = para_marcar_ativos + cancelados
+        pedidos_raw = para_marcar_ativos + cancelados
+
+        # Expande pedidos com múltiplos itens usando pedido_itens
+        # Cada item vira um "slot" com sku/product_name/image_url próprio
+        order_nums = [p["order_number"] for p in pedidos_raw]
+        itens_map: dict = {}
+        for i in range(0, len(order_nums), 100):
+            r_it = supa.table("pedido_itens").select("order_number,sku,product_name,image_url,quantidade").in_("order_number", order_nums[i:i+100]).execute()
+            for it in (r_it.data or []):
+                itens_map.setdefault(it["order_number"], []).append(it)
+
+        pedidos = []
+        for p in pedidos_raw:
+            on   = p["order_number"]
+            its  = itens_map.get(on)
+            if its and len(its) > 1:
+                # Um slot por item, com metadados do pedido mesclados
+                for it in its:
+                    slot = dict(p)
+                    slot["sku"]          = it.get("sku")          or p.get("sku")
+                    slot["product_name"] = it.get("product_name") or p.get("product_name")
+                    slot["image_url"]    = it.get("image_url")    or p.get("image_url")
+                    slot["quantidade"]   = max(int(it.get("quantidade") or 1), 1)
+                    pedidos.append(slot)
+            else:
+                pedidos.append(p)
     except Exception as e:
         log(f"[picklist] ⚠️ Erro ao consultar Supabase: {e}")
         return False
@@ -2634,7 +2773,7 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
 
     n_cancelados = len(cancelados)
     n_processar  = len(para_marcar_ativos)
-    log(f"[picklist] 📋 {len(pedidos)} pedido(s): {n_processar} processar, {n_cancelados} cancelados")
+    log(f"[picklist] 📋 {len(pedidos_raw)} pedido(s) → {len(pedidos)} slot(s): {n_processar} processar, {n_cancelados} cancelados")
 
     margem_topo_mm = float(config.get("margem_topo_mm", 5) or 0)
 
@@ -2642,7 +2781,7 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
     import re as _re
     grupos: dict[str, list] = {}
     for p in pedidos:
-        plat = (p.get("plataforma") or "outros").strip()
+        plat = _norm_plat(p.get("plataforma") or "Outros")
         grupos.setdefault(plat, []).append(p)
 
     def _slug(nome: str) -> str:
@@ -2656,8 +2795,9 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
             log(f"[picklist] ❌ Erro ao gerar PDF [{plat}]: {e}")
             continue
 
-        total_u = sum(max(int(p.get("quantidade") or 1), 1) for p in grupo)
-        _upload_picklist_supabase(pdf_pick, config.get("token", ""), len(grupo), total_u)
+        total_u       = sum(max(int(p.get("quantidade") or 1), 1) for p in grupo)
+        n_pedidos_unu = len({p["order_number"] for p in grupo})
+        _upload_picklist_supabase(pdf_pick, config.get("token", ""), n_pedidos_unu, total_u)
         log(f"[picklist] 📋 [{plat}] PDF disponível via PCP")
 
     # Marca todos os pedidos (ativos exceto Para Reservar + cancelados)
@@ -2857,7 +2997,7 @@ def imprimir_picklist():
             daemon=True
         ).start()
 
-    r = jsonify({"ok": True, "aguardando": rodando, "ja_gerando": ja_gerando})
+    r = jsonify({"ok": True, "ja_gerando": ja_gerando})
     r.headers["Access-Control-Allow-Origin"] = "*"
     return r
 
@@ -3109,6 +3249,327 @@ def imprimir_existente(nome):
     return r
 
 
+# ── Auto-cadastra produtos novos em `produtos` a partir dos itens de pedido ───
+
+def _auto_cadastrar_produtos(supa, itens: list, token: str) -> int:
+    """Insere em `produtos` os SKUs ainda não cadastrados. Retorna qtd inserida."""
+    try:
+        skus_itens = {}
+        for it in itens:
+            sku = (it.get("sku") or "").strip()
+            nome = (it.get("product_name") or "").strip()
+            if sku and sku not in skus_itens:
+                skus_itens[sku] = nome or sku
+        if not skus_itens:
+            return 0
+        # Descobre quais já existem
+        existentes: set = set()
+        for i in range(0, len(skus_itens), 100):
+            chunk = list(skus_itens.keys())[i:i+100]
+            r = supa.table("produtos").select("sku").eq("cliente", token).in_("sku", chunk).execute()
+            existentes.update(row["sku"] for row in (r.data or []))
+        novos = [
+            {"nome": nome, "sku": sku, "tipo": "produto_acabado",
+             "unidade": "un", "ativo": True, "cliente": token,
+             "estoque_atual": 0, "estoque_minimo": 0}
+            for sku, nome in skus_itens.items() if sku not in existentes
+        ]
+        if novos:
+            supa.table("produtos").insert(novos).execute()
+            log(f"[produtos] ✅ {len(novos)} produto(s) auto-cadastrado(s)")
+        return len(novos)
+    except Exception as e:
+        log(f"[produtos] ⚠️ Auto-cadastro falhou: {e}")
+        return 0
+
+
+def _auto_cadastrar_clientes(supa, pedidos: list, token: str) -> int:
+    """
+    Insere em `clientes` os compradores ainda não cadastrados.
+    pedidos = lista de dicts com nome_cliente, plataforma, buyer_account, shop_nome.
+    Retorna qtd inserida.
+    """
+    try:
+        # Agrupa compradores únicos por nome
+        buyers: dict = {}  # nome_lower -> {nome, plataformas: set, buyer_account, shop_nome}
+        for p in pedidos:
+            nome = (p.get("nome_cliente") or "").strip()
+            if not nome:
+                continue
+            key = nome.lower()
+            if key not in buyers:
+                buyers[key] = {
+                    "nome":          nome,
+                    "plataformas":   set(),
+                    "buyer_account": p.get("buyer_account"),
+                    "shop_nome":     p.get("shop_nome"),
+                }
+            if p.get("plataforma"):
+                buyers[key]["plataformas"].add(p["plataforma"])
+
+        if not buyers:
+            return 0
+
+        # Descobre quais já existem pelo nome (case-insensitive via lower())
+        nomes_lower = list(buyers.keys())
+        existentes: set = set()
+        for i in range(0, len(nomes_lower), 100):
+            chunk_nomes = [buyers[k]["nome"] for k in nomes_lower[i:i+100]]
+            r = supa.table("clientes").select("nome").eq("cliente", token).in_("nome", chunk_nomes).execute()
+            existentes.update((row["nome"] or "").strip().lower() for row in (r.data or []))
+
+        novos = []
+        for key, b in buyers.items():
+            if key in existentes:
+                continue
+            novos.append({
+                "cliente":       token,
+                "nome":          b["nome"],
+                "plataformas":   ", ".join(sorted(b["plataformas"])) or None,
+                "buyer_account": b["buyer_account"],
+            })
+
+        if novos:
+            for i in range(0, len(novos), 100):
+                supa.table("clientes").insert(novos[i:i+100]).execute()
+            log(f"[clientes] ✅ {len(novos)} cliente(s) auto-cadastrado(s)")
+        return len(novos)
+    except Exception as e:
+        log(f"[clientes] ⚠️ Auto-cadastro falhou: {e}")
+        return 0
+
+
+@app.route("/inspecionar-pedido", methods=["GET", "OPTIONS"], provide_automatic_options=False)
+def inspecionar_pedido():
+    """Busca um pedido real do UpSeller e retorna todos os campos disponíveis (diagnóstico)."""
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    import json as _json
+    try:
+        from playwright.async_api import async_playwright
+        resultado = {}
+
+        async def _inspecionar():
+            async with async_playwright() as p:
+                ctx = await p.chromium.launch_persistent_context(
+                    user_data_dir=str(PASTA_SESSAO), headless=True,
+                    args=["--window-size=1280,900"],
+                )
+                try:
+                    # Intercepta todas as chamadas /api/ feitas pelo UpSeller
+                    chamadas_api: list = []
+                    page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+
+                    async def _on_request(req):
+                        if "/api/" in req.url and req.method in ("GET", "POST"):
+                            chamadas_api.append({"url": req.url, "method": req.method})
+
+                    async def _on_response(resp):
+                        if "/api/" in resp.url and resp.status == 200:
+                            try:
+                                body = await resp.json()
+                                # Procura campos de telefone/endereço em qualquer nível
+                                def _scan(obj, path=""):
+                                    if isinstance(obj, dict):
+                                        for k, v in obj.items():
+                                            kl = k.lower()
+                                            if any(w in kl for w in ["phone","tel","mobile","addr","street","zip","postal","receiver","cpf","whatsapp"]):
+                                                resultado.setdefault("campos_encontrados", {})[f"{path}.{k}"] = v
+                                            _scan(v, f"{path}.{k}")
+                                    elif isinstance(obj, list):
+                                        for i, item in enumerate(obj[:3]):
+                                            _scan(item, f"{path}[{i}]")
+                                _scan(body)
+                                if resultado.get("campos_encontrados"):
+                                    resultado.setdefault("endpoints_com_dados", []).append(resp.url)
+                            except Exception:
+                                pass
+
+                    page.on("request",  _on_request)
+                    page.on("response", _on_response)
+
+                    await page.goto("https://app.upseller.com/pt/order/in-process",
+                                    wait_until="domcontentloaded", timeout=60_000)
+                    await page.wait_for_timeout(2000)
+                    if "/login" in page.url:
+                        resultado["erro"] = "Sessão expirada"
+                        return
+
+                    # Busca 1 pedido
+                    r = await page.evaluate("""async () => {
+                        const r = await fetch('/api/order/index', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                            body: 'timeType=0&searchType=0&orderState=in_process&pageNum=1&pageSize=1'
+                        });
+                        return await r.json();
+                    }""")
+                    lista = ((r or {}).get("data") or {}).get("list") or []
+                    if not lista:
+                        resultado["aviso"] = "Nenhum pedido em Para Imprimir"
+                        return
+
+                    pedido = lista[0]
+                    order_id  = pedido.get("orderId") or pedido.get("idStr") or ""
+                    order_num = pedido.get("orderNumber") or ""
+                    resultado["order_id"]  = order_id
+                    resultado["order_num"] = order_num
+                    resultado["buyerName"] = pedido.get("buyerName")
+                    resultado["shopName"]  = pedido.get("shopName")
+
+                    # Tenta muitas variações de endpoint de detalhe
+                    ENDPOINTS = [
+                        f"/api/order/detail?id={order_id}",
+                        f"/api/order/detail?orderId={order_id}",
+                        f"/api/order/info?id={order_id}",
+                        f"/api/order/info?orderId={order_id}",
+                        f"/api/order/get?id={order_id}",
+                        f"/api/order/view?id={order_id}",
+                        f"/api/order/receiver?orderId={order_id}",
+                        f"/api/order/address?orderId={order_id}",
+                        f"/api/receiver/detail?orderId={order_id}",
+                        f"/api/order/detail/{order_id}",
+                        f"/api/order/{order_id}",
+                    ]
+                    for ep in ENDPOINTS:
+                        det = await page.evaluate(f"""async () => {{
+                            try {{
+                                const r = await fetch('{ep}');
+                                if (!r.ok) return null;
+                                return await r.json();
+                            }} catch(e) {{ return null; }}
+                        }}""")
+                        if det and det.get("code") == 200 or (det and det.get("data")):
+                            d = det.get("data") or det
+                            resultado["detalhe_endpoint"] = ep
+                            resultado["detalhe_data"] = d if isinstance(d, dict) else str(d)[:500]
+                            break
+
+                    # Navega para a página de detalhe do pedido na UI para capturar chamadas
+                    await page.goto(
+                        f"https://app.upseller.com/pt/order/detail?orderNumber={order_num}",
+                        wait_until="domcontentloaded", timeout=30_000
+                    )
+                    await page.wait_for_timeout(3000)
+                    resultado["chamadas_api_na_pagina"] = [c for c in chamadas_api if c not in chamadas_api[:5]]
+                    resultado["todas_chamadas"] = chamadas_api
+
+                finally:
+                    await ctx.close()
+
+        asyncio.run(_inspecionar())
+        resp = jsonify({"ok": True, "resultado": resultado})
+    except Exception as e:
+        resp = jsonify({"ok": False, "erro": str(e)})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/inspecionar-lojas", methods=["GET", "OPTIONS"], provide_automatic_options=False)
+def inspecionar_lojas():
+    """Busca lojas/contas conectadas no UpSeller e retorna shopId, shopName, platform de cada uma."""
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    import json as _json
+    try:
+        from playwright.async_api import async_playwright
+        resultado = {}
+
+        async def _buscar():
+            async with async_playwright() as p:
+                ctx = await p.chromium.launch_persistent_context(
+                    user_data_dir=str(PASTA_SESSAO), headless=True,
+                    args=["--window-size=1280,900"],
+                )
+                page = await ctx.new_page()
+                try:
+                    await page.goto("https://app.upseller.com/pt/order/all-orders",
+                                    wait_until="domcontentloaded", timeout=30_000)
+
+                    # Tenta vários endpoints conhecidos de lojas/auth
+                    endpoints = [
+                        "/api/shop/list",
+                        "/api/shop/index",
+                        "/api/auth/list",
+                        "/api/account/list",
+                        "/api/channel/list",
+                        "/api/store/list",
+                        "/api/user/shop/list",
+                        "/api/shop/all",
+                    ]
+                    for ep in endpoints:
+                        r = await page.evaluate(f"""async () => {{
+                            try {{
+                                const resp = await fetch('{ep}', {{method:'GET'}});
+                                if (!resp.ok) return null;
+                                return await resp.json();
+                            }} catch(e) {{ return null; }}
+                        }}""")
+                        if r:
+                            resultado[ep] = r
+
+                    # Também busca 1 pedido real e loga todos os valores de shopId/shopName/authId
+                    r2 = await page.evaluate("""async () => {
+                        try {
+                            const body = 'shopId=&pageNum=1&pageSize=5&orderState=10&searchType=0&sortName=1&sortValue=1';
+                            const resp = await fetch('/api/order/index', {
+                                method:'POST',
+                                headers:{'Content-Type':'application/x-www-form-urlencoded'},
+                                body: body
+                            });
+                            const d = await resp.json();
+                            const lista = (d.data || {}).list || [];
+                            return lista.map(o => ({
+                                orderNumber: o.orderNumber,
+                                platform:    o.platform,
+                                shopId:      o.shopId,
+                                shopName:    o.shopName,
+                                authId:      o.authId,
+                                authIdStr:   o.authIdStr,
+                                site:        o.site,
+                            }));
+                        } catch(e) { return null; }
+                    }""")
+                    if r2:
+                        resultado["sample_orders"] = r2
+                finally:
+                    await ctx.close()
+
+        asyncio.run(_buscar())
+        return jsonify({"ok": True, "resultado": resultado})
+    except Exception as e:
+        return jsonify({"ok": False, "erro": str(e)}), 500
+
+
+@app.route("/sincronizar-produtos", methods=["POST", "OPTIONS"], provide_automatic_options=False)
+def sincronizar_produtos():
+    """Varre todos os pedido_itens do Supabase e cadastra os SKUs ausentes em `produtos`."""
+    if request.method == "OPTIONS":
+        return _cors_preflight()
+    try:
+        supa = create_client(*_supa())
+        token = _token()
+        # Carrega todos os itens de pedido em páginas de 1000
+        todos: list = []
+        offset = 0
+        while True:
+            r = supa.table("pedido_itens").select("sku,product_name") \
+                .range(offset, offset + 999).execute()
+            chunk = r.data or []
+            todos.extend(chunk)
+            if len(chunk) < 1000:
+                break
+            offset += 1000
+        log(f"[sync-produtos] {len(todos)} itens lidos de pedido_itens")
+        novos = _auto_cadastrar_produtos(supa, todos, token)
+        resp = jsonify({"ok": True, "total_itens": len(todos), "novos_cadastrados": novos})
+    except Exception as e:
+        log(f"[sync-produtos] ⚠️ Erro: {e}")
+        resp = jsonify({"ok": False, "erro": str(e)})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
 # ── Sincroniza pedidos novos (capturados entre imports) no Supabase ──────────
 
 async def _sincronizar_pedidos_novos_supabase(page, order_numbers: list, config: dict):
@@ -3168,7 +3629,7 @@ async def _sincronizar_pedidos_novos_supabase(page, order_numbers: list, config:
             if on in faltando:
                 items = order.get("orderItemList") or []
                 first = items[0] if items else {}
-                plat  = PLAT.get((order.get("platform") or "").lower(), order.get("platform") or "")
+                plat  = _norm_plat(order.get("platform") or "")
                 try:
                     valor = float(order.get("orderAmount") or 0) or None
                 except Exception:
@@ -3204,6 +3665,7 @@ async def _sincronizar_pedidos_novos_supabase(page, order_numbers: list, config:
             supa.table("pedidos").upsert(novos_pedidos, on_conflict="order_number").execute()
         if novos_itens:
             supa.table("pedido_itens").insert(novos_itens).execute()
+            _auto_cadastrar_produtos(supa, novos_itens, token)
         if atualizar_num:
             for row in atualizar_num:
                 try:
@@ -3936,7 +4398,7 @@ async def _capturar_etiquetas_playwright(config: dict, aguardar_se_vazio: bool =
                     inp = pg.locator("input[placeholder*='Pedido'], input[placeholder*='vírgulas']").first
                     if not await inp.count():
                         return False
-                    await inp.click()
+                    await inp.click(force=True)
                     await inp.fill(",".join(numeros))
                     await inp.press("Enter")
                     await pg.wait_for_timeout(1500)
@@ -3957,7 +4419,13 @@ async def _capturar_etiquetas_playwright(config: dict, aguardar_se_vazio: bool =
 
             # Loop: itera em lotes de pendentes filtrando pelo campo de busca
             rodada_cap = 0
-            BATCH = 50  # UpSeller aceita ~50 números no campo de busca
+            # Sem pypdf não conseguimos fazer split de batch — processa 1 por vez
+            try:
+                import pypdf as _pypdf_chk; _pypdf_ok = True
+            except ImportError:
+                _pypdf_ok = False
+                log("[capturar] ⚠️ pypdf indisponível — modo individual (1 por vez)")
+            BATCH = 50 if _pypdf_ok else 1
             while pendentes and not _parar.is_set():
                 if background and rodando:
                     log("[capturar] ⏸️ Executar iniciado — pausando captura automática")
@@ -4006,7 +4474,7 @@ async def _capturar_etiquetas_playwright(config: dict, aguardar_se_vazio: bool =
                     row_loc = page.locator("tbody tr").filter(has_text=on).first
                     cb = row_loc.locator(".ant-checkbox-input, input[type='checkbox']").first
                     if await cb.count() > 0:
-                        await cb.click()
+                        await cb.click(force=True)
                         await page.wait_for_timeout(80)
                 await page.wait_for_timeout(200)
 
@@ -4049,7 +4517,7 @@ async def _capturar_etiquetas_playwright(config: dict, aguardar_se_vazio: bool =
                         row_loc = page.locator("tbody tr").filter(has_text=on).first
                         cb = row_loc.locator(".ant-checkbox-input, input[type='checkbox']").first
                         if await cb.count() > 0:
-                            await cb.click()
+                            await cb.click(force=True)
                             await page.wait_for_timeout(200)
                         pgs_antes_ind = set(id(pg) for pg in context.pages)
                         if not await _clicar_bulk():
@@ -4255,7 +4723,7 @@ async def _marcar_impresso_playwright(config: dict, order_number: str) -> bool:
             imprimir = row.locator("a, button, span").filter(has_text="Imprimir Etiq").first
             if await imprimir.count() > 0:
                 paginas_antes = set(id(pg) for pg in context.pages)
-                await imprimir.click()
+                await imprimir.click(force=True)
                 for _ in range(25):
                     await page.wait_for_timeout(300)
                     novas = [pg for pg in context.pages if id(pg) not in paginas_antes]
@@ -4266,7 +4734,7 @@ async def _marcar_impresso_playwright(config: dict, order_number: str) -> bool:
             await page.wait_for_timeout(600)
             marcar = page.locator("button", has_text="Marcar como Impresso").first
             if await marcar.count() > 0 and await marcar.is_visible():
-                await marcar.click()
+                await marcar.click(force=True)
                 await page.wait_for_timeout(500)
                 log(f"[marcar] ✅ {order_number} → Para Retirada")
             return True
@@ -4502,7 +4970,7 @@ async def _emitir_etiqueta_playwright(config: dict, order_number: str) -> dict:
             # No fluxo de 6h, pedidos estarão em Para Emitir e serão processados normalmente
             if await imprimir.count() == 0:
                 log(f"[etiqueta] ℹ️ Pedido {order_number} não está em Para Imprimir — verifique o estado no UpSeller")
-                return {"ok": False, "sem_etiqueta": True, "erro": "Etiqueta não disponível no UpSeller — pedido TikTok/iMile requer impressão manual"}
+                return {"ok": False, "sem_etiqueta": True, "erro": "Pedido não encontrado em Para Imprimir no UpSeller"}
 
             if await imprimir.count() == 0:
                 screenshot = PASTA_RAIZ / f"debug_etiqueta_{order_number}.png"
@@ -4759,7 +5227,7 @@ async def _emitir_nfe_massa_playwright(config: dict) -> bool:
                 for texto_tab in ["Para Emitir", "Para emitir"]:
                     tab = page.locator(".ant-tabs-tab").filter(has_text=texto_tab).first
                     if await tab.count() > 0:
-                        await tab.click()
+                        await tab.click(force=True)
                         clicou_tab = True
                     else:
                         clicou_tab = await page.evaluate("""(txt) => {
@@ -4785,7 +5253,7 @@ async def _emitir_nfe_massa_playwright(config: dict) -> bool:
                         const r = await fetch('/api/order/index', {
                             method: 'POST',
                             headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                            body: 'timeType=0&searchType=0&sortName=1&sortValue=1&orderState=invoice_pending&invoiceStatus=to_issue&isVoided=0&pageNum=1&pageSize=1'
+                            body: 'timeType=0&searchType=0&sortName=1&sortValue=1&orderState=invoice_pending&isVoided=0&pageNum=1&pageSize=1'
                         });
                         const j = await r.json();
                         return (j.data || {}).total || 0;
@@ -4975,7 +5443,7 @@ async def _emitir_nfe_massa_playwright(config: dict) -> bool:
                         try {
                             const r = await fetch('/api/order/index', {
                                 method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
-                                body:'timeType=0&searchType=0&sortName=1&sortValue=1&orderState=invoice_pending&invoiceStatus=to_issue&isVoided=0&pageNum=1&pageSize=1'
+                                body:'timeType=0&searchType=0&sortName=1&sortValue=1&orderState=invoice_pending&isVoided=0&pageNum=1&pageSize=1'
                             });
                             const j = await r.json();
                             return (j.data||{}).total ?? -1;
@@ -5446,7 +5914,7 @@ def extrair(config: dict, data_alvo: date):
         nome       = str(row[col_nome       - 1] or "").strip()
         imagem     = str(row[col_imagem     - 1] or "").strip()
         qtd        = int(float(str(row[col_qtd - 1] or 1) or 1)) if col_qtd else 1
-        plataforma  = str(row[col_plataforma  - 1] or "").strip()
+        plataforma  = _norm_plat(str(row[col_plataforma - 1] or ""))
         label_url   = str(row[col_etiqueta   - 1] or "").strip() if col_etiqueta else ""
         try:
             valor_raw = row[col_valor - 1]
@@ -5557,7 +6025,7 @@ def extrair(config: dict, data_alvo: date):
             updates  = [{k: v for k, v in l.items() if k != "data"}
                         for l in linhas if l["order_number"] in existentes_set]
 
-            colunas_opcionais = {"plataforma", "valor", "label_url", "numero_plataforma", "nome_cliente", "status_upseller"}
+            colunas_opcionais = {"plataforma", "valor", "label_url", "numero_plataforma", "nome_cliente", "status_upseller", "shop_id", "shop_nome", "buyer_account", "taxa_plataforma"}
 
             def _upsert_com_fallback(lote_orig, label):
                 excluir: set = set()
@@ -5608,8 +6076,14 @@ def extrair(config: dict, data_alvo: date):
             for i in range(0, len(itens_list), batch):
                 supa.table("pedido_itens").insert(itens_list[i:i+batch]).execute()
             log(f"✅ {len(itens_list)} itens enviados a pedido_itens!")
+            _auto_cadastrar_produtos(supa, itens_list, token)
     except Exception as e:
         log(f"Erro Supabase (pedido_itens): {e}")
+
+    try:
+        _auto_cadastrar_clientes(supa, pedidos, token)
+    except Exception as e:
+        log(f"[clientes] ⚠️ Erro no auto-cadastro: {e}")
 
     atualizar_ultima_execucao(token)
     _ultima_rodada.update({"em": datetime.now().strftime("%d/%m %H:%M"), "pedidos": len(pedidos)})
@@ -5623,6 +6097,38 @@ def extrair(config: dict, data_alvo: date):
 
 
 # ── Importação via API interna do UpSeller ────────────────────────────────────
+
+def _extrair_taxa_plataforma(order: dict):
+    """Tenta extrair a taxa/comissão real da plataforma do JSON do pedido.
+    Retorna float ou None se não encontrado."""
+    # Campos conhecidos de diferentes plataformas
+    for campo in ("commissionFee", "platformFee", "serviceFee", "sellerCommission",
+                  "channelFee", "marketplaceFee", "transactionFee", "sellerFee",
+                  "deductionFee", "totalFee", "commission", "fee"):
+        v = order.get(campo)
+        if v is not None:
+            try:
+                f = float(v)
+                if f > 0:
+                    return f
+            except (TypeError, ValueError):
+                pass
+    # Tenta chargeDetail / feeDetail — lista de cobranças
+    for lista_campo in ("chargeDetail", "feeDetail", "deductDetail", "chargeList"):
+        lst = order.get(lista_campo)
+        if isinstance(lst, list) and lst:
+            total = 0.0
+            for item in lst:
+                if isinstance(item, dict):
+                    for vk in ("amount", "value", "fee", "charge"):
+                        try:
+                            total += float(item.get(vk) or 0)
+                        except (TypeError, ValueError):
+                            pass
+            if total > 0:
+                return total
+    return None
+
 
 async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
     """
@@ -5664,7 +6170,7 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
 
             SECOES = [
                 ("in_process",      "labelStatus=success&warehouseType=0",          "Para Imprimir", False),
-                ("invoice_pending", "invoiceStatus=to_issue&isVoided=0",            "Para Emitir",   False),
+                ("invoice_pending", "",                                              "Para Emitir",   False),
                 ("to_ship",         "",                                              "Para Enviar",   False),
                 ("to_pickup",       "",                                              "Para Retirada", False),
             ]
@@ -5799,13 +6305,14 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
 
     pedidos_dict: dict = {}
     itens_list:   list = []
+    _diag_plat:   dict = {}   # plataforma → contagem logada (para diagnóstico de shopId)
 
     for order in todos_raw:
         order_num = (order.get("orderNumber") or "").strip()
         if not order_num:
             continue
 
-        plataforma = PLAT.get((order.get("platform") or "").lower(), order.get("platform") or "")
+        plataforma = _norm_plat(order.get("platform") or "")
         try:
             valor = float(order.get("orderAmount") or 0) or None
         except Exception:
@@ -5856,8 +6363,18 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                 order.get("recipientName") or order.get("receiveName") or
                 order.get("receiver", {}).get("name") or ""
             ).strip() or None
-            if nome_cliente is None and len(pedidos_dict) == 0:
+            if len(pedidos_dict) == 0:
                 log(f"[api] 🔍 campos do 1º pedido: {sorted(order.keys())}")
+                rec = order.get("receiver") or order.get("receiverInfo") or {}
+                if rec:
+                    log(f"[api] 🔍 receiver fields: {sorted(rec.keys()) if isinstance(rec, dict) else str(rec)[:300]}")
+                # Log fee-related fields to discover taxa_plataforma source
+                fee_kv = {k: v for k, v in order.items() if any(t in k.lower() for t in ("fee", "commission", "taxa", "discount", "charge", "deduct", "cost"))}
+                log(f"[api] 💰 fee fields do 1º pedido: {fee_kv}")
+            # Loga shopId/shopName/authId para os primeiros 3 pedidos de cada plataforma
+            if _diag_plat.get(plataforma, 0) < 3:
+                _diag_plat[plataforma] = _diag_plat.get(plataforma, 0) + 1
+                log(f"[api] 🏪 [{plataforma}] shopId={order.get('shopId')!r} shopName={order.get('shopName')!r} authId={order.get('authId')!r} authIdStr={order.get('authIdStr')!r} site={order.get('site')!r}")
             pedidos_dict[order_num] = {
                 "order_number":      order_num,
                 "numero_plataforma": str(order.get("orderId") or order.get("extendedId") or "") or None,
@@ -5872,6 +6389,10 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                 "nome_cliente":      nome_cliente,
                 "status_upseller":   _API_STATE_LABEL.get(order.get("_state", ""), None),
                 "hora_pagamento":    hora_pagamento,
+                "shop_id":           str(order.get("shopId") or "") or None,
+                "shop_nome":         (order.get("shopName") or "").strip() or None,
+                "buyer_account":     str(order.get("buyerAccount") or "") or None,
+                "taxa_plataforma":   _extrair_taxa_plataforma(order),
             }
         else:
             pedidos_dict[order_num]["quantidade"] += qtd_total
@@ -5955,6 +6476,10 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
             "nome_cliente":      p.get("nome_cliente"),
             "status_upseller":   p.get("status_upseller"),
             "hora_pagamento":    p.get("hora_pagamento"),
+            "shop_id":           p.get("shop_id"),
+            "shop_nome":         p.get("shop_nome"),
+            "buyer_account":     p.get("buyer_account"),
+            "taxa_plataforma":   p.get("taxa_plataforma"),
         } for p in pedidos]
 
         if linhas:
@@ -5968,7 +6493,7 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
             updates2 = [{k: v for k, v in l.items() if k != "data"}
                         for l in linhas if l["order_number"] in existentes2]
 
-            colunas_opcionais = {"plataforma", "valor", "label_url", "numero_plataforma", "nome_cliente"}
+            colunas_opcionais = {"plataforma", "valor", "label_url", "numero_plataforma", "nome_cliente", "shop_id", "shop_nome", "buyer_account", "taxa_plataforma"}
 
             def _upsert_fb2(lote_orig, label):
                 excluir: set = set()
@@ -5988,16 +6513,27 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                             raise
 
             def _update_existentes2(lote):
+                excluir_upd: set = set()
+                ok = 0
                 for linha in lote:
                     on = linha.get("order_number")
                     if not on:
                         continue
-                    campos = {k: v for k, v in linha.items() if k != "order_number"}
-                    try:
-                        supa.table("pedidos").update(campos).eq("order_number", on).execute()
-                    except Exception as e_upd:
-                        log(f"⚠️ Erro ao atualizar {on}: {e_upd}")
-                log(f"✅ {len(lote)} pedidos atualizados (data preservada)")
+                    while True:
+                        campos = {k: v for k, v in linha.items() if k not in excluir_upd and k != "order_number"}
+                        try:
+                            supa.table("pedidos").update(campos).eq("order_number", on).execute()
+                            ok += 1
+                            break
+                        except Exception as e_upd:
+                            col_falt = next((c for c in colunas_opcionais - excluir_upd if c in str(e_upd)), None)
+                            if col_falt:
+                                excluir_upd.add(col_falt)
+                                log(f"⚠️ Update: coluna '{col_falt}' ausente — removida de todos os updates")
+                            else:
+                                log(f"⚠️ Erro ao atualizar {on}: {e_upd}")
+                                break
+                log(f"✅ {ok}/{len(lote)} pedidos atualizados (data preservada)")
 
             if novos2:
                 _upsert_fb2(novos2, "inseridos")
@@ -6016,8 +6552,14 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
             for i in range(0, len(itens_list), batch):
                 supa.table("pedido_itens").insert(itens_list[i:i + batch]).execute()
             log(f"✅ {len(itens_list)} itens enviados a pedido_itens!")
+            _auto_cadastrar_produtos(supa, itens_list, token)
     except Exception as e:
         log(f"Erro Supabase (pedido_itens): {e}")
+
+    try:
+        _auto_cadastrar_clientes(supa, pedidos, token)
+    except Exception as e:
+        log(f"[clientes] ⚠️ Erro no auto-cadastro: {e}")
 
     atualizar_ultima_execucao(token)
     log(f"✅ Concluído! {len(pedidos)} pedidos | {data_arquivo}")
@@ -6156,7 +6698,7 @@ async def _sincronizar_status_upseller(config: dict) -> int:
 
     token = config["token"]
     FILAS = [
-        ("invoice_pending", "invoiceStatus=to_issue&isVoided=0",   "Para Emitir"),
+        ("invoice_pending", "",                                      "Para Emitir"),
         ("to_ship",         "",                                     "Para Enviar"),
         ("in_process",      "labelStatus=success&warehouseType=0", "Para Imprimir"),
         ("to_pickup",       "",                                     "Para Retirada"),
@@ -6217,6 +6759,27 @@ async def _sincronizar_status_upseller(config: dict) -> int:
             supa.table("pedidos").update({"status_upseller": status}) \
                 .in_("order_number", lote).eq("cliente", token).execute()
             total_upd += len(lote)
+
+    # Pedidos que não aparecem em nenhuma fila ativa → marcar como Processado
+    # (foram enviados/retirados e saíram do UpSeller)
+    pedidos_ativos = set(estado_por_pedido.keys())
+    STATUS_ATIVOS = ("Para Emitir", "Para Enviar", "Para Imprimir", "Para Retirada")
+    try:
+        r = supa.table("pedidos").select("order_number") \
+            .eq("cliente", token) \
+            .in_("status_upseller", list(STATUS_ATIVOS)) \
+            .execute()
+        no_supabase = {row["order_number"] for row in (r.data or [])}
+        a_processar = list(no_supabase - pedidos_ativos)
+        for i in range(0, len(a_processar), 50):
+            lote = a_processar[i:i+50]
+            supa.table("pedidos").update({"status_upseller": "Processado"}) \
+                .in_("order_number", lote).eq("cliente", token).execute()
+        if a_processar:
+            log(f"[status] 📤 {len(a_processar)} pedido(s) marcados como Processado (saíram das filas)")
+        total_upd += len(a_processar)
+    except Exception as e:
+        log(f"[status] ⚠️ Erro ao marcar Processados: {e}")
 
     log(f"[status] ✅ {total_upd} pedidos com status_upseller atualizado no Supabase")
     return total_upd
@@ -6298,7 +6861,7 @@ async def _verificar_cancelados_playwright(config: dict) -> None:
             FILAS_ATIVAS = [
                 ("allocate",        "allocateStatus=pending_review"),
                 ("in_process",      "labelStatus=success&warehouseType=0"),
-                ("invoice_pending", "invoiceStatus=to_issue&isVoided=0"),
+                ("invoice_pending", ""),
                 ("to_ship",         ""),
                 ("to_pickup",       ""),
             ]
@@ -6366,6 +6929,100 @@ async def _verificar_cancelados_playwright(config: dict) -> None:
     log(f"[cancelados] ✅ Concluído — voided: {len(voided_match)}, ativos: {len(ativos_match)}, sem fila: {len(desaparecidos)}")
 
 
+def _loop_commands():
+    """Verifica comandos pendentes no Supabase Storage a cada 8s e executa via localhost."""
+    time.sleep(8)
+    while True:
+        try:
+            if CONFIG_FILE.exists():
+                config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                token = (config.get("token") or "").strip()
+                if token:
+                    url = f"{SUPABASE_URL}/storage/v1/object/public/robo-upseller/commands/{token}.json?_={int(time.time())}"
+                    try:
+                        r = urllib.request.urlopen(urllib.request.Request(url), timeout=5)
+                        cmd = json.loads(r.read())
+                    except Exception:
+                        cmd = {}
+                    comando = (cmd.get("comando") or "").strip()
+                    ts_str  = cmd.get("ts", "")
+                    if comando and ts_str:
+                        try:
+                            age = (datetime.utcnow() - datetime.fromisoformat(ts_str.replace("Z", ""))).total_seconds()
+                        except Exception:
+                            age = 999
+                        if age < 60:
+                            # Limpa o comando ANTES de executar (evita re-execução)
+                            clear = json.dumps({"comando": "", "ts": ""}).encode()
+                            cl_url = f"{SUPABASE_URL}/storage/v1/object/robo-upseller/commands/{token}.json"
+                            cl_req = urllib.request.Request(cl_url, data=clear, method="POST")
+                            cl_req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_KEY}")
+                            cl_req.add_header("Content-Type", "application/json")
+                            cl_req.add_header("x-upsert", "true")
+                            try:
+                                urllib.request.urlopen(cl_req, timeout=5)
+                            except Exception:
+                                pass
+                            # Executa via localhost (sem PNA)
+                            args = cmd.get("args", {})
+                            if comando == "executar":
+                                body = json.dumps(args).encode()
+                                req2 = urllib.request.Request("http://127.0.0.1:5001/executar", data=body, method="POST")
+                                req2.add_header("Content-Type", "application/json")
+                                try:
+                                    urllib.request.urlopen(req2, timeout=5)
+                                except Exception:
+                                    pass
+                            elif comando == "parar":
+                                req2 = urllib.request.Request("http://127.0.0.1:5001/parar", data=b"{}", method="POST")
+                                req2.add_header("Content-Type", "application/json")
+                                try:
+                                    urllib.request.urlopen(req2, timeout=5)
+                                except Exception:
+                                    pass
+        except Exception:
+            pass
+        time.sleep(8)
+
+
+def _loop_heartbeat():
+    """Publica status do robô no Supabase Storage a cada 30s via urllib (funciona no PyInstaller)."""
+    _DIA_KEYS = ["seg", "ter", "qua", "qui", "sex", "sab", "dom"]
+    time.sleep(5)
+    while True:
+        try:
+            if CONFIG_FILE.exists():
+                config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                cliente = (config.get("token") or "").strip()
+                if cliente:
+                    horarios_sem = config.get("horarios_semanais", {})
+                    dia = _DIA_KEYS[datetime.now().weekday()]
+                    horarios = horarios_sem.get(dia) or config.get("horarios", [])
+                    agora = datetime.now().strftime("%H:%M")
+                    proxima = next((h for h in sorted(horarios) if h > agora), horarios[0] if horarios else "")
+                    payload = json.dumps({
+                        "online":            True,
+                        "versao":            "1.7.5",
+                        "rodando":           rodando,
+                        "etapa":             _etapa_atual,
+                        "proxima":           proxima,
+                        "horarios":          config.get("horarios", []),
+                        "horarios_semanais": horarios_sem,
+                        "etapas":            config.get("etapas", {}),
+                        "ultima_rodada":     _ultima_rodada,
+                        "atualizado_em":     datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    }, ensure_ascii=False).encode("utf-8")
+                    url = f"{SUPABASE_URL}/storage/v1/object/robo-upseller/heartbeat/{cliente}.json"
+                    req = urllib.request.Request(url, data=payload, method="POST")
+                    req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_KEY}")
+                    req.add_header("Content-Type", "application/json")
+                    req.add_header("x-upsert", "true")
+                    urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass
+        time.sleep(30)
+
+
 if __name__ == "__main__":
     import socket as _socket
 
@@ -6430,6 +7087,8 @@ if __name__ == "__main__":
     threading.Thread(target=_migrar_colunas, daemon=True).start()
     threading.Thread(target=_loop_agendador, daemon=True).start()
     threading.Thread(target=_loop_captura_etiquetas, daemon=True).start()
+    threading.Thread(target=_loop_commands,  daemon=True).start()
+    threading.Thread(target=_loop_heartbeat, daemon=True).start()
     # Pré-baixa SumatraPDF no Windows para a primeira impressão ser imediata
     if platform.system() == "Windows":
         threading.Thread(target=_obter_sumatra, daemon=True).start()

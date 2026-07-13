@@ -1,4 +1,4 @@
 {
-  "version": "1.6.6",
-  "descricao": "fix: pypdf no bundle PyInstaller — split de batch PDF de etiquetas funcionando"
+  "version": "1.8.1",
+  "descricao": "fix: force=True em clicks capturar/nfe — evita Timeout 30s"
 }
