@@ -1,4 +1,4 @@
 {
-  "version": "1.8.1",
-  "descricao": "fix: force=True em clicks capturar/nfe — evita Timeout 30s"
+  "version": "1.8.2",
+  "descricao": "fix: variacao do produto no picklist (camisa preta/branca)"
 }

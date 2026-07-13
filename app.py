@@ -5892,11 +5892,15 @@ def extrair(config: dict, data_alvo: date):
         log(f"Colunas disponíveis: {[h for h in headers if h][:10]}")
         return
 
-    # Coluna opcional — URL da etiqueta já gerada pelo UpSeller
+    # Colunas opcionais
     try:
         col_etiqueta = achar("Etiqueta")
     except ValueError:
         col_etiqueta = None
+    try:
+        col_variacao = achar("Variação")
+    except ValueError:
+        col_variacao = None
 
     pedidos_dict  = {}
     itens_list    = []
@@ -5912,6 +5916,9 @@ def extrair(config: dict, data_alvo: date):
 
         sku        = str(row[col_sku        - 1] or "").strip()
         nome       = str(row[col_nome       - 1] or "").strip()
+        variacao   = str(row[col_variacao   - 1] or "").strip() if col_variacao else ""
+        if variacao:
+            nome = f"{nome} — {variacao}" if nome else variacao
         imagem     = str(row[col_imagem     - 1] or "").strip()
         qtd        = int(float(str(row[col_qtd - 1] or 1) or 1)) if col_qtd else 1
         plataforma  = _norm_plat(str(row[col_plataforma - 1] or ""))
