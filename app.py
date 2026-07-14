@@ -161,11 +161,6 @@ def salvar():
     if erros:
         return jsonify({"ok": False, "erro": " | ".join(erros)})
 
-    try:
-        nome = validar_token(dados["token"])
-    except SystemExit:
-        return jsonify({"ok": False, "erro": "Token inválido ou não encontrado"})
-
     # Preserva campos não exibidos na UI (ncm_padrao, ncm_produtos, etc.)
     config_existente = {}
     if CONFIG_FILE.exists():
@@ -173,6 +168,9 @@ def salvar():
             config_existente = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         except Exception:
             pass
+
+    # Usa nome do config existente — evita chamada Supabase no /salvar
+    nome = config_existente.get("nome_cliente") or dados["token"].strip()
 
     config = {
         "ncm_padrao": "6109.10.00",

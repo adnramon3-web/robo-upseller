@@ -605,29 +605,33 @@
     btn.textContent = 'Salvando...';
     btn.disabled = true;
 
-    const resp = await fetch('/salvar', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        token:           document.getElementById('token').value,
-        upseller_email:  document.getElementById('email').value,
-        upseller_senha:  document.getElementById('senha').value,
-        horarios_semanais: _coletarSemanal(),
-        horarios:          _horariosDaSemanal(_coletarSemanal()),
-        etapas:          _etapas,
-        nome_impressora:         document.getElementById('nome_impressora').value,
-        auto_imprimir_etiquetas: document.getElementById('auto_imprimir_etiquetas').checked,
-      })
-    });
-    const data = await resp.json();
-
-    if (data.ok) {
-      btn.textContent = '✅ Salvo!';
-      adicionarLog(`✅ Configuração salva — ${data.cliente}`, 'ok');
-      setTimeout(() => verificarStatus(), 400);
-    } else {
+    try {
+      const resp = await fetch('/salvar', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token:           document.getElementById('token').value,
+          upseller_email:  document.getElementById('email').value,
+          upseller_senha:  document.getElementById('senha').value,
+          horarios_semanais: _coletarSemanal(),
+          horarios:          _horariosDaSemanal(_coletarSemanal()),
+          etapas:          _etapas,
+          nome_impressora:         document.getElementById('nome_impressora').value,
+          auto_imprimir_etiquetas: document.getElementById('auto_imprimir_etiquetas').checked,
+        })
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        btn.textContent = '✅ Salvo!';
+        adicionarLog(`✅ Configuração salva — ${data.cliente}`, 'ok');
+        setTimeout(() => verificarStatus(), 400);
+      } else {
+        btn.textContent = '❌ Erro';
+        adicionarLog(`❌ ${data.erro}`, 'erro');
+      }
+    } catch(e) {
       btn.textContent = '❌ Erro';
-      adicionarLog(`❌ ${data.erro}`, 'erro');
+      adicionarLog(`❌ Erro ao salvar: ${e}`, 'erro');
     }
     setTimeout(() => { btn.textContent = '💾 Salvar Configuração'; btn.disabled = false; }, 2000);
   }
