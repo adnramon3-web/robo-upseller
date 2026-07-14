@@ -1,4 +1,4 @@
 {
-  "version": "1.8.2",
-  "descricao": "fix: variacao do produto no picklist (camisa preta/branca)"
+  "version": "1.8.3",
+  "descricao": "fix: checkboxes capturar via JS — elimina Locator.click Timeout 30s"
 }

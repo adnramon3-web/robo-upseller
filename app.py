@@ -2041,7 +2041,7 @@ async def _fechar_popups_upseller(page) -> None:
             # Botão X padrão do Ant Design Modal
             x_btn = page.locator(".ant-modal-close").first
             if await x_btn.count() > 0 and await x_btn.is_visible():
-                await x_btn.click()
+                await x_btn.click(force=True, timeout=3000)
                 await page.wait_for_timeout(600)
                 continue
             # Botões de dismiss — role=button E texto genérico (cobre spans/divs também)
@@ -4469,13 +4469,16 @@ async def _capturar_etiquetas_playwright(config: dict, aguardar_se_vazio: bool =
                         continue
                     break
 
-                # ── MODO BATCH: seleciona todos, 1 clique bulk ────────────────
-                for on in visiveis:
-                    row_loc = page.locator("tbody tr").filter(has_text=on).first
-                    cb = row_loc.locator(".ant-checkbox-input, input[type='checkbox']").first
-                    if await cb.count() > 0:
-                        await cb.click(force=True)
-                        await page.wait_for_timeout(80)
+                # ── MODO BATCH: seleciona todos via JS — sem locator timeout ──
+                await page.evaluate("""(numeros) => {
+                    const rows = Array.from(document.querySelectorAll('tbody tr'));
+                    rows.forEach(row => {
+                        if (numeros.some(n => row.innerText.includes(n))) {
+                            const cb = row.querySelector('.ant-checkbox-input, input[type="checkbox"]');
+                            if (cb && !cb.checked) cb.click();
+                        }
+                    });
+                }""", visiveis)
                 await page.wait_for_timeout(200)
 
                 paginas_antes = set(id(pg) for pg in context.pages)
@@ -4514,11 +4517,15 @@ async def _capturar_etiquetas_playwright(config: dict, aguardar_se_vazio: bool =
                         if await modal.count() > 0:
                             await page.keyboard.press("Escape")
                             await page.wait_for_timeout(500)
-                        row_loc = page.locator("tbody tr").filter(has_text=on).first
-                        cb = row_loc.locator(".ant-checkbox-input, input[type='checkbox']").first
-                        if await cb.count() > 0:
-                            await cb.click(force=True)
-                            await page.wait_for_timeout(200)
+                        await page.evaluate("""(n) => {
+                            const row = Array.from(document.querySelectorAll('tbody tr'))
+                                .find(r => r.innerText.includes(n));
+                            if (row) {
+                                const cb = row.querySelector('.ant-checkbox-input, input[type="checkbox"]');
+                                if (cb && !cb.checked) cb.click();
+                            }
+                        }""", on)
+                        await page.wait_for_timeout(200)
                         pgs_antes_ind = set(id(pg) for pg in context.pages)
                         if not await _clicar_bulk():
                             _capturar_skip.add(on)
