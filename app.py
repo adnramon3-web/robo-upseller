@@ -955,11 +955,8 @@ def status():
         config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
 
     cliente = ""
-    if config.get("token"):
-        try:
-            cliente = validar_token(config["token"])
-        except Exception:
-            cliente = "Token inválido"
+    # Usa nome do config — evita chamada Supabase no /status (supabase-py tem SSL issues no bundle)
+    cliente = config.get("nome_cliente") or config.get("token", "") or ""
 
     _DIA_KEYS = ["seg", "ter", "qua", "qui", "sex", "sab", "dom"]
     _dia_hoje = _DIA_KEYS[datetime.now().weekday()]

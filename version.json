@@ -1,4 +1,4 @@
 {
-  "version": "1.8.4",
-  "descricao": "fix: salvar config sem chamar Supabase — evita travamento no Mac"
+  "version": "1.8.5",
+  "descricao": "fix: /status sem validar_token — evita travamento apos salvar"
 }
