@@ -1,4 +1,4 @@
 {
-  "version": "1.8.5",
-  "descricao": "fix: /status sem validar_token — evita travamento apos salvar"
+  "version": "1.9.20",
+  "descricao": "fix: variacao e fulfill_by_platform incluídos no insert/update de pedidos via API"
 }

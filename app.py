@@ -112,6 +112,10 @@ _API_STATE_LABEL = {
     "to_ship":         "Para Enviar",
     "to_pickup":       "Para Retirada",
     "pickup":          "Para Retirada",
+    "fulfilled":       "Para Retirada",
+    "in_fulfillment":  "Para Retirada",
+    "fulfillment":     "Para Retirada",
+    "delivered":       "Para Retirada",
 }
 
 
@@ -180,12 +184,33 @@ def salvar():
         "upseller_senha":  dados["upseller_senha"].strip(),
         "horarios":           dados.get("horarios", []),
         "horarios_semanais":  dados.get("horarios_semanais", None),
-        "etapas":          dados.get("etapas", {"importar": True, "picklist": False, "nfe": True, "envio": True}),
+        "etapas":          dados.get("etapas", {"importar": True, "nfe": True, "envio": True}),
         "nome_impressora":         dados.get("nome_impressora", "").strip(),
         "auto_imprimir_etiquetas": bool(dados.get("auto_imprimir_etiquetas", False)),
     }
     CONFIG_FILE.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     return jsonify({"ok": True, "cliente": nome})
+
+
+def _upload_config_supabase(config: dict) -> None:
+    """Faz upload do config (etapas + horarios) para Supabase Storage — compartilhado entre robôs."""
+    token = config.get("token", "")
+    if not token:
+        return
+    payload = {k: config[k] for k in ("etapas", "horarios_semanais", "horarios", "horarios_semanais_picklist", "horarios_picklist") if k in config}
+    payload["atualizado_em"] = __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        data = json.dumps(payload, ensure_ascii=False).encode()
+        req = urllib.request.Request(
+            f"{SUPABASE_URL}/storage/v1/object/robo-upseller/configs/{token}.json",
+            data=data, method="POST",
+        )
+        req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_KEY}")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("x-upsert", "true")
+        urllib.request.urlopen(req, timeout=8)
+    except Exception as e:
+        log(f"[config] ⚠️ Upload config Supabase falhou: {e}")
 
 
 @app.route("/salvar-config-parcial", methods=["POST", "OPTIONS"], provide_automatic_options=False)
@@ -202,14 +227,23 @@ def salvar_config_parcial():
             pass
     for k, v in dados.items():
         config[k] = v
-    # Se salvou horarios_semanais, mantém backward-compat gerando lista flat de todos os horários únicos
     if "horarios_semanais" in dados:
         todos: set = set()
         for v in (dados["horarios_semanais"].values()):
             if v:
                 todos.update(v)
         config["horarios"] = sorted(todos)
+    if "horarios_semanais_picklist" in dados:
+        todos_p: set = set()
+        for v in (dados["horarios_semanais_picklist"].values()):
+            if v:
+                todos_p.update(v)
+        config["horarios_picklist"] = sorted(todos_p)
     CONFIG_FILE.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Propaga para Supabase — outros robôs sincronizam em até 30s
+    if any(k in dados for k in ("etapas", "horarios_semanais", "horarios_semanais_picklist")):
+        import threading as _thr
+        _thr.Thread(target=_upload_config_supabase, args=(config,), daemon=True).start()
     return _cors(jsonify({"ok": True}))
 
 
@@ -338,9 +372,13 @@ async def _backfill_historico(config: dict, dias: int):
                 break
         items = order.get("orderItemList") or []
         for item in items:
+            _vsku = (item.get("variationSku") or item.get("productSku") or "").strip()
+            _attr = item.get("warehouseVariantsAttr") or item.get("productAttr") or ""
+            _variacao = _attr if isinstance(_attr, str) else (json.dumps(_attr, ensure_ascii=False) if _attr else "")
             itens_list.append({
                 "order_number": on,
-                "sku":          (item.get("variationSku") or item.get("productSku") or "").strip(),
+                "sku":          _vsku,
+                "variacao":     _variacao.strip() or None,
                 "product_name": (item.get("productName") or "").strip(),
                 "image_url":    (item.get("productImg")  or "").strip(),
                 "quantidade":   int(item.get("productCount") or 1),
@@ -368,23 +406,29 @@ async def _backfill_historico(config: dict, dias: int):
             ).strip() or None
             if nome_cliente is None and len(pedidos_dict) == 0:
                 log(f"[backfill] 🔍 campos do 1º pedido: {sorted(order.keys())}")
+                if items:
+                    log(f"[backfill] 🔍 campos do 1º item: {sorted(items[0].keys())}")
+            _f_attr = first.get("warehouseVariantsAttr") or first.get("productAttr") or ""
+            _f_var  = _f_attr if isinstance(_f_attr, str) else (json.dumps(_f_attr, ensure_ascii=False) if _f_attr else "")
             pedidos_dict[on] = {
-                "order_number":      on,
-                "numero_plataforma": (order.get("orderId") or order.get("extendedId") or "").strip() or None,
-                "sku":               (first.get("variationSku") or first.get("productSku") or "").strip(),
-                "product_name":      (first.get("productName") or "").strip(),
-                "image_url":         (first.get("productImg")  or "").strip(),
-                "data":              data_pedido,
-                "hora_pagamento":    hora_pagamento,
-                "quantidade":        qtd_total,
-                "plataforma":        plataforma,
-                "valor":             valor,
-                "cliente":           token,
-                "label_url":         api_label_url,
-                "nome_cliente":      nome_cliente,
-                "shop_id":           str(order.get("shopId") or "") or None,
-                "shop_nome":         (order.get("shopName") or "").strip() or None,
-                "taxa_plataforma":   _extrair_taxa_plataforma(order),
+                "order_number":        on,
+                "numero_plataforma":   (order.get("orderId") or order.get("extendedId") or "").strip() or None,
+                "sku":                 (first.get("variationSku") or first.get("productSku") or "").strip(),
+                "variacao":            _f_var.strip() or None,
+                "product_name":        (first.get("productName") or "").strip(),
+                "image_url":           (first.get("productImg")  or "").strip(),
+                "data":                data_pedido,
+                "hora_pagamento":      hora_pagamento,
+                "quantidade":          qtd_total,
+                "plataforma":          plataforma,
+                "valor":               valor,
+                "cliente":             token,
+                "label_url":           api_label_url,
+                "nome_cliente":        nome_cliente,
+                "shop_id":             str(order.get("shopId") or "") or None,
+                "shop_nome":           (order.get("shopName") or "").strip() or None,
+                "taxa_plataforma":     _extrair_taxa_plataforma(order),
+                "fulfill_by_platform": bool(order.get("fulfillByPlatform")),
             }
 
     # Upserta todos (on_conflict=order_number) — atualiza shop_nome em pedidos já existentes
@@ -409,7 +453,7 @@ async def _backfill_historico(config: dict, dias: int):
     # Upsert em lotes com tratamento de erro por coluna
     inseridos = 0
     erros = 0
-    COLUNAS_OPCIONAIS = {"plataforma", "valor", "label_url", "numero_plataforma", "nome_cliente", "shop_id", "shop_nome", "taxa_plataforma"}
+    COLUNAS_OPCIONAIS = {"plataforma", "valor", "label_url", "numero_plataforma", "nome_cliente", "shop_id", "shop_nome", "taxa_plataforma", "variacao", "fulfill_by_platform"}
     for i in range(0, len(todos_pedidos), 50):
         lote_orig = todos_pedidos[i:i + 50]
         excluir: set = set()
@@ -431,13 +475,24 @@ async def _backfill_historico(config: dict, dias: int):
                     break
 
     # Insere itens apenas dos pedidos novos
+    ITENS_OPCIONAIS = {"variacao"}
     ons_faltando = novos
     itens_inserir = [it for it in itens_list if it["order_number"] in ons_faltando]
     for i in range(0, len(itens_inserir), 50):
-        try:
-            supa.table("pedido_itens").insert(itens_inserir[i:i + 50]).execute()
-        except Exception:
-            pass
+        lote_it = itens_inserir[i:i + 50]
+        excluir_it: set = set()
+        while True:
+            try:
+                supa.table("pedido_itens").insert(lote_it).execute()
+                break
+            except Exception as e_it:
+                col_it = next((c for c in ITENS_OPCIONAIS - excluir_it if c in str(e_it)), None)
+                if col_it:
+                    excluir_it.add(col_it)
+                    lote_it = [{k: v for k, v in r.items() if k not in excluir_it} for r in itens_inserir[i:i + 50]]
+                else:
+                    log(f"[backfill] ⚠️ Erro itens lote {i//50+1}: {str(e_it)[:120]}")
+                    break
 
     log(f"[backfill] ✅ {inseridos} pedido(s) importados! ({len(itens_inserir)} itens){f' | {erros} erros' if erros else ''}")
 
@@ -495,6 +550,9 @@ CREATE TABLE IF NOT EXISTS pedidos (
 ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS numero_plataforma TEXT;
 ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS nome_cliente TEXT;
 ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS hora_pagamento TEXT;
+ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS variacao TEXT;
+ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS fulfill_by_platform BOOLEAN DEFAULT FALSE;
+ALTER TABLE pedido_itens ADD COLUMN IF NOT EXISTS variacao TEXT;
 
 CREATE TABLE IF NOT EXISTS pedido_itens (
     id           BIGSERIAL PRIMARY KEY,
@@ -971,7 +1029,7 @@ def status():
                 config.get("hora_fim", "18:00"),
                 int(config.get("intervalo_horas", 1)),
             )
-    etapas  = config.get("etapas", {"importar": True, "picklist": False, "nfe": True, "envio": True})
+    etapas  = config.get("etapas", {"importar": True, "nfe": True, "envio": True})
     agora   = datetime.now().strftime("%H:%M")
     proxima = next((h for h in sorted(horarios) if h > agora), horarios[0] if horarios else "—")
 
@@ -1006,9 +1064,11 @@ def status():
         "token":          config.get("token", ""),
         "cliente":        cliente,
         "email":          config.get("email", ""),
-        "horarios":          horarios,
-        "horarios_semanais": config.get("horarios_semanais"),
-        "etapas":            etapas,
+        "horarios":                    horarios,
+        "horarios_semanais":           config.get("horarios_semanais"),
+        "horarios_semanais_picklist":  config.get("horarios_semanais_picklist"),
+        "horarios_picklist":           config.get("horarios_picklist"),
+        "etapas":                      etapas,
         "proxima":           proxima,
         "nome_impressora": config.get("nome_impressora", ""),
         "auto_imprimir":  config.get("auto_imprimir", False),
@@ -1087,9 +1147,11 @@ def heartbeat_now():
 def parar():
     if request.method == "OPTIONS":
         return _cors_preflight()
-    global rodando
+    global rodando, _pos_import_ativo, _etapa_atual
     _parar.set()
     rodando = False
+    _pos_import_ativo = False
+    _etapa_atual = ""
     log("⏹️ Robô parado pelo usuário")
     return _cors(jsonify({"ok": True}))
 
@@ -1219,9 +1281,9 @@ def atualizar():
         return _cors_preflight()
     BASE = "https://qaqlaqlxxeilouvbwgiv.supabase.co/storage/v1/object/public/robo-upseller"
     ARQUIVOS_UPDATE = [
-        (f"{BASE}/version.json",         PASTA_RAIZ / "version.json"),
         (f"{BASE}/app.py",               PASTA_RAIZ / "app.py"),
         (f"{BASE}/templates/index.html", PASTA_RAIZ / "templates" / "index.html"),
+        (f"{BASE}/version.json",         PASTA_RAIZ / "version.json"),  # sempre por último
     ]
     def _update():
         try:
@@ -1287,22 +1349,114 @@ _INTERVALO_RETRO: float = 5 * 60  # retroativo a cada 5 minutos
 _ultimo_sync_status: float = 0.0        # timestamp do último sync de status
 _INTERVALO_SYNC_STATUS: float = 30 * 60  # sync de status a cada 30 minutos
 
+_LOCK_TIMEOUT_MIN = 90  # lock expira após 90 min (protege contra crash)
+
+
+def _adquirir_lock_distribuido(token: str) -> str | None:
+    """Tenta adquirir lock distribuído via Supabase Storage.
+    Retorna lid (lock ID) se adquirido, None se outro robô já está rodando.
+    """
+    import socket as _sock, uuid as _uuid, os as _os
+    lock_url = f"{SUPABASE_URL}/storage/v1/object/robo-upseller/locks/{token}.json"
+    auth = f"Bearer {SUPABASE_SERVICE_KEY}"
+
+    # Lê lock atual
+    try:
+        req = urllib.request.Request(lock_url)
+        req.add_header("Authorization", auth)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            lock_atual = json.loads(resp.read())
+        if lock_atual.get("lid"):
+            age_min = (datetime.utcnow() - datetime.fromisoformat(
+                lock_atual["ts"].replace("Z", ""))).total_seconds() / 60
+            if age_min < _LOCK_TIMEOUT_MIN:
+                log(f"[lock] ⛔ {lock_atual.get('hostname','?')} em execução há {age_min:.0f} min — pulando")
+                return None
+    except Exception:
+        pass  # sem lock ou arquivo inexistente → prossegue
+
+    # Grava nosso lock
+    lid = _uuid.uuid4().hex[:12]
+    payload = json.dumps({
+        "hostname": _sock.gethostname(),
+        "pid":      _os.getpid(),
+        "ts":       datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "lid":      lid,
+    }).encode()
+    req2 = urllib.request.Request(lock_url, data=payload, method="POST")
+    req2.add_header("Authorization", auth)
+    req2.add_header("Content-Type", "application/json")
+    req2.add_header("x-upsert", "true")
+    try:
+        urllib.request.urlopen(req2, timeout=8)
+    except Exception as e:
+        log(f"[lock] ⚠️ Erro ao gravar lock: {e}")
+        return None
+
+    # Espera 2s e confirma que ainda somos o dono (janela de corrida)
+    time.sleep(2)
+    try:
+        req3 = urllib.request.Request(lock_url)
+        req3.add_header("Authorization", auth)
+        with urllib.request.urlopen(req3, timeout=8) as resp3:
+            confirmado = json.loads(resp3.read())
+        if confirmado.get("lid") != lid:
+            log(f"[lock] ⛔ Lock perdido para {confirmado.get('hostname','?')} — pulando")
+            return None
+    except Exception:
+        pass  # sem leitura de confirmação → assume que ficou com o lock
+
+    log(f"[lock] 🔒 Lock adquirido ({_sock.gethostname()})")
+    return lid
+
+
+def _liberar_lock_distribuido(token: str, lid: str) -> None:
+    """Libera o lock distribuído se ainda for nosso."""
+    if not lid:
+        return
+    lock_url = f"{SUPABASE_URL}/storage/v1/object/robo-upseller/locks/{token}.json"
+    auth = f"Bearer {SUPABASE_SERVICE_KEY}"
+    try:
+        req = urllib.request.Request(lock_url)
+        req.add_header("Authorization", auth)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            atual = json.loads(resp.read())
+        if atual.get("lid") != lid:
+            return  # outro robô assumiu — não apagar
+    except Exception:
+        return
+    clear = json.dumps({"lid": "", "ts": ""}).encode()
+    req2 = urllib.request.Request(lock_url, data=clear, method="POST")
+    req2.add_header("Authorization", auth)
+    req2.add_header("Content-Type", "application/json")
+    req2.add_header("x-upsert", "true")
+    try:
+        urllib.request.urlopen(req2, timeout=8)
+        log("[lock] 🔓 Lock liberado")
+    except Exception as e:
+        log(f"[lock] ⚠️ Erro ao liberar lock: {e}")
+
 
 def _executar_captura(config: dict, aguardar: bool = True, background: bool = False):
-    """Roda captura com lock — impede duas execuções simultâneas.
-    Background: pula se já rodando. Executar principal: espera até 60s o background ceder.
-    """
+    """Roda captura com lock local + distribuído — impede execuções simultâneas."""
     global _ultimo_retro, _ultimo_sync_status
     if background:
         if not _captura_lock.acquire(blocking=False):
             log("[captura] ⏭️ Já em execução — pulando")
             return
     else:
-        # Executar principal: aguarda o background ceder (ele verifica `rodando` a cada pedido)
         adquiriu = _captura_lock.acquire(timeout=60)
         if not adquiriu:
             log("[captura] ⚠️ Background ainda rodando após 60s — pulando captura")
             return
+
+    # Lock distribuído — impede que dois robôs rodem ao mesmo tempo
+    token = config.get("token", "")
+    lid = _adquirir_lock_distribuido(token) if token else "local"
+    if lid is None:
+        _captura_lock.release()
+        return
+
     try:
         asyncio.run(_capturar_etiquetas_playwright(config, aguardar_se_vazio=aguardar, background=background))
         if background:
@@ -1317,6 +1471,7 @@ def _executar_captura(config: dict, aguardar: bool = True, background: bool = Fa
                 asyncio.run(_sincronizar_status_upseller(config))
                 _ultimo_sync_status = time.time()
     finally:
+        _liberar_lock_distribuido(token, lid)
         _captura_lock.release()
 
 
@@ -1327,15 +1482,18 @@ def _upload_etiqueta_supabase(pdf_path: Path, order_number: str) -> str | None:
     """Faz upload do PDF para Supabase Storage e retorna a URL pública permanente.
     Retorna None em caso de falha — o fallback local continua funcionando.
     """
+    caminho = f"etiquetas/etiqueta_{order_number}.pdf"
     for tentativa in range(2):
         try:
-            supa = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-            caminho = f"etiquetas/etiqueta_{order_number}.pdf"
-            supa.storage.from_("robo-upseller").upload(
-                caminho,
-                pdf_path.read_bytes(),
-                {"content-type": "application/pdf", "upsert": "true"},
+            data = pdf_path.read_bytes()
+            req = urllib.request.Request(
+                f"{SUPABASE_URL}/storage/v1/object/robo-upseller/{caminho}",
+                data=data, method="POST",
             )
+            req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_KEY}")
+            req.add_header("Content-Type", "application/pdf")
+            req.add_header("x-upsert", "true")
+            urllib.request.urlopen(req, timeout=15)
             return f"{SUPABASE_STORAGE_URL}/{caminho}"
         except Exception as e:
             if tentativa == 1:
@@ -1347,22 +1505,28 @@ def _upload_etiqueta_supabase(pdf_path: Path, order_number: str) -> str | None:
 def _upload_picklist_supabase(pdf_path: Path, token: str, total_pedidos: int, total_unidades: int) -> str | None:
     """Faz upload da picklist para Supabase Storage, salva metadados na tabela picklists e retorna URL pública."""
     try:
-        supa = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-        nome = pdf_path.name
+        nome    = pdf_path.name
         caminho = f"picklists/{nome}"
-        supa.storage.from_("robo-upseller").upload(
-            caminho,
-            pdf_path.read_bytes(),
-            {"content-type": "application/pdf", "upsert": "true"},
+        # Upload do PDF
+        req = urllib.request.Request(
+            f"{SUPABASE_URL}/storage/v1/object/robo-upseller/{caminho}",
+            data=pdf_path.read_bytes(), method="POST",
         )
+        req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_KEY}")
+        req.add_header("Content-Type", "application/pdf")
+        req.add_header("x-upsert", "true")
+        urllib.request.urlopen(req, timeout=30)
         url = f"{SUPABASE_STORAGE_URL}/{caminho}"
-        supa.table("picklists").insert({
-            "cliente":        token,
-            "nome":           nome,
-            "url":            url,
-            "total_pedidos":  total_pedidos,
-            "total_unidades": total_unidades,
-        }).execute()
+        # Registra metadados na tabela picklists
+        body = json.dumps({
+            "cliente": token, "nome": nome, "url": url,
+            "total_pedidos": total_pedidos, "total_unidades": total_unidades,
+        }).encode()
+        req2 = urllib.request.Request(f"{SUPABASE_URL}/rest/v1/picklists", data=body, method="POST")
+        req2.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_KEY}")
+        req2.add_header("apikey", SUPABASE_KEY)
+        req2.add_header("Content-Type", "application/json")
+        urllib.request.urlopen(req2, timeout=10)
         log(f"[picklist] ☁️ Upload Supabase: {nome}")
         return url
     except Exception as e:
@@ -1371,61 +1535,105 @@ def _upload_picklist_supabase(pdf_path: Path, token: str, total_pedidos: int, to
 
 
 def _salvar_imagens_supabase(token: str, pedidos: list, itens_list: list) -> int:
-    """Baixa imagens externas e salva no Supabase Storage, atualizando image_url in-place."""
-    import urllib.request as _ureq
+    """Baixa imagens externas e salva no Supabase Storage, atualizando image_url in-place.
+    Itens com imagem diferente do pedido recebem arquivo próprio: {order}_{sku}.ext"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    supa = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+    # Lista imagens já salvas no bucket
     try:
-        existentes = {f["name"] for f in (supa.storage.from_("robo-upseller").list("imagens") or [])}
+        list_req = urllib.request.Request(
+            f"{SUPABASE_URL}/storage/v1/object/list/robo-upseller",
+            data=json.dumps({"prefix": "imagens", "limit": 1000}).encode(),
+            method="POST",
+        )
+        list_req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_KEY}")
+        list_req.add_header("Content-Type", "application/json")
+        lst = json.loads(urllib.request.urlopen(list_req, timeout=10).read())
+        existentes = {f["name"].split("/")[-1] for f in lst}
     except Exception:
         existentes = set()
 
-    # Separa pedidos que precisam de download
-    pendentes = []
+    def _ext(url: str) -> str:
+        u = url.lower()
+        if ".png" in u:  return "png"
+        if ".webp" in u: return "webp"
+        return "jpg"
+
+    # Agrupa itens por pedido
+    itens_por_on: dict = {}
+    for it in itens_list:
+        itens_por_on.setdefault(it["order_number"], []).append(it)
+
+    # Monta mapa url_original → (nome_arquivo, caminho, storage_url)
+    # Pedido usa {order}.ext; item diferente usa {order}_{sku_ou_idx}.ext
+    url_meta: dict = {}  # url → (nome, caminho, storage_url)
+
     for p in pedidos:
         img = (p.get("image_url") or "").strip()
-        if not img or SUPABASE_URL in img:
+        if not img or SUPABASE_URL in img or img in url_meta:
             continue
-        on  = p["order_number"]
-        ext = "jpg"
-        if ".png" in img.lower():   ext = "png"
-        elif ".webp" in img.lower(): ext = "webp"
-        nome_arquivo = f"{on}.{ext}"
-        caminho      = f"imagens/{nome_arquivo}"
-        storage_url  = f"{SUPABASE_STORAGE_URL}/{caminho}"
-        if nome_arquivo in existentes:
-            p["image_url"] = storage_url
+        on   = p["order_number"]
+        nome = f"{on}.{_ext(img)}"
+        path = f"imagens/{nome}"
+        url_meta[img] = (nome, path, f"{SUPABASE_STORAGE_URL}/{path}")
+
+    for on, its in itens_por_on.items():
+        for idx, it in enumerate(its):
+            img = (it.get("image_url") or "").strip()
+            if not img or SUPABASE_URL in img or img in url_meta:
+                continue
+            safe = (it.get("sku") or f"i{idx}").replace("/", "_").replace(" ", "_")[:20]
+            nome = f"{on}_{safe}.{_ext(img)}"
+            path = f"imagens/{nome}"
+            url_meta[img] = (nome, path, f"{SUPABASE_STORAGE_URL}/{path}")
+
+    if not url_meta:
+        return 0
+
+    # Atualiza URLs que já existem no storage (sem download)
+    for url, (nome, path, storage_url) in url_meta.items():
+        if nome in existentes:
+            for p in pedidos:
+                if (p.get("image_url") or "").strip() == url:
+                    p["image_url"] = storage_url
             for it in itens_list:
-                if it["order_number"] == on:
+                if (it.get("image_url") or "").strip() == url:
                     it["image_url"] = storage_url
-            continue
-        pendentes.append((p, img, on, ext, nome_arquivo, caminho, storage_url))
+
+    # Pendentes: URLs que ainda precisam de download
+    pendentes = [(url, nome, path, storage_url)
+                 for url, (nome, path, storage_url) in url_meta.items()
+                 if nome not in existentes]
 
     if not pendentes:
         return 0
-
-    itens_por_on = {}
-    for it in itens_list:
-        itens_por_on.setdefault(it["order_number"], []).append(it)
 
     salvos_lock = threading.Lock()
     salvos = 0
 
     def _baixar_e_salvar(args):
-        p, img, on, ext, nome_arquivo, caminho, storage_url = args
+        url, nome, path, storage_url = args
         try:
-            req  = _ureq.Request(img, headers={"User-Agent": "Mozilla/5.0"})
-            data = _ureq.urlopen(req, timeout=8).read()
-            create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY).storage.from_("robo-upseller").upload(
-                caminho, data,
-                {"content-type": f"image/{ext}", "upsert": "true"},
+            req  = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            data = urllib.request.urlopen(req, timeout=8).read()
+            up   = urllib.request.Request(
+                f"{SUPABASE_URL}/storage/v1/object/robo-upseller/{path}",
+                data=data, method="POST",
             )
-            p["image_url"] = storage_url
-            for it in itens_por_on.get(on, []):
-                it["image_url"] = storage_url
+            up.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_KEY}")
+            up.add_header("Content-Type", f"image/{nome.rsplit('.',1)[-1]}")
+            up.add_header("x-upsert", "true")
+            urllib.request.urlopen(up, timeout=15)
+            # Atualiza pedidos e itens com a nova URL
+            for p in pedidos:
+                if (p.get("image_url") or "").strip() == url:
+                    p["image_url"] = storage_url
+            for it in itens_list:
+                if (it.get("image_url") or "").strip() == url:
+                    it["image_url"] = storage_url
             return True
         except Exception as e:
-            log(f"[img] ⚠️ {on}: {e}")
+            log(f"[img] ⚠️ {nome}: {e}")
             return False
 
     with ThreadPoolExecutor(max_workers=8) as ex:
@@ -1465,26 +1673,37 @@ def _limpar_etiquetas_storage(dias: int = 7):
 
 
 def _atualizar_supabase_com_pdfs_locais(token: str):
-    """Atualiza label_url no Supabase para todos os pedidos que já têm PDF em disco."""
+    """Atualiza label_url no Supabase apenas para pedidos com PDF local mas sem label_url."""
     pdfs = list(PASTA_ETIQUETAS.glob("etiqueta_*.pdf"))
     if not pdfs:
         return
     try:
         supa = create_client(*_supa())
-        atualizados = 0
-        for pdf in pdfs:
-            on = pdf.stem.replace("etiqueta_", "")
-            if not on:
-                continue
-            # Tenta URL pública Supabase Storage; fallback para localhost se upload falhar
-            url_publica = _upload_etiqueta_supabase(pdf, on)
-            label_url = url_publica or f"http://127.0.0.1:5001/etiqueta/{on}"
-            # Sempre atualiza — sem condição .is_null para não perder PDFs que já existem
-            supa.table("pedidos").update({"label_url": label_url}) \
-                .eq("order_number", on).execute()
-            atualizados += 1
-        if atualizados:
-            log(f"[import] 🔗 Supabase: {atualizados} etiqueta(s) sincronizadas")
+        pdf_map = {pdf.stem.replace("etiqueta_", ""): pdf for pdf in pdfs}
+        order_numbers = [on for on in pdf_map if on]
+
+        # Busca somente os que ainda não têm label_url
+        sem_url: set = set()
+        for i in range(0, len(order_numbers), 100):
+            lote = order_numbers[i:i+100]
+            r = supa.table("pedidos").select("order_number") \
+                .in_("order_number", lote).eq("cliente", token) \
+                .is_("label_url", "null").execute()
+            sem_url.update(row["order_number"] for row in (r.data or []))
+
+        if not sem_url:
+            return
+
+        # Usa URL local imediatamente — _executar_captura fará o upload para Storage em seguida
+        rows = [{"order_number": on, "cliente": token,
+                 "label_url": f"http://127.0.0.1:5001/etiqueta/{on}"}
+                for on in sem_url if pdf_map.get(on)]
+        if not rows:
+            return
+        for i in range(0, len(rows), 50):
+            supa.table("pedidos").upsert(rows[i:i+50],
+                                         on_conflict="order_number,cliente").execute()
+        log(f"[import] 🔗 Supabase: {len(rows)} etiqueta(s) sincronizadas")
     except Exception as e:
         log(f"[import] ⚠️ Erro ao sincronizar PDFs com Supabase: {e}")
 
@@ -1529,7 +1748,7 @@ def _pos_import(config: dict):
         return
 
     # 2. Picklist (gerada do Supabase — dedup via picklist_impresso_em)
-    if etapas.get("picklist", True):
+    if etapas.get("picklist", False):
         _etapa_atual = "Gerando picklist..."
         log("━━ Gerando picklist ━━")
         _imprimir_picklist_supabase(config)
@@ -2603,15 +2822,25 @@ def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0, sufixo: str 
     PX      = 4  * rl_mm   # X da foto
     PY      = 19 * rl_mm   # Y base da foto (bottom)
 
+    def _extrair_variacao(sku: str) -> str:
+        """Remove código numérico inicial do SKU, retorna só a variação (cor/tamanho)."""
+        if not sku:
+            return ""
+        partes = sku.split("-")
+        while partes and partes[0].strip().replace(" ", "").isdigit():
+            partes.pop(0)
+        resultado = "-".join(partes).strip()
+        return resultado if resultado else sku
+
     for idx, (p, frac_i, frac_total) in enumerate(unidades, start=1):
         on       = p.get("order_number", "")
         produto  = (p.get("product_name") or "")
         sku      = (p.get("sku") or "")
-        cliente  = (p.get("nome_cliente") or "")[:30].upper()
+        # Usa variacao do banco (warehouseVariantsAttr/productAttr) se disponível, senão extrai do SKU
+        variacao = (p.get("variacao") or "").strip() or _extrair_variacao(sku)
+        cliente  = (p.get("nome_cliente") or "")[:28].upper()
+        loja     = (p.get("shop_nome") or "")[:38]
         plat     = (p.get("plataforma") or "")[:14]
-        data     = (p.get("data") or "")
-        hora     = (p.get("hora_pagamento") or "")
-        data_fmt = (f"{data[8:10]}/{data[5:7]}/{data[2:4]}" if len(data) >= 10 else "") + (f" {hora}" if hora else "")
         img_url  = (p.get("image_url") or "").strip()
 
         # ── Cabeçalho ────────────────────────────────────────────────────────
@@ -2651,24 +2880,40 @@ def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0, sufixo: str 
 
         # ── Conteúdo ─────────────────────────────────────────────────────────
         if True:
-            nome_curto = produto[:40] if len(produto) <= 40 else produto[:37] + "..."
-            c.setFont("Helvetica", 7)
+            linha1 = produto[:46]
+            linha2 = produto[46:90] if len(produto) > 46 else ""
+            if len(produto) > 90:
+                linha2 = produto[46:87] + "..."
+
+            c.setFont("Helvetica", 6.5)
             c.setFillColor(rl_colors.black)
-            c.drawString(TX, ORDER_Y - 6 * rl_mm, nome_curto)
+            c.drawString(TX, ORDER_Y - 5.5 * rl_mm, linha1)
 
-            sku_display = sku if len(sku) <= 35 else sku[:32] + "..."
-            c.setFont("Helvetica", 6)
-            c.setFillColor(HexColor("#6b7280"))
-            c.drawString(TX, ORDER_Y - 11 * rl_mm, f"SKU: {sku_display}")
+            if linha2:
+                c.drawString(TX, ORDER_Y - 9.0 * rl_mm, linha2)
+                var_y     = ORDER_Y - 12.5 * rl_mm
+                loja_y    = ORDER_Y - 16.0 * rl_mm
+                cliente_y = ORDER_Y - 19.5 * rl_mm
+            else:
+                var_y     = ORDER_Y -  9.5 * rl_mm
+                loja_y    = ORDER_Y - 13.0 * rl_mm
+                cliente_y = ORDER_Y - 16.5 * rl_mm
 
-            if data_fmt:
+            if variacao:
+                var_display = variacao if len(variacao) <= 42 else variacao[:39] + "..."
+                c.setFont("Helvetica-Bold", 6.5)
+                c.setFillColor(HexColor("#374151"))
+                c.drawString(TX, var_y, var_display)
+
+            if loja:
                 c.setFont("Helvetica", 6)
-                c.drawString(TX, ORDER_Y - 16 * rl_mm, data_fmt)
+                c.setFillColor(HexColor("#6b7280"))
+                c.drawString(TX, loja_y, loja)
 
             if cliente:
                 c.setFont("Helvetica-Bold", 6.5)
                 c.setFillColor(HexColor("#1a56db"))
-                c.drawString(TX, ORDER_Y - 20 * rl_mm, cliente)
+                c.drawString(TX, cliente_y, cliente)
 
         # ── Código de barras (Code128, centralizado, 10mm altura) ───────────
         c.setFillColor(rl_colors.black)
@@ -2698,48 +2943,66 @@ def _gerar_picklist_pdf(pedidos: list, margem_topo_mm: float = 5.0, sufixo: str 
 
 def _imprimir_picklist_supabase(config: dict) -> bool:
     """Gera e imprime a picklist da rodada atual a partir dos dados do Supabase.
-    Pedidos ativos: incluídos uma vez (marcados com picklist_impresso_em).
-    Para Reservar: incluídos em toda picklist como aviso (não marcados — status muda quando ML liberar).
-    Cancelados: incluídos uma vez como aviso (marcados)."""
+    Incluídos: status=ativo, exceto Para Reservar e Para Retirada.
+    Excluídos: cancelados, Para Reservar, Para Retirada."""
     try:
         supa  = create_client(*_supa())
         token = config.get("token", "")
 
         # Pedidos ativos ainda não na picklist
-        _COLS = "order_number,product_name,sku,quantidade,status_upseller,label_url,image_url,nome_cliente,plataforma,data,hora_pagamento"
-        r = (supa.table("pedidos")
-             .select(_COLS)
-             .eq("status", "ativo")
-             .eq("cliente", token)
-             .is_("picklist_impresso_em", "null")
-             .order("data", desc=False)
-             .execute())
+        _COLS_BASE = "order_number,product_name,sku,quantidade,status_upseller,label_url,image_url,nome_cliente,shop_nome,plataforma,data,hora_pagamento"
+        _COLS_EXTRA = ["variacao", "fulfill_by_platform"]
+        _COLS = _COLS_BASE + "," + ",".join(_COLS_EXTRA)
+        _cols_excluir: set = set()
+        while True:
+            try:
+                cols_q = ",".join(c for c in _COLS.split(",") if c not in _cols_excluir)
+                r = (supa.table("pedidos")
+                     .select(cols_q)
+                     .eq("status", "ativo")
+                     .eq("cliente", token)
+                     .is_("picklist_impresso_em", "null")
+                     .order("data", desc=False)
+                     .execute())
+                break
+            except Exception as _eq:
+                _mc = next((c for c in _COLS_EXTRA if c not in _cols_excluir and c in str(_eq)), None)
+                if _mc:
+                    _cols_excluir.add(_mc)
+                    log(f"[picklist] ⚠️ Coluna '{_mc}' ausente em pedidos — selecionando sem ela")
+                else:
+                    raise
         ativos = r.data or []
 
-        # Cancelados ainda não avisados na picklist
-        r_c = (supa.table("pedidos")
-               .select(_COLS.replace(",label_url", "").replace(",image_url", ""))
-               .eq("status", "cancelado")
-               .eq("cliente", token)
-               .is_("picklist_impresso_em", "null")
-               .order("data", desc=False)
-               .execute())
-        cancelados = r_c.data or []
-        for p in cancelados:
-            p["status"] = "cancelado"
-
-        # Para Reservar excluído da picklist — sem etiqueta, operador não consegue processar
+        # Exclui da picklist: sem status, Para Reservar, Para Retirada, ML Full (fulfillByPlatform)
+        _excluir_statuses = {"para reservar", "para retirada", ""}
         para_marcar_ativos = [p for p in ativos
-                              if (p.get("status_upseller") or "").strip().lower() != "para reservar"]
+                              if (p.get("status_upseller") or "").strip().lower() not in _excluir_statuses
+                              and not p.get("fulfill_by_platform")]
 
-        pedidos_raw = para_marcar_ativos + cancelados
+        cancelados = []  # cancelados não entram na picklist
+        pedidos_raw = para_marcar_ativos
 
         # Expande pedidos com múltiplos itens usando pedido_itens
         # Cada item vira um "slot" com sku/product_name/image_url próprio
         order_nums = [p["order_number"] for p in pedidos_raw]
         itens_map: dict = {}
+        _IT_COLS = "order_number,sku,variacao,product_name,image_url,quantidade"
+        _it_excluir: set = set()
         for i in range(0, len(order_nums), 100):
-            r_it = supa.table("pedido_itens").select("order_number,sku,product_name,image_url,quantidade").in_("order_number", order_nums[i:i+100]).execute()
+            _it_lote_ok = False
+            while not _it_lote_ok:
+                try:
+                    cols_it = ",".join(c for c in _IT_COLS.split(",") if c not in _it_excluir)
+                    r_it = supa.table("pedido_itens").select(cols_it).in_("order_number", order_nums[i:i+100]).execute()
+                    _it_lote_ok = True
+                except Exception as _eit:
+                    _mc2 = next((c for c in ["variacao"] if c not in _it_excluir and c in str(_eit)), None)
+                    if _mc2:
+                        _it_excluir.add(_mc2)
+                        log(f"[picklist] ⚠️ Coluna '{_mc2}' ausente em pedido_itens — selecionando sem ela")
+                    else:
+                        raise
             for it in (r_it.data or []):
                 itens_map.setdefault(it["order_number"], []).append(it)
 
@@ -2766,9 +3029,8 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
         log("[picklist] ℹ️ Nenhum pedido novo — picklist não gerada")
         return True
 
-    n_cancelados = len(cancelados)
-    n_processar  = len(para_marcar_ativos)
-    log(f"[picklist] 📋 {len(pedidos_raw)} pedido(s) → {len(pedidos)} slot(s): {n_processar} processar, {n_cancelados} cancelados")
+    n_processar = len(para_marcar_ativos)
+    log(f"[picklist] 📋 {len(pedidos_raw)} pedido(s) → {len(pedidos)} slot(s): {n_processar} para processar")
 
     margem_topo_mm = float(config.get("margem_topo_mm", 5) or 0)
 
@@ -2783,6 +3045,7 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
         return _re.sub(r"[^a-z0-9]", "", nome.lower())[:20]
 
     for plat, grupo in grupos.items():
+        grupo.sort(key=lambda p: (p.get("sku") or "").lower())
         sufixo = _slug(plat)
         try:
             pdf_pick = _gerar_picklist_pdf(grupo, margem_topo_mm=margem_topo_mm, sufixo=sufixo, plataforma=plat)
@@ -2795,10 +3058,10 @@ def _imprimir_picklist_supabase(config: dict) -> bool:
         _upload_picklist_supabase(pdf_pick, config.get("token", ""), n_pedidos_unu, total_u)
         log(f"[picklist] 📋 [{plat}] PDF disponível via PCP")
 
-    # Marca todos os pedidos (ativos exceto Para Reservar + cancelados)
+    # Marca pedidos ativos incluídos na picklist
     try:
         agora    = datetime.utcnow().isoformat()
-        order_ns = [p["order_number"] for p in para_marcar_ativos + cancelados]
+        order_ns = [p["order_number"] for p in para_marcar_ativos]
         for i in range(0, len(order_ns), 50):
             (supa.table("pedidos")
              .update({"picklist_impresso_em": agora})
@@ -6034,7 +6297,7 @@ def extrair(config: dict, data_alvo: date):
             updates  = [{k: v for k, v in l.items() if k != "data"}
                         for l in linhas if l["order_number"] in existentes_set]
 
-            colunas_opcionais = {"plataforma", "valor", "label_url", "numero_plataforma", "nome_cliente", "status_upseller", "shop_id", "shop_nome", "buyer_account", "taxa_plataforma"}
+            colunas_opcionais = {"plataforma", "valor", "label_url", "numero_plataforma", "nome_cliente", "status_upseller", "shop_id", "shop_nome", "buyer_account", "taxa_plataforma", "variacao", "fulfill_by_platform"}
 
             def _upsert_com_fallback(lote_orig, label):
                 excluir: set = set()
@@ -6081,10 +6344,27 @@ def extrair(config: dict, data_alvo: date):
         if itens_list:
             order_numbers = list(pedidos_dict.keys())
             supa.table("pedido_itens").delete().in_("order_number", order_numbers).execute()
+            _ITENS_OPCIONALS = {"variacao"}
             batch = 200
+            total_it = 0
             for i in range(0, len(itens_list), batch):
-                supa.table("pedido_itens").insert(itens_list[i:i+batch]).execute()
-            log(f"✅ {len(itens_list)} itens enviados a pedido_itens!")
+                lote_it = itens_list[i:i+batch]
+                excluir_it: set = set()
+                while True:
+                    try:
+                        supa.table("pedido_itens").insert(lote_it).execute()
+                        total_it += len(lote_it)
+                        break
+                    except Exception as e_it:
+                        col_it = next((c for c in _ITENS_OPCIONALS - excluir_it if c in str(e_it)), None)
+                        if col_it:
+                            excluir_it.add(col_it)
+                            lote_it = [{k: v for k, v in r.items() if k not in excluir_it} for r in itens_list[i:i+batch]]
+                            log(f"⚠️ Coluna '{col_it}' ausente em pedido_itens — tentando sem ela...")
+                        else:
+                            log(f"Erro Supabase (pedido_itens lote {i//batch+1}): {e_it}")
+                            break
+            log(f"✅ {total_it} itens enviados a pedido_itens!")
             _auto_cadastrar_produtos(supa, itens_list, token)
     except Exception as e:
         log(f"Erro Supabase (pedido_itens): {e}")
@@ -6245,6 +6525,7 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                 nums_ativos = {(o.get("orderNumber") or "").strip() for o in todos_raw}
                 pg_v = 1
                 cancelados_api: list = []
+                cancelados_objs: list = []
                 while True:
                     r_v = await page.evaluate(f"""async () => {{
                         const r = await fetch('/api/order/index', {{
@@ -6256,6 +6537,7 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                     lista_v = (r_v.get("data") or {}).get("list") or []
                     total_v = (r_v.get("data") or {}).get("total") or 0
                     cancelados_api.extend((o.get("orderNumber") or "").strip() for o in lista_v)
+                    cancelados_objs.extend(lista_v)
                     if pg_v * 50 >= total_v or not lista_v:
                         break
                     pg_v += 1
@@ -6267,9 +6549,31 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                         lote_c = list(cancelados_api_set)[i:i+50]
                         res_c = supa_c.table("pedidos").update({"status": "cancelado", "status_upseller": "Cancelado"}).in_("order_number", lote_c).eq("status", "ativo").execute()
                         total_cancelados += len(res_c.data or [])
-                    log(f"[api] ⛔ {len(cancelados_api_set)} voided no UpSeller — {total_cancelados} marcado(s) como cancelado no Supabase")
-                    if total_cancelados:
-                        _ultima_rodada["cancelados"] = _ultima_rodada.get("cancelados", 0) + total_cancelados
+                    # Upsert voided orders que não existem ainda no Supabase
+                    rows_v = []
+                    for o in cancelados_objs:
+                        on = (o.get("orderNumber") or "").strip()
+                        if not on:
+                            continue
+                        first = (o.get("orderItemList") or [{}])[0]
+                        rows_v.append({
+                            "order_number":    on,
+                            "cliente":         token,
+                            "status":          "cancelado",
+                            "status_upseller": "Cancelado",
+                            "plataforma":      _norm_plat(o.get("platform") or ""),
+                            "data":            data_arquivo,
+                            "sku":             (first.get("variationSku") or first.get("productSku") or "").strip(),
+                            "product_name":    (first.get("productName") or "").strip(),
+                            "quantidade":      int(first.get("productCount") or 1),
+                            "nome_cliente":    (o.get("buyerName") or "").strip() or None,
+                        })
+                    for i in range(0, len(rows_v), 50):
+                        supa_c.table("pedidos").upsert(rows_v[i:i+50], on_conflict="order_number").execute()
+                    novos_v = max(0, len(rows_v) - total_cancelados)
+                    log(f"[api] ⛔ {len(cancelados_api_set)} voided no UpSeller — {total_cancelados} atualizado(s), {novos_v} inserido(s) como cancelado")
+                    if total_cancelados or novos_v:
+                        _ultima_rodada["cancelados"] = _ultima_rodada.get("cancelados", 0) + total_cancelados + novos_v
             except Exception as e_v:
                 log(f"[api] ⚠️ Verificação de cancelados falhou: {e_v}")
 
@@ -6287,6 +6591,17 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
                     _ultima_rodada["sem_fila"] = len(desap)
                 elif nums_sem:
                     log(f"[api] ✅ {len(nums_sem)} sem etiqueta — todos nas filas ativas")
+                # Sem etiqueta + já em Para Retirada → processado manualmente; atualiza status_upseller
+                retirada_set = {(o.get("orderNumber") or "").strip()
+                                for o in todos_raw if o.get("_state") == "to_pickup" and o.get("orderNumber")}
+                retirada_sem_etiqueta = nums_sem & retirada_set
+                if retirada_sem_etiqueta:
+                    log(f"[api] 📦 {len(retirada_sem_etiqueta)} sem etiqueta em Para Retirada "
+                        f"(processado manualmente): {', '.join(sorted(retirada_sem_etiqueta)[:10])}")
+                    for _i in range(0, len(list(retirada_sem_etiqueta)), 50):
+                        _lote = list(retirada_sem_etiqueta)[_i:_i+50]
+                        supa_d.table("pedidos").update({"status_upseller": "Para Retirada"}) \
+                            .in_("order_number", _lote).eq("cliente", token).execute()
             except Exception as e_d:
                 log(f"[api] ⚠️ Cruzamento sem-etiqueta falhou: {e_d}")
 
@@ -6320,6 +6635,9 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
         order_num = (order.get("orderNumber") or "").strip()
         if not order_num:
             continue
+        # Para Retirada = usuário já processou manualmente; não importar como novo pedido
+        if order.get("_state") == "to_pickup":
+            continue
 
         plataforma = _norm_plat(order.get("platform") or "")
         try:
@@ -6330,13 +6648,16 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
         items = order.get("orderItemList") or []
 
         for item in items:
-            sku  = (item.get("variationSku") or item.get("productSku") or "").strip()
-            nome = (item.get("productName") or "").strip()
-            img  = (item.get("productImg")  or "").strip()
-            qtd  = int(item.get("productCount") or 1)
+            sku   = (item.get("variationSku") or item.get("productSku") or "").strip()
+            nome  = (item.get("productName") or "").strip()
+            img   = (item.get("productImg")  or "").strip()
+            qtd   = int(item.get("productCount") or 1)
+            _iattr = item.get("warehouseVariantsAttr") or item.get("productAttr") or ""
+            _ivar  = _iattr if isinstance(_iattr, str) else (json.dumps(_iattr, ensure_ascii=False) if _iattr else "")
             itens_list.append({
                 "order_number": order_num,
                 "sku":          sku,
+                "variacao":     _ivar.strip() or None,
                 "product_name": nome,
                 "image_url":    img,
                 "quantidade":   qtd,
@@ -6374,34 +6695,50 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
             ).strip() or None
             if len(pedidos_dict) == 0:
                 log(f"[api] 🔍 campos do 1º pedido: {sorted(order.keys())}")
+                _items0 = order.get("orderItemList") or []
+                if _items0:
+                    log(f"[api] 🔍 campos do 1º item: {sorted(_items0[0].keys())}")
+                    log(f"[api] 🔍 item[0] variationSku={_items0[0].get('variationSku')!r} productAttr={_items0[0].get('productAttr')!r} warehouseVariantsAttr={_items0[0].get('warehouseVariantsAttr')!r}")
+                    # Log primeiro item SEM variationSku para ver campo alternativo
+                    _sem_vsku = [i for i in _items0 if not (i.get("variationSku") or "").strip()]
+                    if _sem_vsku:
+                        log(f"[api] 🔍 item sem variationSku: productAttr={_sem_vsku[0].get('productAttr')!r} warehouseVariantsAttr={_sem_vsku[0].get('warehouseVariantsAttr')!r}")
                 rec = order.get("receiver") or order.get("receiverInfo") or {}
                 if rec:
                     log(f"[api] 🔍 receiver fields: {sorted(rec.keys()) if isinstance(rec, dict) else str(rec)[:300]}")
                 # Log fee-related fields to discover taxa_plataforma source
                 fee_kv = {k: v for k, v in order.items() if any(t in k.lower() for t in ("fee", "commission", "taxa", "discount", "charge", "deduct", "cost"))}
                 log(f"[api] 💰 fee fields do 1º pedido: {fee_kv}")
+            # Loga _state desconhecido para ajudar a mapear novos status
+            _state_val = order.get("_state", "")
+            if _state_val and _state_val not in _API_STATE_LABEL:
+                log(f"[api] ⚠️ _state desconhecido: '{_state_val}' — pedido {order_num} [{plataforma}]")
             # Loga shopId/shopName/authId para os primeiros 3 pedidos de cada plataforma
             if _diag_plat.get(plataforma, 0) < 3:
                 _diag_plat[plataforma] = _diag_plat.get(plataforma, 0) + 1
                 log(f"[api] 🏪 [{plataforma}] shopId={order.get('shopId')!r} shopName={order.get('shopName')!r} authId={order.get('authId')!r} authIdStr={order.get('authIdStr')!r} site={order.get('site')!r}")
+            _f2_attr = first.get("warehouseVariantsAttr") or first.get("productAttr") or ""
+            _f2_var  = _f2_attr if isinstance(_f2_attr, str) else (json.dumps(_f2_attr, ensure_ascii=False) if _f2_attr else "")
             pedidos_dict[order_num] = {
-                "order_number":      order_num,
-                "numero_plataforma": str(order.get("orderId") or order.get("extendedId") or "") or None,
-                "sku":               (first.get("variationSku") or first.get("productSku") or "").strip(),
-                "product_name":      (first.get("productName") or "").strip(),
-                "image_url":         (first.get("productImg")  or "").strip(),
-                "data":              data_pedido,
-                "quantidade":        qtd_total,
-                "plataforma":        plataforma,
-                "valor":             valor,
-                "label_url":         api_label_url,
-                "nome_cliente":      nome_cliente,
-                "status_upseller":   _API_STATE_LABEL.get(order.get("_state", ""), None),
-                "hora_pagamento":    hora_pagamento,
-                "shop_id":           str(order.get("shopId") or "") or None,
-                "shop_nome":         (order.get("shopName") or "").strip() or None,
-                "buyer_account":     str(order.get("buyerAccount") or "") or None,
-                "taxa_plataforma":   _extrair_taxa_plataforma(order),
+                "order_number":        order_num,
+                "numero_plataforma":   str(order.get("orderId") or order.get("extendedId") or "") or None,
+                "sku":                 (first.get("variationSku") or first.get("productSku") or "").strip(),
+                "variacao":            _f2_var.strip() or None,
+                "product_name":        (first.get("productName") or "").strip(),
+                "image_url":           (first.get("productImg")  or "").strip(),
+                "data":                data_pedido,
+                "quantidade":          qtd_total,
+                "plataforma":          plataforma,
+                "valor":               valor,
+                "label_url":           api_label_url,
+                "nome_cliente":        nome_cliente,
+                "status_upseller":     _API_STATE_LABEL.get(_state_val, None),
+                "hora_pagamento":      hora_pagamento,
+                "shop_id":             str(order.get("shopId") or "") or None,
+                "shop_nome":           (order.get("shopName") or "").strip() or None,
+                "buyer_account":       str(order.get("buyerAccount") or "") or None,
+                "taxa_plataforma":     _extrair_taxa_plataforma(order),
+                "fulfill_by_platform": bool(order.get("fulfillByPlatform")),
             }
         else:
             pedidos_dict[order_num]["quantidade"] += qtd_total
@@ -6489,6 +6826,8 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
             "shop_nome":         p.get("shop_nome"),
             "buyer_account":     p.get("buyer_account"),
             "taxa_plataforma":   p.get("taxa_plataforma"),
+            "variacao":          p.get("variacao"),
+            "fulfill_by_platform": p.get("fulfill_by_platform"),
         } for p in pedidos]
 
         if linhas:
@@ -6502,7 +6841,7 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
             updates2 = [{k: v for k, v in l.items() if k != "data"}
                         for l in linhas if l["order_number"] in existentes2]
 
-            colunas_opcionais = {"plataforma", "valor", "label_url", "numero_plataforma", "nome_cliente", "shop_id", "shop_nome", "buyer_account", "taxa_plataforma"}
+            colunas_opcionais = {"plataforma", "valor", "label_url", "numero_plataforma", "nome_cliente", "shop_id", "shop_nome", "buyer_account", "taxa_plataforma", "variacao", "fulfill_by_platform"}
 
             def _upsert_fb2(lote_orig, label):
                 excluir: set = set()
@@ -6557,10 +6896,27 @@ async def _importar_via_api(config: dict, data_arquivo: str) -> bool:
         if itens_list:
             order_numbers = list(pedidos_dict.keys())
             supa.table("pedido_itens").delete().in_("order_number", order_numbers).execute()
+            _ITENS_OPT = {"variacao"}
             batch = 200
+            total_it = 0
             for i in range(0, len(itens_list), batch):
-                supa.table("pedido_itens").insert(itens_list[i:i + batch]).execute()
-            log(f"✅ {len(itens_list)} itens enviados a pedido_itens!")
+                lote_it = itens_list[i:i + batch]
+                excluir_it: set = set()
+                while True:
+                    try:
+                        supa.table("pedido_itens").insert(lote_it).execute()
+                        total_it += len(lote_it)
+                        break
+                    except Exception as e_it:
+                        col_it = next((c for c in _ITENS_OPT - excluir_it if c in str(e_it)), None)
+                        if col_it:
+                            excluir_it.add(col_it)
+                            lote_it = [{k: v for k, v in r.items() if k not in excluir_it} for r in itens_list[i:i + batch]]
+                            log(f"⚠️ Coluna '{col_it}' ausente em pedido_itens — tentando sem ela...")
+                        else:
+                            log(f"Erro Supabase (pedido_itens lote {i//batch+1}): {e_it}")
+                            break
+            log(f"✅ {total_it} itens enviados a pedido_itens!")
             _auto_cadastrar_produtos(supa, itens_list, token)
     except Exception as e:
         log(f"Erro Supabase (pedido_itens): {e}")
@@ -6621,6 +6977,15 @@ def _loop_agendador():
 
             _execucoes_hoje = {k for k in _execucoes_hoje if k.startswith(hoje)}
             _picklist_hoje  = {k for k in _picklist_hoje  if k.startswith(hoje)}
+
+            # ── Agenda independente de picklist ──────────────────────────────
+            _hs_pick = config.get("horarios_semanais_picklist", {})
+            horarios_pick = (_hs_pick.get(_dia_wd) or []) if _hs_pick else config.get("horarios_picklist", [])
+            chave_pick = f"{hoje}_{agora}_pick"
+            if agora in horarios_pick and chave_pick not in _picklist_hoje and not _picklist_lock.locked():
+                _picklist_hoje.add(chave_pick)
+                log(f"⏰ Picklist agendada ({agora})")
+                threading.Thread(target=_imprimir_picklist_thread, args=(config,), daemon=True).start()
 
             if agora in horarios and chave not in _execucoes_hoje and not rodando:
                 _execucoes_hoje.add(chave)
@@ -6989,9 +7354,76 @@ def _loop_commands():
                                     urllib.request.urlopen(req2, timeout=5)
                                 except Exception:
                                     pass
+                            elif comando == "reiniciar":
+                                req2 = urllib.request.Request("http://127.0.0.1:5001/reiniciar", data=b"{}", method="POST")
+                                req2.add_header("Content-Type", "application/json")
+                                try:
+                                    urllib.request.urlopen(req2, timeout=5)
+                                except Exception:
+                                    pass
+                            elif comando == "atualizar":
+                                req2 = urllib.request.Request("http://127.0.0.1:5001/atualizar", data=b"{}", method="POST")
+                                req2.add_header("Content-Type", "application/json")
+                                try:
+                                    urllib.request.urlopen(req2, timeout=5)
+                                except Exception:
+                                    pass
+                            elif comando == "config":
+                                # Atualiza etapas/horarios no config.json — sem chamar Supabase
+                                try:
+                                    cfg = {}
+                                    if CONFIG_FILE.exists():
+                                        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                                    if "etapas" in args:
+                                        cfg["etapas"] = args["etapas"]
+                                    if "horarios_semanais" in args:
+                                        cfg["horarios_semanais"] = args["horarios_semanais"]
+                                        todos: set = set()
+                                        for v in args["horarios_semanais"].values():
+                                            if v:
+                                                todos.update(v)
+                                        cfg["horarios"] = sorted(todos)
+                                    CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+                                except Exception:
+                                    pass
         except Exception:
             pass
         time.sleep(8)
+
+
+def _loop_config_sync():
+    """Sincroniza config (etapas + horarios) do Supabase Storage a cada 30s.
+    Garante que ambos os robôs recebam mudanças salvas pelo PCP ou pelo outro robô.
+    """
+    time.sleep(10)
+    while True:
+        try:
+            if CONFIG_FILE.exists():
+                cfg_local = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                token = (cfg_local.get("token") or "").strip()
+                if token:
+                    req = urllib.request.Request(
+                        f"{SUPABASE_URL}/storage/v1/object/robo-upseller/configs/{token}.json"
+                    )
+                    req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_KEY}")
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        cfg_remoto = json.loads(resp.read())
+                    ts_remoto = cfg_remoto.get("atualizado_em", "")
+                    ts_local  = cfg_local.get("config_atualizado_em", "")
+                    if ts_remoto and ts_remoto > ts_local:
+                        # Config remota é mais nova — aplica localmente
+                        for campo in ("etapas", "horarios_semanais", "horarios",
+                                      "horarios_semanais_picklist", "horarios_picklist"):
+                            if campo in cfg_remoto:
+                                cfg_local[campo] = cfg_remoto[campo]
+                        cfg_local["config_atualizado_em"] = ts_remoto
+                        CONFIG_FILE.write_text(
+                            json.dumps(cfg_local, indent=2, ensure_ascii=False), encoding="utf-8"
+                        )
+                        log(f"[config] 🔄 Config sincronizado do Supabase ({ts_remoto})")
+        except Exception:
+            pass
+        time.sleep(30)
 
 
 def _loop_heartbeat():
@@ -7009,11 +7441,15 @@ def _loop_heartbeat():
                     horarios = horarios_sem.get(dia) or config.get("horarios", [])
                     agora = datetime.now().strftime("%H:%M")
                     proxima = next((h for h in sorted(horarios) if h > agora), horarios[0] if horarios else "")
+                    try:
+                        _ver = json.loads((PASTA_RAIZ / "version.json").read_text())["version"]
+                    except Exception:
+                        _ver = "?"
                     payload = json.dumps({
                         "online":            True,
-                        "versao":            "1.7.5",
-                        "rodando":           rodando,
-                        "etapa":             _etapa_atual,
+                        "versao":            _ver,
+                        "rodando":           rodando or _pos_import_ativo,
+                        "etapa":             _etapa_atual if (rodando or _pos_import_ativo) else "",
                         "proxima":           proxima,
                         "horarios":          config.get("horarios", []),
                         "horarios_semanais": horarios_sem,
@@ -7088,16 +7524,28 @@ if __name__ == "__main__":
     def _migrar_colunas():
         try:
             sb = create_client(*_supa())
-            sb.rpc("exec_sql", {"sql": "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS nome_cliente TEXT;"}).execute()
-            log("[startup] ✅ Coluna nome_cliente verificada/criada")
+            _ddls = [
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS nome_cliente TEXT;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS hora_pagamento TEXT;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS variacao TEXT;",
+                "ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS fulfill_by_platform BOOLEAN DEFAULT FALSE;",
+                "ALTER TABLE pedido_itens ADD COLUMN IF NOT EXISTS variacao TEXT;",
+            ]
+            for _ddl in _ddls:
+                try:
+                    sb.rpc("exec_sql", {"sql": _ddl}).execute()
+                except Exception:
+                    pass
+            log("[startup] ✅ Colunas verificadas/criadas via exec_sql")
         except Exception:
-            pass  # exec_sql pode não existir; coluna pode já existir — tudo ok
+            pass
 
     threading.Thread(target=_migrar_colunas, daemon=True).start()
     threading.Thread(target=_loop_agendador, daemon=True).start()
     threading.Thread(target=_loop_captura_etiquetas, daemon=True).start()
     threading.Thread(target=_loop_commands,  daemon=True).start()
     threading.Thread(target=_loop_heartbeat, daemon=True).start()
+    threading.Thread(target=_loop_config_sync, daemon=True).start()
     # Pré-baixa SumatraPDF no Windows para a primeira impressão ser imediata
     if platform.system() == "Windows":
         threading.Thread(target=_obter_sumatra, daemon=True).start()

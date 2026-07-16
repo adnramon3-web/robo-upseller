@@ -256,12 +256,31 @@
 
   <!-- AGENDA SEMANAL -->
   <div class="card">
-    <div class="card-header"><span>📅</span><h2>Agenda Semanal</h2></div>
+    <div class="card-header"><span>📅</span><h2>Agenda Semanal — Robô</h2></div>
     <div class="card-body">
       <p style="font-size:12px;color:#78909C;margin-bottom:14px;">
-        Defina em quais dias e horários o robô vai rodar automaticamente.
+        Defina em quais dias e horários o robô vai rodar automaticamente (NF-e, envio, importação).
       </p>
-      <div id="agenda-semanal" style="border:1px solid #E3E8F0;border-radius:10px;overflow:hidden"></div>
+      <div id="agenda-semanal" style="border:1px solid #E3E8F0;border-radius:10px;overflow:hidden;margin-bottom:14px"></div>
+      <button onclick="salvarAgendaRobo()" style="background:#1e3a5f;color:#fff;border:none;border-radius:8px;padding:9px 22px;font-size:13px;font-weight:700;cursor:pointer">
+        💾 Salvar Agenda Robô
+      </button>
+      <span id="robo-agenda-status" style="margin-left:12px;font-size:12px;color:#78909C"></span>
+    </div>
+  </div>
+
+  <!-- AGENDA PICKLIST -->
+  <div class="card">
+    <div class="card-header"><span>🗒️</span><h2>Agenda Semanal — Picklist</h2></div>
+    <div class="card-body">
+      <p style="font-size:12px;color:#78909C;margin-bottom:14px;">
+        Agenda independente para geração de picklist. Roda separado do robô principal.
+      </p>
+      <div id="agenda-semanal-picklist" style="border:1px solid #E3E8F0;border-radius:10px;overflow:hidden;margin-bottom:14px"></div>
+      <button onclick="salvarAgendaPicklist()" style="background:#1e3a5f;color:#fff;border:none;border-radius:8px;padding:9px 22px;font-size:13px;font-weight:700;cursor:pointer">
+        💾 Salvar Agenda Picklist
+      </button>
+      <span id="pick-agenda-status" style="margin-left:12px;font-size:12px;color:#78909C"></span>
     </div>
   </div>
 
@@ -277,13 +296,6 @@
           <div class="etapa-label"><span>📥</span> Importar Pedidos</div>
           <label class="toggle">
             <input type="checkbox" id="etapa-importar" checked onchange="atualizarEtapa('importar')"/>
-            <span class="toggle-slider"></span>
-          </label>
-        </div>
-        <div class="etapa-item" id="etapa-picklist-box">
-          <div class="etapa-label"><span>🗒️</span> Imprimir Picklist</div>
-          <label class="toggle">
-            <input type="checkbox" id="etapa-picklist" checked onchange="atualizarEtapa('picklist')"/>
             <span class="toggle-slider"></span>
           </label>
         </div>
@@ -411,7 +423,7 @@
 <script>
   // Estado local
   let _horarios = [];
-  let _etapas   = { importar: true, picklist: true, nfe: true, envio: true };
+  let _etapas   = { importar: true, nfe: true, envio: true };
 
   window.addEventListener('DOMContentLoaded', () => {
     verificarStatus();
@@ -496,6 +508,73 @@
     if (wrap.lastChild) wrap.lastChild.style.borderBottom = 'none';
   }
 
+  async function salvarAgendaRobo() {
+    const status = document.getElementById('robo-agenda-status');
+    status.textContent = 'Salvando...';
+    try {
+      const resp = await fetch('/salvar-config-parcial', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          horarios_semanais: _coletarSemanal(),
+          horarios: _horariosDaSemanal(_coletarSemanal()),
+        })
+      });
+      const data = await resp.json();
+      status.textContent = data.ok ? '✅ Salvo!' : '❌ Erro';
+    } catch(e) {
+      status.textContent = '❌ Erro';
+    }
+    setTimeout(() => { status.textContent = ''; }, 3000);
+  }
+
+  // ── Agenda Semanal — Picklist ────────────────────────────────────────────
+  function renderAgendaPicklist(horarios_semanais) {
+    const wrap = document.getElementById('agenda-semanal-picklist');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+    _DIAS.forEach(({ key, label, fim }) => {
+      const row = document.createElement('div');
+      row.id = `pick-dia-${key}`;
+      const times = horarios_semanais ? horarios_semanais[key] : null;
+      _buildDia(row, key, label, Array.isArray(times) ? times : null, fim);
+      wrap.appendChild(row);
+    });
+    if (wrap.lastChild) wrap.lastChild.style.borderBottom = 'none';
+  }
+
+  function _coletarSemanalpicklist() {
+    const s = {};
+    _DIAS.forEach(({ key }) => {
+      const row = document.getElementById(`pick-dia-${key}`);
+      if (!row) return;
+      if (row.dataset.ativo === '1') {
+        const vals = [...row.querySelectorAll('input[type=time]')].map(i=>i.value).filter(Boolean).sort();
+        s[key] = vals.length ? vals : ['08:00'];
+      } else {
+        s[key] = null;
+      }
+    });
+    return s;
+  }
+
+  async function salvarAgendaPicklist() {
+    const status = document.getElementById('pick-agenda-status');
+    status.textContent = 'Salvando...';
+    try {
+      const resp = await fetch('/salvar-config-parcial', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ horarios_semanais_picklist: _coletarSemanalpicklist() })
+      });
+      const data = await resp.json();
+      status.textContent = data.ok ? '✅ Salvo!' : '❌ Erro';
+    } catch(e) {
+      status.textContent = '❌ Erro';
+    }
+    setTimeout(() => { status.textContent = ''; }, 3000);
+  }
+
   function _flatToSemanal(horarios) {
     const h = horarios && horarios.length ? [...horarios] : ['08:00'];
     return { seg:h, ter:h, qua:h, qui:h, sex:h, sab:null, dom:null };
@@ -533,11 +612,15 @@
     _etapas[nome] = document.getElementById(`etapa-${nome}`).checked;
     const box = document.getElementById(`etapa-${nome}-box`);
     if (box) box.classList.toggle('ativa', _etapas[nome]);
+    fetch('/salvar-config-parcial', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ etapas: _etapas })
+    }).catch(() => {});
   }
 
   function aplicarEtapas(etapas) {
-    _etapas = { ...{ importar: true, picklist: true, nfe: true, envio: true }, ...etapas };
-    ['importar','picklist','nfe','envio'].forEach(n => {
+    _etapas = { ...{ importar: true, nfe: true, envio: true }, ...etapas };
+    ['importar','nfe','envio'].forEach(n => {
       const el = document.getElementById(`etapa-${n}`);
       if (el) {
         el.checked = _etapas[n];
@@ -568,11 +651,13 @@
       // Carrega agenda semanal ou converte lista antiga
       const semanal = data.horarios_semanais || _flatToSemanal(data.horarios || []);
       renderAgenda(semanal);
+      renderAgendaPicklist(data.horarios_semanais_picklist || null);
       if (data.etapas) aplicarEtapas(data.etapas);
     } else {
       pill.className = 'status-pill nok';
       txt.textContent = 'Não configurado';
       renderAgenda(null);
+      renderAgendaPicklist(null);
     }
 
     const btnAuth = document.getElementById('btn-auth');
