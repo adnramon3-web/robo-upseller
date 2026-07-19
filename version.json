@@ -1,4 +1,4 @@
 {
-  "version": "1.9.20",
-  "descricao": "fix: variacao e fulfill_by_platform incluídos no insert/update de pedidos via API"
+  "version": "1.9.69",
+  "descricao": "feat: loop pós-envio aguarda pedidos migrarem Para Emitir→Para Imprimir e captura etiquetas"
 }

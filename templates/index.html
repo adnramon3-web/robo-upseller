@@ -170,6 +170,20 @@
     .modal-close{width:100%;height:40px;background:var(--azul);color:#fff;border:none;
         border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;}
 
+    /* CARD CANCELADOS */
+    .cancelados-badge{display:inline-flex;align-items:center;justify-content:center;
+        background:#FFEBEE;color:#C62828;border-radius:12px;padding:2px 10px;
+        font-size:12px;font-weight:700;margin-left:8px;}
+    .cancelados-lista{display:flex;flex-direction:column;gap:6px;margin-top:4px;}
+    .cancelado-item{display:flex;align-items:center;gap:10px;padding:8px 12px;
+        background:#FAFAFA;border:1px solid #FFCDD2;border-radius:8px;font-size:12px;}
+    .cancelado-item .cn-num{font-weight:700;color:#B71C1C;min-width:110px;}
+    .cancelado-item .cn-prod{color:#546E7A;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+    .cancelado-item .cn-data{color:#90A4AE;min-width:80px;text-align:right;}
+    .cancelados-empty{font-size:13px;color:#90A4AE;text-align:center;padding:12px 0;}
+    .cancelados-aviso{font-size:11px;color:#C62828;background:#FFEBEE;border-radius:6px;
+        padding:6px 10px;margin-bottom:10px;}
+
     @media(max-width:480px){
       .exec-grid{grid-template-columns:1fr 1fr;}
       .etapas-grid{grid-template-columns:1fr;}
@@ -277,6 +291,24 @@
         Agenda independente para geração de picklist. Roda separado do robô principal.
       </p>
       <div id="agenda-semanal-picklist" style="border:1px solid #E3E8F0;border-radius:10px;overflow:hidden;margin-bottom:14px"></div>
+
+      <!-- Seletor de máquina autorizada -->
+      <div style="margin-bottom:16px;padding:14px;background:#F8FAFC;border:1px solid #E3E8F0;border-radius:10px">
+        <div style="font-size:12px;font-weight:700;color:#1e293b;margin-bottom:10px">
+          🖥️ Máquina autorizada para picklist agendada
+        </div>
+        <p style="font-size:11px;color:#78909C;margin:0 0 10px">
+          Somente esta máquina rodará a picklist pelo agendamento. As demais podem usar o botão manual.
+        </p>
+        <div id="maquinas-lista" style="display:flex;flex-direction:column;gap:8px">
+          <span style="font-size:11px;color:#94A3B8;font-style:italic">Carregando máquinas...</span>
+        </div>
+        <button onclick="salvarMaquinaPicklist()" style="margin-top:12px;background:#1e3a5f;color:#fff;border:none;border-radius:8px;padding:7px 18px;font-size:12px;font-weight:700;cursor:pointer">
+          💾 Salvar máquina
+        </button>
+        <span id="maq-status" style="margin-left:10px;font-size:11px;color:#78909C"></span>
+      </div>
+
       <button onclick="salvarAgendaPicklist()" style="background:#1e3a5f;color:#fff;border:none;border-radius:8px;padding:9px 22px;font-size:13px;font-weight:700;cursor:pointer">
         💾 Salvar Agenda Picklist
       </button>
@@ -384,10 +416,24 @@
     <div class="card-header"><span>▶️</span><h2>Execução</h2></div>
     <div class="card-body">
       <div class="progress-bar" id="progress-bar"><div class="progress-fill"></div></div>
-      <button class="exec-btn exec-btn-hoje" id="btn-hoje" onclick="executar('hoje')" style="width:100%;height:48px;font-size:15px;font-weight:700;border-radius:10px;margin-bottom:10px">▶ Rodar</button>
+      <button class="exec-btn exec-btn-hoje" id="btn-hoje" onclick="executar('hoje')" style="width:100%;height:48px;font-size:15px;font-weight:700;border-radius:10px;margin-bottom:10px">▶ Rodar Agora (Manual)</button>
       <button class="btn-sec btn-capturar" id="btn-capturar" onclick="capturarEtiquetas()">🏷️ Capturar Etiquetas</button>
       <div class="robot-controls">
         <button class="btn-ctrl btn-parar" id="btn-parar" onclick="pararRobo()" disabled>⏹️ Parar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- CANCELADOS -->
+  <div class="card" id="card-cancelados" style="display:none">
+    <div class="card-header">
+      <span>🚫</span>
+      <h2>Pedidos Cancelados <span class="cancelados-badge" id="cancelados-badge">0</span></h2>
+    </div>
+    <div class="card-body">
+      <div class="cancelados-aviso">Estes pedidos foram cancelados no UpSeller e não serão produzidos nem incluídos na picklist.</div>
+      <div class="cancelados-lista" id="cancelados-lista">
+        <div class="cancelados-empty">Carregando...</div>
       </div>
     </div>
   </div>
@@ -429,10 +475,36 @@
     verificarStatus();
     iniciarLogStream();
     atualizarBlocos();
+    carregarCancelados();
     setInterval(atualizarBlocos, 30000);
+    setInterval(carregarCancelados, 60000);
   });
 
   function atualizarBlocos() {}
+
+  async function carregarCancelados() {
+    try {
+      const r = await fetch('/api/pedidos-cancelados');
+      const d = await r.json();
+      const pedidos = d.pedidos || [];
+      const card = document.getElementById('card-cancelados');
+      const lista = document.getElementById('cancelados-lista');
+      const badge = document.getElementById('cancelados-badge');
+      badge.textContent = pedidos.length;
+      card.style.display = pedidos.length > 0 ? '' : 'none';
+      if (pedidos.length === 0) { lista.innerHTML = '<div class="cancelados-empty">Nenhum pedido cancelado.</div>'; return; }
+      lista.innerHTML = pedidos.map(p => {
+        const num = p.order_number || '—';
+        const prod = (p.product_name || p.shop_nome || '—').substring(0, 50);
+        const data = (p.data || '').substring(0, 10);
+        return `<div class="cancelado-item">
+          <span class="cn-num">${num}</span>
+          <span class="cn-prod" title="${p.product_name || ''}">${prod}</span>
+          <span class="cn-data">${data}</span>
+        </div>`;
+      }).join('');
+    } catch(e) {}
+  }
 
   // ── Agenda Semanal ───────────────────────────────────────────────────────
   const _DIAS = [
@@ -448,7 +520,7 @@
   function _chipH(val) {
     const d = document.createElement('div');
     d.className = 'horario-chip';
-    d.innerHTML = `🕐 <input type="time" value="${val}" style="border:none;background:none;font-size:13px;font-weight:700;color:#1565C0;width:54px;outline:none;padding:0"/>
+    d.innerHTML = `🕐 <input type="time" value="${val}" style="border:none;background:none;font-size:13px;font-weight:700;color:#1565C0;width:72px;outline:none;padding:0"/>
       <button onclick="this.parentElement.remove()" style="background:none;border:none;cursor:pointer;color:#90A4AE;font-size:15px;line-height:1;padding:0">×</button>`;
     return d;
   }
@@ -575,6 +647,66 @@
     setTimeout(() => { status.textContent = ''; }, 3000);
   }
 
+  // ── Máquinas vinculadas ──────────────────────────────────────────────────
+  async function carregarMaquinas() {
+    const lista = document.getElementById('maquinas-lista');
+    if (!lista) return;
+    try {
+      const resp = await fetch('/maquinas');
+      const data = await resp.json();
+      const { maquinas, picklist_machine, hostname_atual } = data;
+      if (!maquinas || maquinas.length === 0) {
+        lista.innerHTML = '<span style="font-size:11px;color:#94A3B8;font-style:italic">Nenhuma máquina detectada ainda.</span>';
+        return;
+      }
+      lista.innerHTML = '';
+      // Opção "qualquer máquina" (sem restrição)
+      const rowAll = document.createElement('label');
+      rowAll.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:8px;cursor:pointer;background:#fff;border:1px solid #E3E8F0';
+      rowAll.innerHTML = `<input type="radio" name="maq_pick" value="" ${!picklist_machine ? 'checked' : ''} style="accent-color:#1e3a5f">
+        <span style="font-size:12px;color:#64748B;font-style:italic">Qualquer máquina (sem restrição)</span>`;
+      lista.appendChild(rowAll);
+
+      maquinas.forEach(m => {
+        const ativa = m.atualizado_em ? true : false;
+        const isAtual = m.hostname === hostname_atual;
+        const isSel = m.hostname === picklist_machine;
+        const row = document.createElement('label');
+        row.style.cssText = `display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:8px;cursor:pointer;background:${isSel?'#EEF6FF':'#fff'};border:1px solid ${isSel?'#93C5FD':'#E3E8F0'}`;
+        row.innerHTML = `
+          <input type="radio" name="maq_pick" value="${m.hostname}" ${isSel ? 'checked' : ''} style="accent-color:#1e3a5f">
+          <div style="flex:1">
+            <div style="font-size:13px;font-weight:700;color:#1e293b">${m.hostname}${isAtual?' <span style="font-size:10px;color:#1e3a5f;font-weight:600">(esta máquina)</span>':''}</div>
+            <div style="font-size:10px;color:#94A3B8">v${m.versao} · ${ativa ? '🟢 online' : '⚫ sem heartbeat recente'}</div>
+          </div>`;
+        lista.appendChild(row);
+      });
+    } catch(e) {
+      lista.innerHTML = '<span style="font-size:11px;color:#e53e3e">Erro ao carregar máquinas.</span>';
+    }
+  }
+
+  async function salvarMaquinaPicklist() {
+    const status = document.getElementById('maq-status');
+    status.textContent = 'Salvando...';
+    const sel = document.querySelector('input[name="maq_pick"]:checked');
+    const maq = sel ? sel.value : '';
+    try {
+      const resp = await fetch('/salvar-config-parcial', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ picklist_machine: maq })
+      });
+      const data = await resp.json();
+      status.textContent = data.ok
+        ? (maq ? `✅ Apenas "${maq}" usará o agendamento` : '✅ Qualquer máquina pode rodar')
+        : '❌ Erro';
+    } catch(e) {
+      status.textContent = '❌ Erro';
+    }
+    setTimeout(() => { status.textContent = ''; }, 4000);
+  }
+
   function _flatToSemanal(horarios) {
     const h = horarios && horarios.length ? [...horarios] : ['08:00'];
     return { seg:h, ter:h, qua:h, qui:h, sex:h, sab:null, dom:null };
@@ -652,6 +784,7 @@
       const semanal = data.horarios_semanais || _flatToSemanal(data.horarios || []);
       renderAgenda(semanal);
       renderAgendaPicklist(data.horarios_semanais_picklist || null);
+      carregarMaquinas();
       if (data.etapas) aplicarEtapas(data.etapas);
     } else {
       pill.className = 'status-pill nok';
